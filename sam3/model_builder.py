@@ -644,9 +644,40 @@ def download_ckpt_from_hf():
     SAM3_MODEL_ID = "facebook/sam3"
     SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
-    return checkpoint_path
+    
+    # 首先检查本地缓存目录中是否有文件
+    import os
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub")
+    model_cache_dir = os.path.join(cache_base, "models--facebook--sam3")
+    snapshot_dir = os.path.join(model_cache_dir, "snapshots", "main")
+    
+    local_checkpoint = os.path.join(snapshot_dir, SAM3_CKPT_NAME)
+    local_config = os.path.join(snapshot_dir, SAM3_CFG_NAME)
+    
+    # 如果本地缓存文件存在，直接使用
+    if os.path.exists(local_checkpoint) and os.path.exists(local_config):
+        print(f"使用本地缓存文件: {local_checkpoint}")
+        return local_checkpoint
+    
+    # 否则尝试从HuggingFace下载
+    try:
+        # 优先使用本地文件（如果网络不可用）
+        _ = hf_hub_download(
+            repo_id=SAM3_MODEL_ID, 
+            filename=SAM3_CFG_NAME,
+            local_files_only=True
+        )
+        checkpoint_path = hf_hub_download(
+            repo_id=SAM3_MODEL_ID, 
+            filename=SAM3_CKPT_NAME,
+            local_files_only=True
+        )
+        return checkpoint_path
+    except Exception:
+        # 如果本地文件不存在，尝试从网络下载
+        _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
+        checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+        return checkpoint_path
 
 
 def build_sam3_video_model(
