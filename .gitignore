@@ -129,7 +129,11 @@ dmypy.json
 *.safetensors
 weights/
 checkpoints/
+sgg/checkpoints/
 sam3_logs/
+
+# Documents (training logs, design docs, etc.)
+documents/
 
 # Data files
 *.h5
@@ -141,6 +145,8 @@ sam3_logs/
 
 # Logs
 logs/
+logfiles/
+sgg/logfiles/
 runs/
 tensorboard/
 

@@ -1,0 +1,443 @@
+"""
+Training script for SGG PredCls task
+按照新流程：GT objects → SAM3 embedding → relation classification
+"""
+import os
+import sys
+
+# 添加项目根目录到 Python 路径
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import argparse
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from PIL import Image
+import json
+from datetime import datetime
+from collections import defaultdict
+from torch.utils.tensorboard import SummaryWriter
+import threading
+import time
+from time import perf_counter
+
+from sgg.datasets.vg150_dataset import VG150Dataset
+from sgg.models.frozen_sam3_gt import FrozenSAM3GT
+from sgg.models.relation_head import RelationHead
+from sgg.utils.geometry import box_geom_feat
+from sgg.utils.edge_builder import build_edges, sample_neg_pairs, build_pair_features
+
+
+def forward_one_image(
+    sam3: FrozenSAM3GT,
+    rel_head: RelationHead,
+    image: Image.Image,
+    gt_boxes: torch.Tensor,
+    gt_rels: torch.Tensor,
+    neg_ratio: int = 3,
+    max_negs: int = 50,
+    device: str = "cuda",
+):
+    """
+    对单张图像进行前向传播（新流程：无 IoU matching）
+    
+    Args:
+        sam3: Frozen SAM3 model
+        rel_head: Relation head
+        image: PIL Image
+        gt_boxes: [G, 4] normalized xyxy boxes
+        gt_rels: [R, 3] (s_idx, o_idx, pred_idx)
+        neg_ratio: Negative sampling ratio
+        max_negs: Maximum negatives when no positives
+        device: Device
+        
+    Returns:
+        (logits, labels, skip_reason) or (None, None, skip_reason)
+    """
+    G = gt_boxes.size(0)
+    
+    # Check basic requirements
+    if G == 0:
+        return None, None, "no_gt_objects"
+    if G < 2:
+        return None, None, "less_than_2_objects"
+    
+    # Extract embeddings for GT boxes using box prompts
+    try:
+        embs = sam3.forward_batch_boxes(image, gt_boxes.to(device))  # [G, 256]
+    except Exception as e:
+        return None, None, f"sam3_error: {str(e)}"
+    
+    if embs.size(0) != G:
+        return None, None, "embedding_mismatch"
+    
+    # Build edges from GT relations
+    pos_edges, pos_pairs = build_edges(gt_rels)
+    
+    # Sample negative pairs
+    neg_edges = sample_neg_pairs(G, pos_pairs, neg_ratio=neg_ratio, max_negs=max_negs)
+    
+    # Combine positive and negative edges
+    all_edges = pos_edges + neg_edges
+    
+    if len(all_edges) == 0:
+        return None, None, "no_edges"
+    
+    # Build pair features
+    def geom_fn(box_s, box_o):
+        return box_geom_feat(box_s, box_o)
+    
+    feats, labels = build_pair_features(embs, gt_boxes.to(device), all_edges, geom_fn)
+    # feats: [P, 2*256 + 6], labels: [P]
+    
+    # Forward through relation head
+    logits = rel_head(feats)  # [P, num_predicates]
+    
+    skip_reason = None if len(pos_edges) > 0 else "no_valid_relations"
+    
+    return logits, labels, skip_reason
+
+
+def train_step(
+    batch,
+    sam3: FrozenSAM3GT,
+    rel_head: RelationHead,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    neg_ratio: int = 3,
+    max_negs: int = 50,
+):
+    """
+    单个训练步骤
+    """
+    rel_head.train()
+    optimizer.zero_grad()
+    
+    total_loss = 0.0
+    valid = 0
+    loss_details = []
+    skip_reasons = defaultdict(int)
+    
+    for sample in batch:
+        image_pil = sample["image_pil"]
+        gt_boxes = sample["gt_boxes"]  # [G, 4]
+        gt_rels = sample["gt_rels"]  # [R, 3]
+        
+        # Forward pass
+        out = forward_one_image(
+            sam3, rel_head, image_pil, gt_boxes, gt_rels,
+            neg_ratio=neg_ratio, max_negs=max_negs, device=device
+        )
+        
+        if out[0] is None:
+            skip_reason = out[2]
+            skip_reasons[skip_reason] += 1
+            continue
+        
+        logits, labels, _ = out
+        # logits: [P, num_predicates], labels: [P]
+        
+        # Compute loss (single softmax CE)
+        loss = criterion(logits, labels)
+        
+        # Backward
+        loss.backward()
+        
+        # Record
+        num_pairs = logits.size(0)
+        num_positives = (labels > 0).sum().item()
+        num_negatives = (labels == 0).sum().item()
+        
+        loss_details.append({
+            "loss": loss.item(),
+            "num_pairs": num_pairs,
+            "num_positives": num_positives,
+            "num_negatives": num_negatives,
+        })
+        
+        total_loss += loss.item()
+        valid += 1
+    
+    # Update parameters
+    if valid > 0:
+        # Clip gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(rel_head.parameters(), max_norm=1.0)
+        optimizer.step()
+    else:
+        grad_norm = torch.tensor(0.0)
+    
+    # Aggregate statistics
+    avg_loss = total_loss / max(valid, 1)
+    avg_pairs = sum(d["num_pairs"] for d in loss_details) / max(valid, 1) if loss_details else 0
+    avg_pos = sum(d["num_positives"] for d in loss_details) / max(valid, 1) if loss_details else 0
+    avg_neg = sum(d["num_negatives"] for d in loss_details) / max(valid, 1) if loss_details else 0
+    
+    loss_info = {
+        "loss": avg_loss,
+        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+        "valid": valid,
+        "avg_num_pairs": avg_pairs,
+        "avg_positives": avg_pos,
+        "avg_negatives": avg_neg,
+        "skip_reasons": dict(skip_reasons),
+    }
+    
+    return avg_loss, loss_info
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train SGG PredCls")
+    parser.add_argument("--data_root", type=str, required=True, help="VG dataset root")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--neg_ratio", type=int, default=3, help="Negative sampling ratio")
+    parser.add_argument("--max_negs", type=int, default=50, help="Max negatives when no positives")
+    parser.add_argument("--bg_weight", type=float, default=0.1, help="Background class weight")
+    parser.add_argument("--save_dir", type=str, default="sgg/checkpoints", help="Save directory")
+    parser.add_argument("--log_dir", type=str, default="sgg/logfiles", help="Log directory")
+    parser.add_argument("--log_interval", type=int, default=10, help="JSON log save interval (console logs every step)")
+    
+    args = parser.parse_args()
+    
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create directories
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    print(f"\nCheckpoint settings:")
+    print(f"  Save directory: {args.save_dir}")
+    print(f"  - Every 1000 steps: checkpoint_step_<step>.pt")
+    print(f"  - End of each epoch: checkpoint_epoch_<epoch>.pt")
+    
+    # Load dataset
+    print("Loading dataset...")
+    dataset = VG150Dataset(
+        data_root=args.data_root,
+        split="train",
+        image_size=1008,
+    )
+    
+    # Get predicate vocabulary
+    vocab = dataset.get_predicate_vocab()
+    num_predicates = vocab["num_predicates"]
+    print(f"Number of predicates: {num_predicates}")
+    
+    # Save vocabulary
+    vocab_path = os.path.join("sgg/configs", "predicate_vocab.json")
+    os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
+    with open(vocab_path, 'w') as f:
+        json.dump({
+            **vocab,
+            "created_at": datetime.now().isoformat(),
+        }, f, indent=2)
+    print(f"Saved predicate vocabulary to {vocab_path}")
+    
+    # Print predicate vocabulary
+    print("\n" + "="*80)
+    print("Predicate Vocabulary:")
+    print("="*80)
+    print(f"{'Index':<8} {'Predicate Name':<30}")
+    print("-"*80)
+    for idx in sorted(vocab["idx_to_predicate"].keys()):
+        pred_name = vocab["idx_to_predicate"][idx]
+        print(f"{idx:<8} {pred_name:<30}")
+    print("="*80 + "\n")
+    
+    # DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=lambda x: x,  # Return list of samples
+    )
+    
+    # Models
+    print("Initializing models...")
+    sam3 = FrozenSAM3GT(device=device)
+    rel_head = RelationHead(
+        emb_dim=256,
+        geom_dim=6,
+        num_predicates=num_predicates,
+        hidden=512,
+        dropout=0.1,
+    ).to(device)
+    
+    # Optimizer
+    optimizer = torch.optim.Adam(rel_head.parameters(), lr=args.lr)
+    
+    # Loss function (single softmax CE with background down-weighting)
+    class_weights = torch.ones(num_predicates, device=device)
+    class_weights[0] = args.bg_weight  # Background weight
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    print(f"Using CrossEntropyLoss with background weight={args.bg_weight}")
+    
+    # Logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(args.log_dir, f"train_log_{timestamp}.json")
+    tb_log_dir = os.path.join(args.log_dir, "tensorboard", timestamp)
+    writer = SummaryWriter(tb_log_dir)
+    
+    log_data = {
+        "config": vars(args),
+        "vocab": vocab,
+        "logs": [],
+    }
+    log_lock = threading.Lock()
+    
+    def save_log():
+        with log_lock:
+            with open(log_file, 'w') as f:
+                json.dump(log_data, f, indent=2)
+    
+    # Training loop
+    print("\nStarting training...")
+    global_step = 0
+    
+    # Time tracking
+    epoch_start_time = None
+    step_times = []  # Track recent step times for ETA calculation
+    
+    for epoch in range(args.num_epochs):
+        print(f"\n[Epoch {epoch+1}/{args.num_epochs}]")
+        epoch_start_time = perf_counter()
+        epoch_step_times = []
+        
+        for step, batch in enumerate(dataloader):
+            step_start_time = perf_counter()
+            
+            # Train step
+            avg_loss, loss_info = train_step(
+                batch, sam3, rel_head, criterion, optimizer,
+                device=device, neg_ratio=args.neg_ratio, max_negs=args.max_negs
+            )
+            
+            step_end_time = perf_counter()
+            step_time = step_end_time - step_start_time
+            epoch_step_times.append(step_time)
+            step_times.append(step_time)
+            
+            # Keep only last 100 step times for ETA calculation
+            if len(step_times) > 100:
+                step_times.pop(0)
+            
+            global_step += 1
+            
+            # Calculate ETA
+            avg_step_time = sum(step_times) / len(step_times) if step_times else step_time
+            remaining_steps_epoch = len(dataloader) - step - 1
+            remaining_steps_total = (args.num_epochs - epoch - 1) * len(dataloader) + remaining_steps_epoch
+            
+            eta_epoch_sec = remaining_steps_epoch * avg_step_time
+            eta_total_sec = remaining_steps_total * avg_step_time
+            
+            def format_time(seconds):
+                """Format seconds to human readable time"""
+                if seconds < 60:
+                    return f"{seconds:.1f}s"
+                elif seconds < 3600:
+                    return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+                else:
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    return f"{hours}h {minutes}m"
+            
+            # Logging - every step
+            valid = loss_info["valid"]
+            batch_size = len(batch)
+            skip_info = ", ".join([f"{k}:{v}" for k, v in loss_info["skip_reasons"].items()]) if loss_info["skip_reasons"] else "none"
+            
+            print(
+                f"Step {step+1}/{len(dataloader)} | "
+                f"time={format_time(step_time)} | "
+                f"grad={loss_info['grad_norm']:.4f} | "
+                f"loss={avg_loss:.4f} | "
+                f"valid={valid}/{batch_size} "
+                f"(avg_num_pairs={loss_info['avg_num_pairs']:.1f} "
+                f"pos={loss_info['avg_positives']:.1f} "
+                f"neg={loss_info['avg_negatives']:.1f}) | "
+                f"skipped: {skip_info} | "
+                f"ETA (this epoch): {format_time(eta_epoch_sec)} | "
+                f"ETA (end train): {format_time(eta_total_sec)}"
+            )
+            
+            # TensorBoard - log every step
+            writer.add_scalar("Loss", avg_loss, global_step)
+            writer.add_scalar("GradNorm", loss_info["grad_norm"], global_step)
+            writer.add_scalar("ValidSamples", valid, global_step)
+            writer.add_scalar("AvgNumPairsPerSample", loss_info["avg_num_pairs"], global_step)
+            writer.add_scalar("AvgPositives", loss_info["avg_positives"], global_step)
+            writer.add_scalar("AvgNegatives", loss_info["avg_negatives"], global_step)
+            writer.add_scalar("StepTime", step_time, global_step)
+            
+            # JSON log - only log at intervals to avoid too much data
+            if step % args.log_interval == 0:
+                log_entry = {
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "global_step": global_step,
+                    "step_time": step_time,
+                    "eta_epoch_sec": eta_epoch_sec,
+                    "eta_total_sec": eta_total_sec,
+                    **loss_info,
+                }
+                log_data["logs"].append(log_entry)
+                save_log()
+            
+            # Save checkpoint every 1000 steps
+            if global_step % 1000 == 0:
+                checkpoint_path = os.path.join(args.save_dir, f"checkpoint_step_{global_step}.pt")
+                torch.save({
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "global_step": global_step,
+                    "model_state_dict": rel_head.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "vocab": vocab,
+                    "loss": avg_loss,
+                }, checkpoint_path)
+                print(f"  [Checkpoint saved] {checkpoint_path}")
+        
+        # Epoch summary
+        epoch_end_time = perf_counter()
+        epoch_time = epoch_end_time - epoch_start_time
+        avg_step_time_epoch = sum(epoch_step_times) / len(epoch_step_times) if epoch_step_times else 0
+        
+        print(f"\n[Epoch {epoch+1} completed]")
+        print(f"  Time: {format_time(epoch_time)}")
+        print(f"  Avg step time: {format_time(avg_step_time_epoch)}")
+        print(f"  Total steps: {len(dataloader)}")
+        
+        # Calculate remaining time for all epochs
+        remaining_epochs = args.num_epochs - epoch - 1
+        if remaining_epochs > 0:
+            estimated_remaining = epoch_time * remaining_epochs
+            print(f"  Estimated remaining time (end train): {format_time(estimated_remaining)}")
+        
+        # Save checkpoint at end of each epoch
+        checkpoint_path = os.path.join(args.save_dir, f"checkpoint_epoch_{epoch+1}.pt")
+        torch.save({
+            "epoch": epoch + 1,
+            "step": len(dataloader) - 1,
+            "global_step": global_step,
+            "model_state_dict": rel_head.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "vocab": vocab,
+            "loss": avg_loss,
+        }, checkpoint_path)
+        print(f"  [Checkpoint saved] {checkpoint_path}")
+    
+    writer.close()
+    print("\nTraining completed!")
+
+
+if __name__ == "__main__":
+    main()
