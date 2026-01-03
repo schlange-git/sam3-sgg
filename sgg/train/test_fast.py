@@ -459,21 +459,21 @@ def visualize_scene_graph(
     rel_label_positions = []
     rel_labels = []
     
-    def get_label_position(box_idx):
-        """获取标签位置（用于relation链接）"""
-        if box_idx < len(adjusted_label_positions):
-            return adjusted_label_positions[box_idx]
-        else:
-            # 如果索引超出范围，使用box中心
+    def get_box_center(box_idx):
+        """获取box中心点（用于relation链接）"""
+        if 0 <= box_idx < len(boxes_xyxy):
             x1, y1, x2, y2 = boxes_xyxy[box_idx]
             return ((x1 + x2) / 2, (y1 + y2) / 2)
+        else:
+            # 如果索引超出范围，返回(0, 0)
+            return (0, 0)
     
-    # 绘制正确预测的关系（绿色实线）- 链接标签
+    # 绘制正确预测的关系（绿色实线）- 链接box中心
     for s, o, p in correct_set:
-        if s < len(adjusted_label_positions) and o < len(adjusted_label_positions):
-            # 获取标签位置
-            x_s, y_s = get_label_position(s)
-            x_o, y_o = get_label_position(o)
+        if 0 <= s < len(boxes_xyxy) and 0 <= o < len(boxes_xyxy):
+            # 获取box中心点
+            x_s, y_s = get_box_center(s)
+            x_o, y_o = get_box_center(o)
             
             pred_name = idx_to_predicate.get(p, f"P{p}")
             ax.plot([x_s, x_o], [y_s, y_o], "g-", linewidth=2, alpha=0.7)
@@ -485,9 +485,9 @@ def visualize_scene_graph(
     
     # 绘制误报（FP，使用黄色虚线，不那么显眼）
     for s, o, p in false_pos_set:
-        if s < len(adjusted_label_positions) and o < len(adjusted_label_positions):
-            x_s, y_s = get_label_position(s)
-            x_o, y_o = get_label_position(o)
+        if 0 <= s < len(boxes_xyxy) and 0 <= o < len(boxes_xyxy):
+            x_s, y_s = get_box_center(s)
+            x_o, y_o = get_box_center(o)
             
             pred_name = idx_to_predicate.get(p, f"P{p}")
             ax.plot([x_s, x_o], [y_s, y_o], "y--", linewidth=1.5, alpha=0.5)
@@ -498,9 +498,9 @@ def visualize_scene_graph(
     
     # 绘制漏报（FN，使用红色实线，更显眼，这个指标更重要）
     for s, o, p in false_neg_set:
-        if s < len(adjusted_label_positions) and o < len(adjusted_label_positions):
-            x_s, y_s = get_label_position(s)
-            x_o, y_o = get_label_position(o)
+        if 0 <= s < len(boxes_xyxy) and 0 <= o < len(boxes_xyxy):
+            x_s, y_s = get_box_center(s)
+            x_o, y_o = get_box_center(o)
             
             pred_name = idx_to_predicate.get(p, f"P{p}")
             ax.plot([x_s, x_o], [y_s, y_o], "r-", linewidth=2, alpha=0.8)
