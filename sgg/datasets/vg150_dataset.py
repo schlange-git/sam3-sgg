@@ -298,16 +298,17 @@ class VG150Dataset(Dataset):
             T.ToTensor(),
         ])
         
-        # Find image directory
-        self.image_dir = None
-        for img_dir_name in ['images', 'images2']:
-            img_dir = os.path.join(data_root, img_dir_name)
-            if os.path.exists(img_dir):
-                self.image_dir = img_dir
-                break
-        
-        if self.image_dir is None:
-            print(f"Warning: Could not find images/ or images2/ directory in {data_root}")
+        # Image directories (fixed paths)
+        self.image_dirs = [
+            os.path.join(data_root, "images", "VG_100K"),
+            os.path.join(data_root, "images2", "VG_100K_2"),
+        ]
+        # Check which directories exist
+        existing_dirs = [d for d in self.image_dirs if os.path.exists(d)]
+        if existing_dirs:
+            print(f"Using image directories: {existing_dirs}")
+        else:
+            print(f"Warning: Image directories not found: {self.image_dirs}")
     
     def __len__(self):
         return len(self.valid_indices)
@@ -328,37 +329,93 @@ class VG150Dataset(Dataset):
             img_boxes = self.boxes[first_box:last_box+1]  # [G, 4] (x1, y1, x2, y2) in pixels
             img_labels = self.labels[first_box:last_box+1]  # [G] object class labels
             
-            # Get image info for dimensions
-            if img_id in self.image_id_to_info:
-                img_info = self.image_id_to_info[img_id]
-                orig_w = img_info.get("width", 1000)
-                orig_h = img_info.get("height", 1000)
-            else:
-                # Try to load image to get dimensions
-                orig_w, orig_h = 1000, 1000  # Default, will be updated when loading image
-            
-            # Normalize boxes to [0, 1]
-            # Note: boxes in h5 are in pixel coordinates
-            # We need to normalize them, but we need image dimensions first
-            # For now, we'll load the image to get dimensions
-            
-            # Load image
+            # Load image first to get actual dimensions
             img_path = self._get_image_path(img_id)
             if img_path and os.path.exists(img_path):
                 image = Image.open(img_path).convert("RGB")
-                orig_w, orig_h = image.size
+                actual_w, actual_h = image.size
             else:
                 # Fallback: create dummy image
-                image = Image.new('RGB', (orig_w, orig_h), color='white')
+                actual_w, actual_h = 1000, 1000
+                image = Image.new('RGB', (actual_w, actual_h), color='white')
             
-            # Normalize boxes
+            # Get annotated dimensions from image_data.json (if available)
+            # This is the size used when creating boxes_512 annotations
+            if img_id in self.image_id_to_info:
+                img_info = self.image_id_to_info[img_id]
+                annotated_w = img_info.get("width")
+                annotated_h = img_info.get("height")
+                if annotated_w is not None and annotated_h is not None:
+                    # Use annotated dimensions for coordinate conversion
+                    orig_w, orig_h = annotated_w, annotated_h
+                else:
+                    # Fallback to actual image dimensions
+                    orig_w, orig_h = actual_w, actual_h
+            else:
+                # No annotation info, use actual image dimensions
+                orig_w, orig_h = actual_w, actual_h
+            
+            # Warn if dimensions don't match (could cause misalignment)
+            if actual_w != orig_w or actual_h != orig_h:
+                if img_id % 1000 == 0:  # Only warn occasionally to avoid spam
+                    print(f"Warning: Image {img_id} size mismatch: "
+                          f"annotated=({orig_w}, {orig_h}), actual=({actual_w}, {actual_h})")
+            
+            # Convert boxes_512 to normalized coordinates (0-1) based on original image size
+            # According to Scene-Graph-Benchmark.pytorch:
+            # boxes_512 are normalized coordinates (0-1) multiplied by 512
+            # So: boxes_512 = normalized_coords * 512
+            # To get normalized coords: normalized_coords = boxes_512 / 512
+            # 
+            # However, boxes_512 might be based on a 512-long-side coordinate system.
+            # If the original image is resized so long side = 512, then:
+            # - boxes_512 are in [0, 512] for the long dimension
+            # - For the short dimension, boxes_512 are also in [0, 512] but the actual
+            #   image dimension is shorter
+            # 
+            # The correct conversion depends on how boxes_512 were created.
+            # We'll use the simpler interpretation: boxes_512 / 512 gives normalized coords
+            # based on a 512x512 coordinate system, which we then scale to original image size.
+            
             gt_boxes = []
             for box in img_boxes:
-                x1, y1, x2, y2 = box
-                x1_norm = x1 / orig_w
-                y1_norm = y1 / orig_h
-                x2_norm = x2 / orig_w
-                y2_norm = y2 / orig_h
+                x1, y1, x2, y2 = box.astype(np.float32)
+                
+                # Fix coordinate order if needed (ensure x1 < x2, y1 < y2)
+                if x1 > x2:
+                    x1, x2 = x2, x1
+                if y1 > y2:
+                    y1, y2 = y2, y1
+                
+                # Method 1: Simple division by 512 (assumes boxes_512 = norm_coords * 512)
+                # This gives normalized coordinates in a 512x512 coordinate system
+                x1_norm_512 = x1 / 512.0
+                y1_norm_512 = y1 / 512.0
+                x2_norm_512 = x2 / 512.0
+                y2_norm_512 = y2 / 512.0
+                
+                # Convert from 512x512 coordinate system to original image coordinates
+                # If boxes_512 are based on 512 long side, we need to account for aspect ratio
+                # However, the simplest interpretation is that boxes_512 are already
+                # normalized coordinates scaled by 512, so we just divide by 512
+                # and use directly as normalized coordinates for the original image
+                x1_norm = x1_norm_512
+                y1_norm = y1_norm_512
+                x2_norm = x2_norm_512
+                y2_norm = y2_norm_512
+                
+                # Clamp to [0, 1]
+                x1_norm = max(0.0, min(1.0, x1_norm))
+                y1_norm = max(0.0, min(1.0, y1_norm))
+                x2_norm = max(0.0, min(1.0, x2_norm))
+                y2_norm = max(0.0, min(1.0, y2_norm))
+                
+                # Ensure valid box (x2 > x1, y2 > y1)
+                if x2_norm <= x1_norm:
+                    x2_norm = x1_norm + 0.01
+                if y2_norm <= y1_norm:
+                    y2_norm = y1_norm + 0.01
+                
                 gt_boxes.append([x1_norm, y1_norm, x2_norm, y2_norm])
             
             gt_boxes = torch.tensor(gt_boxes, dtype=torch.float32)  # [G, 4]
@@ -410,22 +467,23 @@ class VG150Dataset(Dataset):
             img_info = self.image_id_to_info[img_id]
             img_path = img_info.get("url", img_info.get("file_name", ""))
             if img_path:
-                # Try different possible paths
-                possible_paths = [
-                    os.path.join(self.data_root, "images", img_path),
-                    os.path.join(self.data_root, "images2", img_path),
-                    os.path.join(self.data_root, img_path),
-                    img_path,
-                ]
-                for path in possible_paths:
+                # Try fixed image directories
+                for img_dir in self.image_dirs:
+                    path = os.path.join(img_dir, img_path)
+                    if os.path.exists(path):
+                        return path
+                # Also try with just the filename if img_path contains subdirectory
+                img_filename = os.path.basename(img_path)
+                for img_dir in self.image_dirs:
+                    path = os.path.join(img_dir, img_filename)
                     if os.path.exists(path):
                         return path
         
-        # Fallback: try common naming patterns
-        if self.image_dir:
+        # Fallback: try common naming patterns in fixed directories
+        for img_dir in self.image_dirs:
             for ext in ['.jpg', '.png', '.jpeg']:
                 for pattern in [f"{img_id}{ext}", f"{img_id:06d}{ext}"]:
-                    path = os.path.join(self.image_dir, pattern)
+                    path = os.path.join(img_dir, pattern)
                     if os.path.exists(path):
                         return path
         

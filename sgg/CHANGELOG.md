@@ -31,7 +31,9 @@ sgg/
 ├── models/            # 模型定义
 ├── utils/             # 工具函数
 ├── configs/           # 配置文件
-├── train_predcls.py   # 主训练脚本
+├── train/
+│   ├── train_fast.py  # 快速训练脚本（使用缓存）
+│   └── test_fast.py    # 测试脚本
 ├── run_train.sh       # 运行脚本
 └── README.md          # 使用说明
 ```

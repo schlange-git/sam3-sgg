@@ -32,16 +32,30 @@ sgg/
 │   └── vg150_dataset.py          # VG150 数据集加载器
 ├── models/
 │   ├── __init__.py
-│   ├── frozen_sam3_gt.py         # 使用 GT box prompt 的 SAM3
-│   └── relation_head.py          # 关系分类头
+│   ├── frozen_sam3_gt.py         # 使用 GT box prompt 的 SAM3（用于离线预处理）
+│   └── relation_head_geom.py      # 关系分类头（仅使用几何特征）
 ├── utils/
 │   ├── __init__.py
 │   ├── geometry.py                # 几何特征计算
-│   └── edge_builder.py           # Edge list 构建和负采样
+│   ├── seed.py                    # 随机种子设置
+│   ├── io.py                      # IO 工具函数
+│   └── inspect_cache.py          # 缓存文件检查工具
+├── precompute/
+│   ├── build_cache.py             # 离线预处理脚本
+│   ├── sam3_adapter.py            # SAM3 适配器
+│   ├── pair_sampler.py            # Pair 采样
+│   └── geom_extractor.py          # 几何特征提取
+├── train/
+│   ├── train_fast.py              # 快速训练脚本（使用缓存）
+│   ├── test_fast.py                # 测试脚本（带评测和可视化）
+│   └── loss.py                     # Loss 函数
+├── eval/
+│   └── sgg_metrics.py              # SGG 评测指标
 ├── configs/
 │   └── __init__.py
-├── train_predcls.py              # 主训练脚本
-├── run_train.sh                  # 训练运行脚本
+├── run_build_cache.sh             # 构建缓存脚本
+├── run_train_fast.sh              # 快速训练脚本
+└── run_test_fast.sh               # 测试脚本
 └── README.md                      # 本文件
 ```
 
@@ -71,10 +85,14 @@ pip install h5py  # 用于读取 h5 文件
 
 ### 1. 修改运行脚本
 
-编辑 `sgg/run_train.sh`，设置你的数据集路径：
+编辑 `sgg/run_build_cache.sh` 和 `sgg/run_train_fast.sh`，设置你的数据集路径：
 
 ```bash
-DATA_ROOT="/home/shi/abschluss/dataset/vg150"  # 修改为你的 VG150 数据集路径
+# 在 run_build_cache.sh 中
+VG_ROOT="/home/shi/abschluss/dataset/vg150"  # 修改为你的 VG150 数据集路径
+
+# 在 run_train_fast.sh 中
+CACHE_DIR="sgg/cache/train"  # 缓存目录
 ```
 
 **注意**：确保数据集路径包含：
@@ -83,23 +101,45 @@ DATA_ROOT="/home/shi/abschluss/dataset/vg150"  # 修改为你的 VG150 数据集
 - `image_data.json`
 - `images/` 或 `images2/` 目录
 
-### 2. 运行训练
+### 2. 构建缓存（离线预处理）
+
+首先需要运行离线预处理，生成几何特征缓存：
 
 ```bash
-bash sgg/run_train.sh
+bash sgg/run_build_cache.sh
+```
+
+或者手动运行：
+
+```bash
+conda activate sam3
+python sgg/precompute/build_cache.py \
+    --vg_root /path/to/visual_genome \
+    --out_dir sgg/cache/train \
+    --split train \
+    --P 128 \
+    --neg_ratio 3
+```
+
+### 3. 运行训练
+
+使用快速训练脚本（读取缓存）：
+
+```bash
+bash sgg/run_train_fast.sh
 ```
 
 或者直接使用 Python：
 
 ```bash
 conda activate sam3
-python sgg/train_predcls.py \
-    --data_root /path/to/visual_genome \
-    --batch_size 4 \
-    --num_epochs 3 \
-    --lr 1e-4 \
-    --neg_ratio 3 \
-    --bg_weight 0.1
+python sgg/train/train_fast.py \
+    --cache_dir sgg/cache/train \
+    --out_dir checkpoints/sgghead \
+    --num_predicates 51 \
+    --epochs 12 \
+    --batch_size 32 \
+    --lr 1e-3
 ```
 
 ### 3. 训练参数说明

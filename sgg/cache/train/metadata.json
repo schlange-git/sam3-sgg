@@ -1,0 +1,17 @@
+{
+  "total_images": 10,
+  "success_count": 10,
+  "fail_count": 1,
+  "skip_reasons": {
+    "image_load_error: [Errno 2] No such file or directory: '/home/shi/abschluss/dataset/vg150/images/VG_100K/0.jpg'": 1
+  },
+  "config": {
+    "vg_root": "/home/shi/abschluss/dataset/vg150",
+    "split": "train",
+    "P": 128,
+    "neg_ratio": 3,
+    "mask_size": 256,
+    "seed": 42,
+    "sam3_impl": "real"
+  }
+}
