@@ -615,10 +615,30 @@ def test(cfg: TestConfig) -> None:
         for i in range(len(geom)):
             cache_file = ds.files[start_idx + i]
             pack = torch.load(cache_file, map_location="cpu", weights_only=False)
-            image_id = pack["image_id"]
+            cache_image_id = pack["image_id"]
+            
+            # 临时修复：image n 对应 relation n+1
+            # TODO: 修复后需要移除这个偏移
+            image_id = cache_image_id + 1
             
             # 获取 GT 三元组（直接从h5文件读取，使用与boxes相同的索引映射）
             gt_triplets = get_gt_triplets_from_h5(reader, image_id)
+            
+            # 验证索引对齐：检查cache文件中的pair_idx是否与GT中的索引范围匹配
+            if "pair_idx" in pack:
+                cache_pair_idx = pack["pair_idx"]  # [P, 2]
+                sample = reader.get_sample_by_image_id(image_id)
+                if sample is not None:
+                    num_boxes = len(sample.boxes_xyxy)
+                    # 检查pair_idx是否在有效范围内
+                    invalid_pairs = (cache_pair_idx[:, 0] >= num_boxes) | (cache_pair_idx[:, 1] >= num_boxes) | \
+                                   (cache_pair_idx[:, 0] < 0) | (cache_pair_idx[:, 1] < 0)
+                    if invalid_pairs.any():
+                        invalid_count = invalid_pairs.sum()
+                        if batch_idx == 0 and i == 0:  # 只在第一个样本时打印警告
+                            print(f"  ⚠️  Warning: Image {image_id} (cache_id={cache_image_id}) has {invalid_count} invalid pair_idx entries "
+                                  f"(out of {len(cache_pair_idx)} total, num_boxes={num_boxes})")
+                            print(f"     Using temporary fix: image_id = cache_image_id + 1")
             
             all_pred_triplets.append(pred_triplets_list[i])
             all_pred_scores.append(pred_scores_list[i])
@@ -653,9 +673,9 @@ def test(cfg: TestConfig) -> None:
                             # 验证：检查cache文件中的num_obj是否匹配
                             cache_num_obj = pack.get("num_obj", -1)
                             if cache_num_obj != num_boxes:
-                                print(f"  Warning: Image {image_id} num_obj mismatch: cache={cache_num_obj}, actual={num_boxes}")
+                                print(f"  Warning: Image {image_id} (cache_id={cache_image_id}) num_obj mismatch: cache={cache_num_obj}, actual={num_boxes}")
                             
-                            vis_path = os.path.join(cfg.vis_dir, f"vis_{image_id:08d}.png")
+                            vis_path = os.path.join(cfg.vis_dir, f"vis_{cache_image_id:08d}.png")
                             visualize_scene_graph(
                                 sample.image_path,
                                 sample.boxes_xyxy,
@@ -667,10 +687,10 @@ def test(cfg: TestConfig) -> None:
                                 title=f"Image {image_id} (PredCls)",
                             )
                             vis_count += 1
-                            print(f"  Visualized image {image_id} (boxes: {len(sample.boxes_xyxy)}, objects: {len(sample.obj_labels)}, "
+                            print(f"  Visualized image {image_id} (cache_id={cache_image_id}, boxes: {len(sample.boxes_xyxy)}, objects: {len(sample.obj_labels)}, "
                                   f"GT rels: {len(gt_triplets)}, Pred rels: {len(pred_triplets_list[i])})")
                 else:
-                    print(f"  Warning: Could not find sample for image_id {image_id} (may not exist in dataset or index mismatch)")
+                    print(f"  Warning: Could not find sample for image_id {image_id} (cache_id={cache_image_id}, may not exist in dataset or index mismatch)")
         
         if (batch_idx + 1) % 10 == 0:
             print(f"  Processed {batch_idx + 1}/{len(dl)} batches")
