@@ -5,7 +5,10 @@ Fast Training Script for Cached Pairs
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import List, Dict, Any
 import torch
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
@@ -69,16 +72,12 @@ def train(cfg: TrainConfig) -> None:
         for idx in sample_indices:
             cache_file = ds.files[idx]
             pack = torch.load(cache_file, map_location="cpu", weights_only=False)
-            cache_image_id = pack["image_id"]
-            
-            # 临时修复：image n 对应 relation n+1
-            # TODO: 修复后需要移除这个偏移
-            image_id = cache_image_id + 1
+            image_id = pack["image_id"]
             
             # 使用与测试端相同的方式：通过image_id直接从h5文件获取
             sample = reader.get_sample_by_image_id(image_id)
             if sample is None:
-                print(f"  ⚠️  Warning: Image {image_id} (cache_id={cache_image_id}) not found in h5 file (cache file: {os.path.basename(cache_file)})")
+                print(f"  ⚠️  Warning: Image {image_id} not found in h5 file (cache file: {os.path.basename(cache_file)})")
                 mismatch_count += 1
                 continue
             
@@ -93,12 +92,13 @@ def train(cfg: TrainConfig) -> None:
                                (cache_pair_idx[:, 0] < 0) | (cache_pair_idx[:, 1] < 0)
                 if invalid_pairs.any():
                     invalid_count = invalid_pairs.sum()
-                    print(f"  ⚠️  Warning: Image {image_id} (cache_id={cache_image_id}) has {invalid_count} invalid pair_idx entries "
+                    print(f"  ⚠️  Warning: Image {image_id} has {invalid_count} invalid pair_idx entries "
                           f"(out of {len(cache_pair_idx)} total, num_boxes={num_boxes})")
-                    print(f"     Using temporary fix: image_id = cache_image_id + 1")
+                    print(f"     This may indicate cache files were generated with incorrect index mapping.")
+                    print(f"     Please regenerate cache files using the updated build_cache.py")
                     mismatch_count += 1
                 else:
-                    print(f"  ✓ Image {image_id} (cache_id={cache_image_id}): index alignment OK (num_boxes={num_boxes}, pairs={len(cache_pair_idx)})")
+                    print(f"  ✓ Image {image_id}: index alignment OK (num_boxes={num_boxes}, pairs={len(cache_pair_idx)})")
             else:
                 print(f"  ⚠️  Warning: Cache file {os.path.basename(cache_file)} missing pair_idx")
         
@@ -155,12 +155,21 @@ def train(cfg: TrainConfig) -> None:
     print(f"  AMP: {cfg.amp}")
     print(f"  Output directory: {cfg.out_dir}\n")
     
+    # 初始化训练日志
+    training_log: List[Dict[str, Any]] = []
+    log_file = os.path.join(cfg.out_dir, "training_log.json")
+    
     global_step = 0
     for ep in range(cfg.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_valid_pairs = 0
         epoch_total_pairs = 0
+        epoch_num_tp = 0
+        epoch_num_pred_positive = 0
+        epoch_num_gt_positive = 0
+        epoch_valid_masks = 0
+        epoch_total_agents = 0
         
         for it, batch in enumerate(dl):
             geom = batch["geom_feat"].to(device, non_blocking=True)   # [B,P,Gd]
@@ -219,13 +228,94 @@ def train(cfg: TrainConfig) -> None:
                 epoch_loss += loss.item()
                 epoch_valid_pairs += valid_n
                 epoch_total_pairs += B * P
+                
+                # 计算 precision 和 recall
+                # GT positive: labels > 0 (背景是0)
+                gt_positive = (y > 0) & m
+                num_gt_positive = int(gt_positive.sum().item())
+                epoch_num_gt_positive += num_gt_positive
+                
+                # 预测结果
+                pred = logits.argmax(dim=1)  # [B*P]
+                pred_positive = (pred > 0) & m
+                num_pred_positive = int(pred_positive.sum().item())
+                epoch_num_pred_positive += num_pred_positive
+                
+                # True positives: 预测正确且为正样本
+                tp = (pred == y) & (y > 0) & m
+                num_tp = int(tp.sum().item())
+                epoch_num_tp += num_tp
+                
+                # 统计 mask 信息：检查 geom_feat 中的 mask 特征（索引6-10）是否有效
+                # mask特征包括：mask_iou, inter_over_min, contain_i_in_j, contain_j_in_i, rel_area_log
+                # 如果mask有效，mask_iou应该>0（或者至少mask特征不全为0）
+                mask_feat = x[:, 6:11]  # [B*P, 5] mask features
+                # 检查mask_iou（第一个特征）是否>0，或者mask特征是否有非零值
+                mask_valid = (mask_feat[:, 0] > 1e-6) | (mask_feat.abs().sum(dim=1) > 1e-6)  # [B*P]
+                mask_valid = mask_valid & m  # 只统计有效对中的mask
+                num_valid_masks = int(mask_valid.sum().item())
+                epoch_valid_masks += num_valid_masks
+                epoch_total_agents += valid_n  # 每个pair有2个agent（subject和object），但这里统计的是pair数量
+                
+                # 计算当前batch的precision和recall
+                precision = num_tp / max(num_pred_positive, 1)
+                recall = num_tp / max(num_gt_positive, 1)
             
             if global_step % cfg.log_every == 0:
+                # 计算累积的precision和recall
+                cum_precision = epoch_num_tp / max(epoch_num_pred_positive, 1)
+                cum_recall = epoch_num_tp / max(epoch_num_gt_positive, 1)
+                mask_ratio = epoch_valid_masks / max(epoch_total_agents, 1)
+                
                 print(
                     f"[E{ep+1}/{cfg.epochs}] step={global_step} "
                     f"loss={loss.item():.4f} "
-                    f"valid_pairs={valid_n}/{B*P}"
+                    f"num_pairs={valid_n}/{B*P} "
+                    f"num_tp={num_tp} "
+                    f"precision={precision:.4f} "
+                    f"recall={recall:.4f} "
+                    f"valid_mask/total_agent={num_valid_masks}/{valid_n} ({mask_ratio:.4f})"
                 )
+                print(
+                    f"  [Cumulative] tp={epoch_num_tp} "
+                    f"pred_pos={epoch_num_pred_positive} "
+                    f"gt_pos={epoch_num_gt_positive} "
+                    f"precision={cum_precision:.4f} "
+                    f"recall={cum_recall:.4f} "
+                    f"valid_mask/total_agent={epoch_valid_masks}/{epoch_total_agents} ({mask_ratio:.4f})"
+                )
+                
+                # 保存训练日志
+                log_entry = {
+                    "epoch": ep + 1,
+                    "step": global_step,
+                    "loss": float(loss.item()),
+                    "num_pairs": valid_n,
+                    "total_pairs": B * P,
+                    "num_tp": num_tp,
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "valid_mask": num_valid_masks,
+                    "total_agent": valid_n,
+                    "mask_ratio": float(num_valid_masks / max(valid_n, 1)),
+                    "cumulative": {
+                        "num_tp": epoch_num_tp,
+                        "pred_pos": epoch_num_pred_positive,
+                        "gt_pos": epoch_num_gt_positive,
+                        "precision": float(cum_precision),
+                        "recall": float(cum_recall),
+                        "valid_mask": epoch_valid_masks,
+                        "total_agent": epoch_total_agents,
+                        "mask_ratio": float(mask_ratio),
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                }
+                training_log.append(log_entry)
+                
+                # 定期保存日志（每10个log点保存一次）
+                if len(training_log) % 10 == 0:
+                    with open(log_file, 'w') as f:
+                        json.dump(training_log, f, indent=2)
             
             # Save checkpoint (根据save_mode决定)
             should_save = False
@@ -256,12 +346,45 @@ def train(cfg: TrainConfig) -> None:
             avg_loss = epoch_loss / len(dl)
         else:
             avg_loss = 0.0
+        
+        epoch_precision = epoch_num_tp / max(epoch_num_pred_positive, 1)
+        epoch_recall = epoch_num_tp / max(epoch_num_gt_positive, 1)
+        epoch_mask_ratio = epoch_valid_masks / max(epoch_total_agents, 1)
+        
         print(f"\n[Epoch {ep+1} completed]")
         print(f"  Average loss: {avg_loss:.4f}")
         if epoch_total_pairs > 0:
             print(f"  Valid pairs: {epoch_valid_pairs}/{epoch_total_pairs} ({100*epoch_valid_pairs/epoch_total_pairs:.1f}%)")
         else:
             print(f"  Valid pairs: {epoch_valid_pairs}/{epoch_total_pairs} (no valid batches processed)")
+        print(f"  Precision: {epoch_precision:.4f}, Recall: {epoch_recall:.4f}")
+        print(f"    num_tp={epoch_num_tp}, pred_pos={epoch_num_pred_positive}, gt_pos={epoch_num_gt_positive}")
+        print(f"  Valid_mask/total_agent: {epoch_valid_masks}/{epoch_total_agents} ({epoch_mask_ratio:.4f})")
+        
+        # 保存epoch结束的日志
+        epoch_log_entry = {
+            "epoch": ep + 1,
+            "type": "epoch_summary",
+            "avg_loss": float(avg_loss),
+            "valid_pairs": epoch_valid_pairs,
+            "total_pairs": epoch_total_pairs,
+            "valid_ratio": float(epoch_valid_pairs / max(epoch_total_pairs, 1)),
+            "precision": float(epoch_precision),
+            "recall": float(epoch_recall),
+            "num_tp": epoch_num_tp,
+            "pred_pos": epoch_num_pred_positive,
+            "gt_pos": epoch_num_gt_positive,
+            "valid_mask": epoch_valid_masks,
+            "total_agent": epoch_total_agents,
+            "mask_ratio": float(epoch_mask_ratio),
+            "timestamp": datetime.now().isoformat(),
+        }
+        training_log.append(epoch_log_entry)
+        
+        # 保存训练日志
+        with open(log_file, 'w') as f:
+            json.dump(training_log, f, indent=2)
+        print(f"  Training log saved to: {log_file}")
         
         # Save epoch checkpoint（根据save_mode决定）
         if cfg.save_mode == "epoch":

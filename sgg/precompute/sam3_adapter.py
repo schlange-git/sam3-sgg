@@ -53,6 +53,7 @@ class RealSAM3MaskGenerator(BaseSAM3MaskGenerator):
     def predict(self, image: Image.Image, boxes_xyxy: np.ndarray) -> SAM3Output:
         """
         Generate masks using real SAM3
+        确保每个box都有一个mask（取top1，即使没有达到threshold）
         """
         G = boxes_xyxy.shape[0]
         if G == 0:
@@ -73,27 +74,30 @@ class RealSAM3MaskGenerator(BaseSAM3MaskGenerator):
         boxes_tensor = torch.from_numpy(boxes_norm).to(self.device)
         
         # Get embeddings and masks from SAM3
-        # Note: FrozenSAM3GT.forward_batch_boxes returns embeddings
-        # We need to also get masks - let's check the implementation
-        embs = self.sam3.forward_batch_boxes(image, boxes_tensor)  # [G, 256]
-        
-        # For now, we'll generate masks from boxes (rectangular)
-        # TODO: If SAM3 provides masks directly, use them
-        masks = np.zeros((G, self.mask_size, self.mask_size), dtype=bool)
-        
-        # Scale boxes to mask size
-        sx = self.mask_size / max(W, 1)
-        sy = self.mask_size / max(H, 1)
-        
-        for i in range(G):
-            x1, y1, x2, y2 = boxes_xyxy[i]
-            x1m = int(max(0, min(self.mask_size - 1, round(x1 * sx))))
-            x2m = int(max(0, min(self.mask_size - 1, round(x2 * sx))))
-            y1m = int(max(0, min(self.mask_size - 1, round(y1 * sy))))
-            y2m = int(max(0, min(self.mask_size - 1, round(y2 * sy))))
+        # 使用新方法：确保每个box都有一个mask（取top1）
+        if hasattr(self.sam3, 'forward_batch_boxes_with_masks'):
+            embs, masks_tensor = self.sam3.forward_batch_boxes_with_masks(
+                image, boxes_tensor, mask_size=self.mask_size
+            )  # [G, 256], [G, mask_size, mask_size] bool
+            masks = masks_tensor.cpu().numpy().astype(bool)
+        else:
+            # Fallback: 使用旧方法（矩形mask）
+            embs = self.sam3.forward_batch_boxes(image, boxes_tensor)  # [G, 256]
+            masks = np.zeros((G, self.mask_size, self.mask_size), dtype=bool)
             
-            if x2m > x1m and y2m > y1m:
-                masks[i, y1m:y2m, x1m:x2m] = True
+            # Scale boxes to mask size
+            sx = self.mask_size / max(W, 1)
+            sy = self.mask_size / max(H, 1)
+            
+            for i in range(G):
+                x1, y1, x2, y2 = boxes_xyxy[i]
+                x1m = int(max(0, min(self.mask_size - 1, round(x1 * sx))))
+                x2m = int(max(0, min(self.mask_size - 1, round(x2 * sx))))
+                y1m = int(max(0, min(self.mask_size - 1, round(y1 * sy))))
+                y2m = int(max(0, min(self.mask_size - 1, round(y2 * sy))))
+                
+                if x2m > x1m and y2m > y1m:
+                    masks[i, y1m:y2m, x1m:x2m] = True
         
         # Convert embeddings to numpy
         obj_emb = embs.cpu().numpy().astype(np.float32) if embs is not None else None

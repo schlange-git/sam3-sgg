@@ -78,21 +78,29 @@ def build_cache(
     print(f"  SAM3 implementation: {sam3_impl}")
     print(f"  Save every {save_every} images")
     if limit > 0:
-        print(f"  ⚠️  LIMIT MODE: Processing only first {limit} images (for quick validation)")
+        print(f"  ⚠️  LIMIT MODE: Processing only first {limit} SUCCESSFUL images (for quick validation)")
     else:
         print(f"  Processing all images (no limit)")
     print()
     
-    for sample in tqdm(reader.iter_samples(), total=len(reader), desc="Precomputing"):
-        # limit <= 0 means no limit, process all images
-        if limit > 0 and n >= limit:
-            break
-        
+    # 计算total（用于tqdm进度条）
+    # 注意：由于可能有很多图像被跳过，total只是一个估计值
+    if limit > 0:
+        # limit模式下，total设置为limit的2倍（考虑到可能有很多失败）
+        total = min(limit * 2, len(reader))
+    else:
+        total = len(reader)
+    
+    # 使用pbar变量来访问tqdm的方法
+    pbar = tqdm(reader.iter_samples(), total=total, desc="Precomputing")
+    for sample in pbar:
         boxes = sample.boxes_xyxy.astype(np.float32)
         G = boxes.shape[0]
         if G < 2:
             fail_count += 1
             skip_reasons["less_than_2_objects"] = skip_reasons.get("less_than_2_objects", 0) + 1
+            if limit > 0:
+                print(f"  ⚠ Skipped image_id={sample.image_id}: less than 2 objects (G={G})")
             continue
         
         # Load image
@@ -101,6 +109,8 @@ def build_cache(
         except Exception as e:
             fail_count += 1
             skip_reasons[f"image_load_error: {str(e)}"] = skip_reasons.get(f"image_load_error: {str(e)}", 0) + 1
+            if limit > 0:
+                print(f"  ⚠ Skipped image_id={sample.image_id}: image load error: {e}")
             continue
         
         # 1) GT-driven masks
@@ -112,6 +122,8 @@ def build_cache(
         except Exception as e:
             fail_count += 1
             skip_reasons[f"sam3_error: {str(e)}"] = skip_reasons.get(f"sam3_error: {str(e)}", 0) + 1
+            if limit > 0:
+                print(f"  ⚠ Skipped image_id={sample.image_id}: SAM3 error: {e}")
             continue
         
         # 2) Sample pairs (fixed P)
@@ -143,10 +155,38 @@ def build_cache(
             "num_obj": int(G),
         }
         out_path = os.path.join(out_dir, f"{sample.image_id:08d}.pt")
-        torch_save(pack, out_path)
         
-        success_count += 1
-        n += 1
+        try:
+            torch_save(pack, out_path)
+            success_count += 1
+            n += 1
+            
+            # 调试信息：每成功处理一个就输出（特别是在limit模式下）
+            # 使用print而不是pbar.write，确保立即输出
+            if limit > 0:
+                # limit模式下，每个成功都输出
+                print(f"\n  ✓ [{success_count}/{limit}] Successfully saved pt file: {os.path.basename(out_path)} (image_id={sample.image_id}, num_obj={G})")
+            elif success_count % 10 == 0:
+                # 非limit模式下，每10个输出一次
+                print(f"\n  ✓ Successfully processed {success_count} pt files...")
+            
+            # 更新进度条描述
+            pbar.set_description(f"Precomputing (success: {success_count}, fail: {fail_count})")
+            
+            # Check limit after successful processing
+            # limit <= 0 means no limit, process all images
+            # limit > 0 means process only first N successful images
+            if limit > 0 and success_count >= limit:
+                print(f"\n  ✓ Reached limit of {limit} successful images. Stopping.")
+                pbar.close()
+                break
+        except Exception as e:
+            fail_count += 1
+            skip_reasons[f"save_error: {str(e)}"] = skip_reasons.get(f"save_error: {str(e)}", 0) + 1
+            print(f"\n  ✗ Failed to save pt file for image_id={sample.image_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
         
         # Periodic save: update metadata every save_every images
         if n - last_save_count >= save_every:
