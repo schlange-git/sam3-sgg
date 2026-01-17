@@ -330,12 +330,22 @@ class VG150Dataset(Dataset):
             img_labels = self.labels[first_box:last_box+1]  # [G] object class labels
             
             # Load image first to get actual dimensions
+            # _get_image_path 会自动在 images 和 images2 之间切换查找
             img_path = self._get_image_path(img_id)
             if img_path and os.path.exists(img_path):
-                image = Image.open(img_path).convert("RGB")
-                actual_w, actual_h = image.size
+                try:
+                    image = Image.open(img_path).convert("RGB")
+                    actual_w, actual_h = image.size
+                except Exception as e:
+                    # 如果图像文件损坏，创建 dummy image
+                    if img_id % 1000 == 0:  # 只偶尔打印警告
+                        print(f"Warning: Failed to open image {img_id} at {img_path}: {e}")
+                    actual_w, actual_h = 1000, 1000
+                    image = Image.new('RGB', (actual_w, actual_h), color='white')
             else:
-                # Fallback: create dummy image
+                # Fallback: create dummy image (如果两个目录都找不到)
+                if img_id % 1000 == 0:  # 只偶尔打印警告
+                    print(f"Warning: Image {img_id} not found in {self.image_dirs}, using dummy image")
                 actual_w, actual_h = 1000, 1000
                 image = Image.new('RGB', (actual_w, actual_h), color='white')
             
