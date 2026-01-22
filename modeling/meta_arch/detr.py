@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from multiprocessing import Condition
 from turtle import back
 from typing import List
@@ -177,13 +178,25 @@ class Detr(nn.Module):
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
             mask_pred = output["pred_masks"] if self.mask_on else None
-            results = self.inference(box_cls, box_pred, mask_pred, images.image_sizes)
+            # 提取image_sizes
+            if hasattr(self.detr, 'use_pre_extracted_features') and self.detr.use_pre_extracted_features:
+                # 从batched_inputs中提取image_sizes
+                image_sizes = [(x['height'], x['width']) for x in batched_inputs]
+            else:
+                image_sizes = images.image_sizes
+            results = self.inference(box_cls, box_pred, mask_pred, image_sizes)
             processed_results = []
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, image_sizes):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r})
+                processed_results.append({
+                    "instances": r,
+                    "rel_pair_idxs": results_per_image._rel_pair_idxs,
+                    "pred_rel_scores": results_per_image._pred_rel_scores,
+                    "pred_rel_labels": results_per_image._pred_rel_labels,
+                    "query_index": results_per_image._query_index,
+                })
             return processed_results
 
     def prepare_targets(self, targets):
@@ -263,8 +276,15 @@ class IterativeRelationDetr(Detr):
             dict[str: Tensor]:
                 mapping from a named loss to a tensor storing the loss. Used during training only.
         """
-        images = self.preprocess_image(batched_inputs)
-        output = self.detr(images)
+        # 检查是否使用预提取特征
+        if hasattr(self.detr, 'use_pre_extracted_features') and self.detr.use_pre_extracted_features:
+            # 预提取特征模式：直接传递特征字典给DETR模型
+            output = self.detr(batched_inputs)
+        else:
+            # 标准图像处理模式
+            images = self.preprocess_image(batched_inputs)
+            output = self.detr(images)
+
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             gt_relations = [x["relations"].to(self.device) for x in batched_inputs]
@@ -281,18 +301,43 @@ class IterativeRelationDetr(Detr):
             # import pdb;pdb.set_trace()
             return loss_dict
         else:
-            results = self.inference(output, images.image_sizes)
+            # 提取image_sizes
+            if hasattr(self.detr, 'use_pre_extracted_features') and self.detr.use_pre_extracted_features:
+                # 从batched_inputs中提取image_sizes
+                image_sizes = [(x['height'], x['width']) for x in batched_inputs]
+            else:
+                image_sizes = images.image_sizes
+            results = self.inference(output, image_sizes)
             processed_results = []
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+            debug_rel = os.environ.get("SPEAQ_DEBUG_REL_OUT", "0") == "1"
+            debug_limit = int(os.environ.get("SPEAQ_DEBUG_REL_OUT_LIMIT", "20"))
+            debug_count = getattr(self, "_debug_rel_out_count", 0)
+            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, image_sizes):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r,
-                                          "rel_pair_idxs": results_per_image._rel_pair_idxs,
-                                          "pred_rel_scores": results_per_image._pred_rel_scores,
-                                          "pred_rel_labels": results_per_image._pred_rel_labels,
-                                          "query_index": results_per_image._query_index
-                                         })
+                if debug_rel and debug_count < debug_limit:
+                    rel_pair = getattr(results_per_image, "_rel_pair_idxs", None)
+                    rel_scores = getattr(results_per_image, "_pred_rel_scores", None)
+                    rel_labels = getattr(results_per_image, "_pred_rel_labels", None)
+                    logging.getLogger("detectron2").info(
+                        "[SPEAQ_DEBUG_REL_OUT] image_id=%s pred_boxes=%d "
+                        "rel_pair=%s rel_scores_shape=%s rel_labels_shape=%s",
+                        input_per_image.get("image_id", "unknown"),
+                        int(r.pred_boxes.tensor.shape[0]) if hasattr(r, "pred_boxes") else -1,
+                        "None" if rel_pair is None else str(tuple(rel_pair.shape)),
+                        "None" if rel_scores is None else str(tuple(rel_scores.shape)),
+                        "None" if rel_labels is None else str(tuple(rel_labels.shape)),
+                    )
+                    debug_count += 1
+                processed_results.append({
+                    "instances": r,
+                    "rel_pair_idxs": results_per_image._rel_pair_idxs,
+                    "pred_rel_scores": results_per_image._pred_rel_scores,
+                    "pred_rel_labels": results_per_image._pred_rel_labels,
+                    "query_index": results_per_image._query_index,
+                })
+            self._debug_rel_out_count = debug_count
             return processed_results
 
     def inference(self, output, image_sizes):
@@ -406,7 +451,7 @@ class IterativeRelationDetr(Detr):
                 result._rel_pair_idxs = rel_pair_idx[keep_triplet == 1] # (#rel, 2)
                 result._pred_rel_scores = rel_class_prob[keep_triplet == 1] # (#rel, #rel_class)
                 result._pred_rel_labels = rel_labels[keep_triplet == 1] # (#rel, )
-                result._query_index=sorting_idx[keep_triplet==1]
+                result._query_index = sorting_idx[keep_triplet == 1]
                 results.append(result)
         return results
 

@@ -2,8 +2,12 @@ import sys
 import os
 import numpy as np
 import torch
+import warnings
 sys.path.insert(0, '../../')
 sys.path.insert(0, '../')
+
+# Suppress FutureWarning from detectron2 autocast usage
+warnings.filterwarnings("ignore", category=FutureWarning, module="detectron2.engine.train_loop")
 
 import detectron2.utils.comm as comm
 from detectron2.utils.logger import setup_logger

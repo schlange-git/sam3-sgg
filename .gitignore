@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Training outputs
+output*/
+tmp/
+wandb/
+runs/
+logs/
+
+# Model weights and checkpoints
+*.pth
+*.pkl
+*.h5
+last_checkpoint
+best_model*.pth
+
+# Backup
+*backup*/
+code_backup/
+
+# Logs and metrics
+*.log
+log.txt
+metrics.json
+events.out.tfevents.*
+
+# Inference results
+inference/
+
+# Pretrained weights (uncomment if you want to track them)
+# pretrained_weights/
+
+# Dataset cache
+*.cache
+VG_*.json.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+*.tmp
+temp.*

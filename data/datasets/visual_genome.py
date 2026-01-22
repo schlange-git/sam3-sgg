@@ -128,7 +128,13 @@ class VisualGenomeTrainData:
         """
         Load data in detectron format
         """
-        fileName = "tmp/visual_genome_{}_data_{}{}{}{}{}{}{}{}.pkl".format(self.split, 'masks' if self.mask_exists else '', '_oi' if 'oi' in self.mask_location else '', "_clamped" if self.clamped else "", "_precomp" if self.precompute else "", "_clipped" if self.clipped else "", '_overlapfalse' if not self.cfg.DATASETS.VISUAL_GENOME.FILTER_NON_OVERLAP else "", '_emptyfalse' if not self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS else '', "_perclass" if self.per_class_dataset else '')
+        overfit_num = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES
+        overfit_seed = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED
+        overfit_source = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT
+        overfit_tag = ""
+        if overfit_num > 0:
+            overfit_tag = "_overfit{}_seed{}_{}".format(overfit_num, overfit_seed, overfit_source)
+        fileName = "tmp/visual_genome_{}_data_{}{}{}{}{}{}{}{}{}.pkl".format(self.split, 'masks' if self.mask_exists else '', '_oi' if 'oi' in self.mask_location else '', "_clamped" if self.clamped else "", "_precomp" if self.precompute else "", "_clipped" if self.clipped else "", '_overlapfalse' if not self.cfg.DATASETS.VISUAL_GENOME.FILTER_NON_OVERLAP else "", '_emptyfalse' if not self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS else '', "_perclass" if self.per_class_dataset else '', overfit_tag)
         print("Loading file: ", fileName)
         if os.path.isfile(fileName):
             #If data has been processed earlier, load that to save time
@@ -202,22 +208,46 @@ class VisualGenomeTrainData:
         Parse examples and create dictionaries
         """
         data_split = self.VG_attribute_h5['split'][:]
-        split_flag = 2 if self.split == 'test' else 0
-        split_mask = data_split == split_flag
-        
-        #Filter images without bounding boxes
-        split_mask &= self.VG_attribute_h5['img_to_first_box'][:] >= 0
-        if self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS:
-            split_mask &= self.VG_attribute_h5['img_to_first_rel'][:] >= 0
-        image_index = np.where(split_mask)[0]
-        
-        if self.split == 'val':
-            image_index = image_index[:self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES]
-        elif self.split == 'train':
-            image_index = image_index[self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES:]
-        
-        split_mask = np.zeros_like(data_split).astype(bool)
-        split_mask[image_index] = True
+
+        def _image_index_for_split(split_name):
+            split_flag = 2 if split_name == 'test' else 0
+            split_mask = data_split == split_flag
+            #Filter images without bounding boxes
+            split_mask &= self.VG_attribute_h5['img_to_first_box'][:] >= 0
+            if self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS:
+                split_mask &= self.VG_attribute_h5['img_to_first_rel'][:] >= 0
+            image_index = np.where(split_mask)[0]
+            if split_name == 'val':
+                image_index = image_index[:self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES]
+            elif split_name == 'train':
+                image_index = image_index[self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES:]
+            return image_index
+
+        overfit_num = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES
+        if overfit_num > 0:
+            overfit_seed = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED
+            overfit_source = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT
+            if overfit_source not in ['train', 'val', 'test']:
+                overfit_source = 'train'
+            source_image_index = _image_index_for_split(overfit_source)
+            os.makedirs('tmp', exist_ok=True)
+            overfit_cache = "tmp/visual_genome_overfit_{}_seed_{}_{}.pkl".format(overfit_num, overfit_seed, overfit_source)
+            if os.path.isfile(overfit_cache):
+                with open(overfit_cache, 'rb') as inputFile:
+                    image_index = pickle.load(inputFile)
+            else:
+                rng = np.random.RandomState(overfit_seed)
+                sample_size = min(overfit_num, len(source_image_index))
+                image_index = rng.choice(source_image_index, size=sample_size, replace=False)
+                image_index = np.sort(image_index)
+                with open(overfit_cache, 'wb') as inputFile:
+                    pickle.dump(image_index, inputFile)
+            split_mask = np.zeros_like(data_split).astype(bool)
+            split_mask[image_index] = True
+        else:
+            image_index = _image_index_for_split(self.split)
+            split_mask = np.zeros_like(data_split).astype(bool)
+            split_mask[image_index] = True
         
         # Get box information
         all_labels = self.VG_attribute_h5['labels'][:, 0]
@@ -400,10 +430,10 @@ def box_filter(boxes, must_overlap=False):
     If no overlapping boxes, use all of them."""
     n_cands = boxes.shape[0]
 
-    overlaps = bbox_overlaps(boxes.astype(np.float), boxes.astype(np.float), to_move=0) > 0
+    overlaps = bbox_overlaps(boxes.astype(np.float32), boxes.astype(np.float32), to_move=0) > 0
     np.fill_diagonal(overlaps, 0)
 
-    all_possib = np.ones_like(overlaps, dtype=np.bool)
+    all_possib = np.ones_like(overlaps, dtype=np.bool_)
     np.fill_diagonal(all_possib, 0)
 
     if must_overlap:

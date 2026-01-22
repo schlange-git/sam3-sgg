@@ -93,6 +93,9 @@ class SceneGraphEvaluator(DatasetEvaluator):
         self._ground_truths = []
         self._predictions = []
         self._zero_shot_triplets = self._get_zero_shot_triplets() - 1
+        self._debug_eval = os.environ.get("SPEAQ_DEBUG_EVAL", "0") == "1"
+        self._debug_limit = int(os.environ.get("SPEAQ_DEBUG_EVAL_LIMIT", "20"))
+        self._debug_count = 0
 
     def reset(self,total):
         self.detection_evaluator.reset()
@@ -141,10 +144,42 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 instances = output["instances"].to(self._cpu_device)
                 prediction["image_id"] = input["image_id"]
                 prediction["instances"] = instances
-                prediction['rel_pair_idxs'] = output["rel_pair_idxs"].to(self._cpu_device)
-                prediction['pred_rel_scores'] = output["pred_rel_scores"].to(self._cpu_device)
-                prediction['pred_rel_labels'] = output['pred_rel_labels'].to(self._cpu_device)
-                prediction['query_index']=output['query_index'].to(self._cpu_device)
+                num_rel_category = self.cfg.MODEL.ROI_SCENEGRAPH_HEAD.NUM_CLASSES
+                rel_pair_idxs = output.get("rel_pair_idxs", getattr(output["instances"], "_rel_pair_idxs", None))
+                pred_rel_scores = output.get("pred_rel_scores", getattr(output["instances"], "_pred_rel_scores", None))
+                pred_rel_labels = output.get("pred_rel_labels", getattr(output["instances"], "_pred_rel_labels", None))
+                query_index = output.get("query_index", getattr(output["instances"], "_query_index", None))
+                if rel_pair_idxs is None:
+                    rel_pair_idxs = torch.zeros((0, 2), dtype=torch.int64)
+                if pred_rel_scores is None:
+                    pred_rel_scores = torch.zeros((0, num_rel_category), dtype=torch.float32)
+                if pred_rel_labels is None:
+                    pred_rel_labels = torch.zeros((0,), dtype=torch.int64)
+                if query_index is None:
+                    query_index = torch.zeros((0,), dtype=torch.int64)
+                prediction['rel_pair_idxs'] = rel_pair_idxs.to(self._cpu_device)
+                prediction['pred_rel_scores'] = pred_rel_scores.to(self._cpu_device)
+                prediction['pred_rel_labels'] = pred_rel_labels.to(self._cpu_device)
+                prediction['query_index'] = query_index.to(self._cpu_device)
+                if self._debug_eval and self._debug_count < self._debug_limit:
+                    self._logger.info(
+                        "[SPEAQ_DEBUG_EVAL] image_id=%s gt_rel=%d gt_boxes=%d "
+                        "pred_boxes=%d pred_rel=%d pred_rel_scores_shape=%s",
+                        input.get("image_id", "unknown"),
+                        int(ground_truth['relation_tuple'].shape[0]),
+                        int(ground_truth['gt_boxes'].tensor.shape[0]),
+                        int(instances.pred_boxes.tensor.shape[0]),
+                        int(prediction['rel_pair_idxs'].shape[0]),
+                        tuple(prediction['pred_rel_scores'].shape),
+                    )
+                    self._debug_count += 1
+            else:
+                if self._debug_eval and self._debug_count < self._debug_limit:
+                    self._logger.warning(
+                        "[SPEAQ_DEBUG_EVAL] image_id=%s output has no instances",
+                        input.get("image_id", "unknown"),
+                    )
+                    self._debug_count += 1
 #                 prediction['subject_scores'] = output['subject_scores'].to(self._cpu_device)
 #                 prediction['object_scores'] = output['object_scores'].to(self._cpu_device)
 #                 prediction['predicate_scores'] = output['predicate_scores'].to(self._cpu_device)
