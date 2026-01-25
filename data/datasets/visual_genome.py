@@ -211,16 +211,16 @@ class VisualGenomeTrainData:
 
         def _image_index_for_split(split_name):
             split_flag = 2 if split_name == 'test' else 0
-            split_mask = data_split == split_flag
-            #Filter images without bounding boxes
-            split_mask &= self.VG_attribute_h5['img_to_first_box'][:] >= 0
-            if self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS:
-                split_mask &= self.VG_attribute_h5['img_to_first_rel'][:] >= 0
-            image_index = np.where(split_mask)[0]
+        split_mask = data_split == split_flag
+        #Filter images without bounding boxes
+        split_mask &= self.VG_attribute_h5['img_to_first_box'][:] >= 0
+        if self.cfg.DATASETS.VISUAL_GENOME.FILTER_EMPTY_RELATIONS:
+            split_mask &= self.VG_attribute_h5['img_to_first_rel'][:] >= 0
+        image_index = np.where(split_mask)[0]
             if split_name == 'val':
-                image_index = image_index[:self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES]
+            image_index = image_index[:self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES]
             elif split_name == 'train':
-                image_index = image_index[self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES:]
+            image_index = image_index[self.cfg.DATASETS.VISUAL_GENOME.NUMBER_OF_VALIDATION_IMAGES:]
             return image_index
 
         overfit_num = self.cfg.DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES
@@ -246,8 +246,8 @@ class VisualGenomeTrainData:
             split_mask[image_index] = True
         else:
             image_index = _image_index_for_split(self.split)
-            split_mask = np.zeros_like(data_split).astype(bool)
-            split_mask[image_index] = True
+        split_mask = np.zeros_like(data_split).astype(bool)
+        split_mask[image_index] = True
         
         # Get box information
         all_labels = self.VG_attribute_h5['labels'][:, 0]

@@ -120,6 +120,26 @@ SGG eval:    zR @ 20: 0.0123;    zR @ 50: 0.0304;    zR @ 100: 0.0463;  for mode
 SGG eval:    mR @ 20: 0.1011;    mR @ 50: 0.1508;    mR @ 100: 0.1760;  for mode=sgdet, type=Mean Recall.
 ```
 
+## SAM3 Backbone (Experimental)
+We added an experimental switch to use SAM3 as the backbone instead of ResNet. This is meant to get the pipeline running first (no explicit FPN fusion). You can enable it with the following config overrides:
+```
+MODEL.SAM3.ENABLED True
+MODEL.SAM3.CHECKPOINT_PATH <PATH_TO_SAM3_CHECKPOINT>   # optional
+MODEL.SAM3.IMAGE_SIZE 1008
+MODEL.SAM3.FEATURE_DIM 256
+MODEL.SAM3.FREEZE True
+```
+Example:
+```
+python train_iterative_model.py --num-gpus 1 --config-file configs/speaq.yaml \
+OUTPUT_DIR output_sam3_run \
+MODEL.SAM3.ENABLED True MODEL.SAM3.CHECKPOINT_PATH /path/to/sam3.pt \
+DATASETS.VISUAL_GENOME.IMAGES <PATH TO VG_100K IMAGES> \
+DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY <PATH TO VG-SGG-dicts-with-attri.json> \
+DATASETS.VISUAL_GENOME.IMAGE_DATA <PATH TO image_data.json> \
+DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 <PATH TO VG-SGG-with-attri.h5>
+```
+
 ## Citations
 ```
 @inproceedings{kim2024groupwise,

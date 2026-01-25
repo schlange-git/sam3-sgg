@@ -8,6 +8,8 @@
 
 set -e  # 遇到错误立即退出
 
+rm -rf z_outputs
+
 # ============================================================================
 # 配置参数 (可通过命令行参数覆盖)
 # ============================================================================
@@ -17,9 +19,24 @@ NUM_GPUS=1
 FINETUNE_ITERS=200
 OVERFIT_NUM_IMAGES=2
 OVERFIT_SEED=42
-BATCH_SIZE=4
+BATCH_SIZE=1
 NUM_WORKERS=2
 CHECKPOINT_PERIOD=50
+# SAM3 backbone settings
+SAM3_ENABLED=True
+SAM3_CHECKPOINT_PATH="sam3/weights/sam3.pt"
+SAM3_IMAGE_SIZE=1008
+SAM3_FEATURE_DIM=256
+SAM3_CHANNEL_REPEAT=1
+SAM3_FREEZE=True
+SAM3_EVAL_ENABLED=${SAM3_ENABLED}
+SAM3_DEVICE="cpu"
+# DETR head-only loading
+DETR_HEAD_ONLY=True
+DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"
+# DETR query settings
+DETR_NUM_OBJECT_QUERIES=10
+DETR_NUM_RELATION_QUERIES=10
 
 # 数据集路径
 DATASET_ROOT="/home/shi/abschluss/dataset/vg150"
@@ -33,7 +50,7 @@ PRETRAINED_WEIGHTS="vg_objectdetector_pretrained.pth"
 
 # 输出目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_BASE="output_pipeline_${TIMESTAMP}"
+OUTPUT_BASE="z_outputs/output_pipeline_${TIMESTAMP}"
 OUTPUT_PRETRAINED="${OUTPUT_BASE}/pretrained_eval"
 OUTPUT_FINETUNE="${OUTPUT_BASE}/finetune_${FINETUNE_ITERS}iter"
 
@@ -63,6 +80,62 @@ while [[ $# -gt 0 ]]; do
             BATCH_SIZE="$2"
             shift 2
             ;;
+        --sam3)
+            SAM3_ENABLED=True
+            shift 1
+            ;;
+        --sam3-checkpoint)
+            SAM3_CHECKPOINT_PATH="$2"
+            shift 2
+            ;;
+        --sam3-image-size)
+            SAM3_IMAGE_SIZE="$2"
+            shift 2
+            ;;
+        --sam3-feature-dim)
+            SAM3_FEATURE_DIM="$2"
+            shift 2
+            ;;
+        --sam3-channel-repeat)
+            SAM3_CHANNEL_REPEAT="$2"
+            shift 2
+            ;;
+        --sam3-device)
+            SAM3_DEVICE="$2"
+            shift 2
+            ;;
+        --detr-head-only)
+            DETR_HEAD_ONLY=True
+            shift 1
+            ;;
+        --detr-head-weights)
+            DETR_HEAD_WEIGHTS="$2"
+            shift 2
+            ;;
+        --obj-queries)
+            DETR_NUM_OBJECT_QUERIES="$2"
+            shift 2
+            ;;
+        --rel-queries)
+            DETR_NUM_RELATION_QUERIES="$2"
+            shift 2
+            ;;
+        --sam3-freeze)
+            SAM3_FREEZE=True
+            shift 1
+            ;;
+        --sam3-unfreeze)
+            SAM3_FREEZE=False
+            shift 1
+            ;;
+        --sam3-eval)
+            SAM3_EVAL_ENABLED=True
+            shift 1
+            ;;
+        --sam3-eval-off)
+            SAM3_EVAL_ENABLED=False
+            shift 1
+            ;;
         --pretrained)
             PRETRAINED_WEIGHTS="$2"
             shift 2
@@ -83,6 +156,20 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpus NUM_GPUS         使用的 GPU 数量 (默认: 1)"
             echo "  --overfit NUM_IMAGES    过拟合数据集大小 (默认: 10)"
             echo "  --batch-size SIZE       批次大小 (默认: 2)"
+            echo "  --sam3                 启用 SAM3 backbone"
+            echo "  --sam3-checkpoint PATH SAM3 checkpoint 路径（可选）"
+            echo "  --sam3-image-size SIZE SAM3 输入分辨率 (默认: 1008)"
+            echo "  --sam3-feature-dim DIM SAM3 输出特征维度 (默认: 256)"
+            echo "  --sam3-channel-repeat N SAM3 通道重复次数 (默认: 1)"
+            echo "  --sam3-device DEV      SAM3 设备 (cuda 或 cpu, 默认: cuda)"
+            echo "  --sam3-freeze          冻结 SAM3 参数（默认）"
+            echo "  --sam3-unfreeze        解冻 SAM3 参数"
+            echo "  --sam3-eval            评测阶段启用 SAM3（默认跟随 --sam3）"
+            echo "  --sam3-eval-off        评测阶段禁用 SAM3（用于评测ResNet预训练权重）"
+            echo "  --detr-head-only       仅加载 DETR head 权重"
+            echo "  --detr-head-weights    DETR head 权重路径"
+            echo "  --obj-queries N        DETR 对象 query 数 (默认: 300)"
+            echo "  --rel-queries N        DETR 关系 query 数 (默认: 300)"
             echo "  --pretrained PATH       预训练权重路径 (默认: vg_objectdetector_pretrained.pth)"
             echo "  --dataset PATH          数据集根目录 (默认: /home/shi/abschluss/dataset/vg150)"
             echo "  -h, --help              显示此帮助信息"
@@ -114,6 +201,18 @@ echo "  Finetune 迭代: ${FINETUNE_ITERS}"
 echo "  过拟合数据集: ${OVERFIT_NUM_IMAGES} 张图片"
 echo "  GPU 数量: ${NUM_GPUS}"
 echo "  批次大小: ${BATCH_SIZE}"
+echo "  SAM3 启用: ${SAM3_ENABLED}"
+echo "  SAM3 评测启用: ${SAM3_EVAL_ENABLED}"
+echo "  SAM3 Checkpoint: ${SAM3_CHECKPOINT_PATH}"
+echo "  SAM3 Image Size: ${SAM3_IMAGE_SIZE}"
+echo "  SAM3 Feature Dim: ${SAM3_FEATURE_DIM}"
+echo "  SAM3 Channel Repeat: ${SAM3_CHANNEL_REPEAT}"
+echo "  SAM3 Device: ${SAM3_DEVICE}"
+echo "  SAM3 Freeze: ${SAM3_FREEZE}"
+echo "  DETR Head-only: ${DETR_HEAD_ONLY}"
+echo "  DETR Head weights: ${DETR_HEAD_WEIGHTS}"
+echo "  DETR Obj Queries: ${DETR_NUM_OBJECT_QUERIES}"
+echo "  DETR Rel Queries: ${DETR_NUM_RELATION_QUERIES}"
 echo "  输出目录: ${OUTPUT_BASE}/"
 echo ""
 
@@ -139,6 +238,39 @@ fi
 echo "激活 conda 环境: speaq"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate speaq
+
+# Ensure SAM3 package is importable
+export PYTHONPATH="$(pwd)/sam3:$(pwd):${PYTHONPATH}"
+# CUDA allocator hint to reduce fragmentation
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Verify SAM3 dependencies; install editable package if missing
+set +e
+python - <<'PY'
+import sys, os
+sys.path.insert(0, os.path.abspath("sam3"))
+try:
+    import sam3.model_builder  # noqa: F401
+    print("✓ sam3 import ok")
+    sys.exit(0)
+except Exception as e:
+    print("sam3 import failed:", type(e).__name__, e)
+    sys.exit(1)
+PY
+SAM3_IMPORT_STATUS=$?
+set -e
+if [ ${SAM3_IMPORT_STATUS} -ne 0 ]; then
+    echo "尝试安装 sam3 依赖 (pip install -e sam3)..."
+    python -m pip install -e sam3 || {
+        echo "❌ sam3 依赖安装失败，请手动执行: python -m pip install -e sam3"
+        exit 1
+    }
+    echo "补充安装 sam3 运行所需依赖 (einops)..."
+    python -m pip install einops || {
+        echo "❌ einops 安装失败，请手动执行: python -m pip install einops"
+        exit 1
+    }
+fi
 
 # 检查 Python 脚本
 if [ ! -f "train_iterative_model.py" ]; then
@@ -167,6 +299,17 @@ python train_iterative_model.py --eval-only --num-gpus ${NUM_GPUS} \
     --config-file configs/speaq.yaml --dist-url ${PORT_PRETRAINED} \
     OUTPUT_DIR "${OUTPUT_PRETRAINED}" \
     MODEL.WEIGHTS "${PRETRAINED_WEIGHTS}" \
+    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+    MODEL.SAM3.ENABLED ${SAM3_EVAL_ENABLED} \
+    MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+    MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+    MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+    MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+    MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
@@ -200,6 +343,17 @@ python train_iterative_model.py --num-gpus ${NUM_GPUS} \
     --config-file configs/speaq.yaml --dist-url ${PORT_FINETUNE} \
     OUTPUT_DIR "${OUTPUT_FINETUNE}" \
     MODEL.WEIGHTS "${PRETRAINED_WEIGHTS}" \
+    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+    MODEL.SAM3.ENABLED ${SAM3_ENABLED} \
+    MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+    MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+    MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+    MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+    MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
@@ -280,6 +434,18 @@ SpeaQ 全链路训练与评测流程 - 执行总结
   GPU 数量:       ${NUM_GPUS}
   批次大小:       ${BATCH_SIZE}
   检查点周期:     每 ${CHECKPOINT_PERIOD} 次迭代
+  SAM3 启用:      ${SAM3_ENABLED}
+  SAM3 评测启用:  ${SAM3_EVAL_ENABLED}
+  SAM3 Checkpoint:${SAM3_CHECKPOINT_PATH}
+  SAM3 Image Size:${SAM3_IMAGE_SIZE}
+  SAM3 Feature Dim:${SAM3_FEATURE_DIM}
+  SAM3 Channel Repeat:${SAM3_CHANNEL_REPEAT}
+  SAM3 Device:    ${SAM3_DEVICE}
+  SAM3 Freeze:    ${SAM3_FREEZE}
+  DETR Head-only: ${DETR_HEAD_ONLY}
+  DETR Head weights:${DETR_HEAD_WEIGHTS}
+  DETR Obj Queries:${DETR_NUM_OBJECT_QUERIES}
+  DETR Rel Queries:${DETR_NUM_RELATION_QUERIES}
 
 生成的文件:
 ────────────────────────────────────────────────────────────────

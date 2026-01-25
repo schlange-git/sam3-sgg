@@ -1,5 +1,6 @@
 import sys
 import os
+import gc
 import numpy as np
 import torch
 import warnings
@@ -26,6 +27,23 @@ from shutil import copyfile
 
 parser = default_argument_parser()
 
+def log_gpu_memory(prefix: str) -> None:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        allocated = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        total = torch.cuda.get_device_properties(device).total_memory / (1024 ** 2)
+        print(f"{prefix} GPU memory: total={total:.1f} MiB, allocated={allocated:.1f} MiB, reserved={reserved:.1f} MiB")
+    else:
+        print(f"{prefix} GPU memory: CUDA not available")
+
+def cleanup_cuda(prefix: str) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    log_gpu_memory(prefix)
+
 def backup_source_codes(cfg):
     if comm.is_main_process():
         output_dir = cfg.OUTPUT_DIR
@@ -42,6 +60,8 @@ def backup_source_codes(cfg):
             if extension == 'pth' or extension == 'pkl':
                 continue
             else:
+                if os.path.isdir(file):
+                    continue
                 target_dir = os.path.join(output_dir, 'code_backup', file)
                 os.makedirs(os.path.dirname(target_dir), exist_ok=True)
                 copyfile(file, target_dir)
@@ -53,6 +73,9 @@ def setup(args):
     assert(cfg.MODEL.ROI_SCENEGRAPH_HEAD.MODE in ['predcls', 'sgls', 'sgdet']), "Mode {} not supported".format(cfg.MODEL.ROI_SCENEGRaGraph.MODE)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    if cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS:
+        # Avoid full-model loading when only DETR head weights are intended
+        cfg.MODEL.WEIGHTS = ""
     cfg.freeze()
     register_datasets(cfg)
     # register_coco_data(cfg)
@@ -63,6 +86,7 @@ def setup(args):
 
 def main(args):
     cfg = setup(args)
+    cleanup_cuda("Before building model")
     if args.eval_only:
         model = JointTransformerTrainer.build_model(cfg)
         # from thop import profile

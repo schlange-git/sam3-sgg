@@ -22,7 +22,7 @@ from ..transformer import build_detr, build_criterion, build_transformer, build_
 from ..transformer.segmentation import DETRsegm, PostProcessPanoptic, PostProcessSegm
 from ..transformer.util.utils import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh, NestedTensor, convert_coco_poly_to_mask
 from ..transformer.util import box_ops
-from ..backbone import MaskedBackbone, Joiner, Backbone, DeformableDETRMaskedBackbone, DeformableDETRJoiner
+from ..backbone import MaskedBackbone, Joiner, Backbone, DeformableDETRMaskedBackbone, DeformableDETRJoiner, Sam3MaskedBackbone
 from detectron2.layers import batched_nms
 
 __all__ = ["Detr"]
@@ -74,7 +74,7 @@ class Detr(nn.Module):
         beta = cfg.MODEL.DETR.BETA
         matcher_topk = cfg.MODEL.DETR.MATCHER_TOPK
         self.nms_thresh = cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST
-        d2_backbone = MaskedBackbone(cfg)
+        d2_backbone = Sam3MaskedBackbone(cfg) if cfg.MODEL.SAM3.ENABLED else MaskedBackbone(cfg)
         position_embedding = build_position_encoding(cfg.MODEL.DETR.POSITION_EMBEDDING, hidden_dim)
         backbone = Joiner(d2_backbone, position_embedding)
         backbone.num_channels = d2_backbone.num_channels
@@ -123,6 +123,7 @@ class Detr(nn.Module):
             one2many_scheme =cfg.MODEL.DETR.ONE2MANY_SCHEME, match_independent = cfg.MODEL.DETR.MATCH_INDEPENDENT)
         self.criterion.to(self.device)
 
+        self.use_sam3_backbone = cfg.MODEL.SAM3.ENABLED
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
         pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
@@ -131,6 +132,9 @@ class Detr(nn.Module):
         self._freeze_layers(layers=cfg.MODEL.DETR.FREEZE_LAYERS)
         pytorch_total_params = sum(p.numel() for p in self.parameters())
         print ("Number of Parameters:", pytorch_total_params)
+
+        if cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS:
+            self._load_detr_head_only(cfg.MODEL.DETR.HEAD_WEIGHTS)
 
     def _freeze_layers(self, layers):
         # Freeze layers
@@ -144,6 +148,33 @@ class Detr(nn.Module):
         pretrained_detr = torch.load(path)['model']
         pretrained_detr_without_class_head = {k: v for k, v in pretrained_detr.items() if 'class_embed' not in k}
         self.detr.load_state_dict(pretrained_detr_without_class_head, strict=False)
+
+    def _load_detr_head_only(self, path):
+        logger = logging.getLogger("detectron2")
+        logger.info("Loading DETR head-only checkpoint: %s", path)
+        checkpoint = torch.load(path, map_location="cpu")
+        state = checkpoint.get("model", checkpoint)
+        detr_state = {}
+        current_state = self.detr.state_dict()
+        skipped = []
+        for k, v in state.items():
+            if not k.startswith("detr."):
+                continue
+            key = k[len("detr."):]
+            if key not in current_state:
+                skipped.append(f"{key} (missing in current)")
+                continue
+            if current_state[key].shape != v.shape:
+                skipped.append(f"{key} (shape {tuple(v.shape)} != {tuple(current_state[key].shape)})")
+                continue
+            detr_state[key] = v
+        missing, unexpected = self.detr.load_state_dict(detr_state, strict=False)
+        if missing:
+            logger.info("DETR head-only missing keys: %s", missing)
+        if unexpected:
+            logger.info("DETR head-only unexpected keys: %s", unexpected)
+        if skipped:
+            logger.info("DETR head-only skipped keys: %s", skipped)
 
     def forward(self, batched_inputs):
         """
@@ -255,7 +286,10 @@ class Detr(nn.Module):
         """
         Normalize, pad and batch the input images.
         """
-        images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
+        if self.use_sam3_backbone:
+            images = [x["image"].to(self.device) for x in batched_inputs]
+        else:
+            images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
         images = ImageList.from_tensors(images)
         return images
 
