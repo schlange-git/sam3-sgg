@@ -133,8 +133,12 @@ class Detr(nn.Module):
         pytorch_total_params = sum(p.numel() for p in self.parameters())
         print ("Number of Parameters:", pytorch_total_params)
 
-        if cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS:
-            self._load_detr_head_only(cfg.MODEL.DETR.HEAD_WEIGHTS)
+        # Load DETR head weights if:
+        # 1. LOAD_HEAD_ONLY is explicitly True, OR
+        # 2. Using SAM3 backbone (to avoid loading ResNet backbone weights)
+        if cfg.MODEL.DETR.HEAD_WEIGHTS:
+            if cfg.MODEL.DETR.LOAD_HEAD_ONLY or cfg.MODEL.SAM3.ENABLED:
+                self._load_detr_head_only(cfg.MODEL.DETR.HEAD_WEIGHTS)
 
     def _freeze_layers(self, layers):
         # Freeze layers
@@ -291,6 +295,7 @@ class Detr(nn.Module):
         else:
             images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
         images = ImageList.from_tensors(images)
+        images.image_ids = [x.get("image_id") for x in batched_inputs]
         return images
 
 @META_ARCH_REGISTRY.register()

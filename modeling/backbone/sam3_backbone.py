@@ -5,6 +5,7 @@ import sys
 from typing import Dict
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torchvision.transforms import v2
 
@@ -28,7 +29,18 @@ class Sam3MaskedBackbone(nn.Module):
         self.image_size = cfg.MODEL.SAM3.IMAGE_SIZE
         self.freeze = cfg.MODEL.SAM3.FREEZE
         self.checkpoint_path = cfg.MODEL.SAM3.CHECKPOINT_PATH
+        self.use_precomputed = cfg.MODEL.SAM3.USE_PRECOMPUTED
+        self.featuremap_dir = cfg.MODEL.SAM3.FEATUREMAP_DIR
         self.feature_stride = 16
+        self.target_stride = getattr(cfg.MODEL.SAM3, "TARGET_STRIDE", 0)
+
+        # If using precomputed features, verify directory exists
+        if self.use_precomputed:
+            if not os.path.isdir(self.featuremap_dir):
+                raise FileNotFoundError(
+                    f"SAM3 precomputed feature directory does not exist: {self.featuremap_dir}. "
+                    f"Please run precomputation first or set MODEL.SAM3.USE_PRECOMPUTED=False"
+                )
 
         # Ensure sam3 is importable from repo local path
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -38,34 +50,36 @@ class Sam3MaskedBackbone(nn.Module):
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
 
-        try:
-            from sam3.model_builder import build_sam3_image_model
-        except Exception as exc:  # pragma: no cover - handled at runtime
-            raise ImportError(
-                "sam3 is not available on PYTHONPATH or dependencies missing. "
-                "Ensure SpeaQ/sam3 is present and required packages are installed."
-            ) from exc
+        self.sam3_model = None
+        self.transform = None
+        if not self.use_precomputed:
+            try:
+                from sam3.model_builder import build_sam3_image_model
+            except Exception as exc:  # pragma: no cover - handled at runtime
+                raise ImportError(
+                    "sam3 is not available on PYTHONPATH or dependencies missing. "
+                    "Ensure SpeaQ/sam3 is present and required packages are installed."
+                ) from exc
+            logging.getLogger("detectron2").info("Loading SAM3 image backbone...")
+            self.sam3_model = build_sam3_image_model(
+                device=str(self.sam3_device),
+                checkpoint_path=self.checkpoint_path if self.checkpoint_path else None,
+            ).to(self.sam3_device)
+            self.sam3_model.eval()
 
-        logging.getLogger("detectron2").info("Loading SAM3 image backbone...")
-        self.sam3_model = build_sam3_image_model(
-            device=str(self.sam3_device),
-            checkpoint_path=self.checkpoint_path if self.checkpoint_path else None,
-        ).to(self.sam3_device)
-        self.sam3_model.eval()
+            if self.freeze:
+                for p in self.sam3_model.parameters():
+                    p.requires_grad_(False)
 
-        if self.freeze:
-            for p in self.sam3_model.parameters():
-                p.requires_grad_(False)
-
-        # SAM3 image transform (aligns with Sam3Processor)
-        self.transform = v2.Compose(
-            [
-                v2.ToDtype(torch.uint8, scale=True),
-                v2.Resize(size=(self.image_size, self.image_size)),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+            # SAM3 image transform (aligns with Sam3Processor)
+            self.transform = v2.Compose(
+                [
+                    v2.ToDtype(torch.uint8, scale=True),
+                    v2.Resize(size=(self.image_size, self.image_size)),
+                    v2.ToDtype(torch.float32, scale=True),
+                    v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ]
+            )
 
         # 1x1 projection to feature_dim (lazy init)
         self._proj_layer = None
@@ -128,6 +142,15 @@ class Sam3MaskedBackbone(nn.Module):
         return candidate
 
     def forward(self, images: ImageList) -> Dict[str, NestedTensor]:
+        if self.use_precomputed:
+            # Must use precomputed features - no fallback allowed
+            if self.sam3_model is not None:
+                raise RuntimeError(
+                    "SAM3 model is loaded but USE_PRECOMPUTED=True. "
+                    "This should not happen - precomputed mode should not load SAM3 model."
+                )
+            return {"sam3": self._load_precomputed(images)}
+
         # Normalize images to SAM3 expected format
         image_batch = self._normalize_batch(images.tensor)
 
@@ -162,12 +185,57 @@ class Sam3MaskedBackbone(nn.Module):
         h_in = image_batch.shape[2]
         h_feat = proj_feat.shape[2]
         self.feature_stride = max(1, int(round(h_in / float(h_feat))))
+        # Downsample to target stride if requested (helps reduce encoder memory)
+        if self.target_stride and self.feature_stride < self.target_stride:
+            factor = self.target_stride // self.feature_stride
+            if factor > 1:
+                proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
+                self.feature_stride = self.feature_stride * factor
         self.feature_strides = [self.feature_stride]
 
         masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
         nested = NestedTensor(proj_feat, masks[0])
 
         return {"sam3": nested}
+
+    def _load_precomputed(self, images: ImageList) -> NestedTensor:
+        image_ids = getattr(images, "image_ids", None)
+        if not image_ids:
+            raise ValueError(
+                "Precomputed SAM3 features require image_ids in ImageList. "
+                "Cannot proceed without precomputed features when USE_PRECOMPUTED=True."
+            )
+        feats = []
+        feature_stride = None
+        for image_id in image_ids:
+            feature_path = os.path.join(self.featuremap_dir, f"{image_id}.pt")
+            if not os.path.isfile(feature_path):
+                raise FileNotFoundError(
+                    f"Required SAM3 precomputed feature file missing: {feature_path}\n"
+                    f"Please run precomputation first. Cannot proceed without .pt file when USE_PRECOMPUTED=True."
+                )
+            payload = torch.load(feature_path, map_location=self.device)
+            feat = payload["feature"]
+            if feat.dim() == 3:
+                feat = feat.unsqueeze(0)
+            if feature_stride is None:
+                feature_stride = int(payload.get("feature_stride", self.feature_stride))
+            feats.append(feat)
+        proj_feat = torch.cat(feats, dim=0)
+        if proj_feat.shape[1] != self.feature_dim:
+            raise ValueError(
+                f"Precomputed feature dim {proj_feat.shape[1]} != expected {self.feature_dim}"
+            )
+        self.feature_stride = feature_stride or self.feature_stride
+        # Downsample precomputed features to target_stride to reduce memory
+        if self.target_stride and self.feature_stride < self.target_stride:
+            factor = self.target_stride // self.feature_stride
+            if factor > 1:
+                proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
+                self.feature_stride = self.feature_stride * factor
+        self.feature_strides = [self.feature_stride]
+        masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
+        return NestedTensor(proj_feat, masks[0])
 
     def _mask_out_padding(self, feature_shapes, image_sizes, device):
         masks = []

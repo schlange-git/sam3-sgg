@@ -47,24 +47,30 @@ def cleanup_cuda(prefix: str) -> None:
 def backup_source_codes(cfg):
     if comm.is_main_process():
         output_dir = cfg.OUTPUT_DIR
-        source_files = glob('**/*', recursive=True)
+        # Only backup Python source files and configs, skip large directories
+        skip_dirs = {'wandb', '__pycache__', '.git', 'z_outputs', 'tmp', 'sam3', 'node_modules', '.pytest_cache', 'build', 'dist', '.eggs'}
+        skip_extensions = {'.pth', '.pkl', '.h5', '.pt', '.pth.tar', '.ckpt', '.log', '.pyc', '.pyo', '.so', '.dylib'}
+        source_files = glob('**/*.py', recursive=True)
+        source_files.extend(glob('**/*.yaml', recursive=True))
+        source_files.extend(glob('**/*.yml', recursive=True))
+        source_files.extend(glob('**/*.sh', recursive=True))
 
         for file in source_files:
-            filedir_split = file.split('/')
-            if filedir_split[0] == 'wandb':
+            # Skip files in excluded directories
+            if any(skip_dir in file for skip_dir in skip_dirs):
                 continue
-            filename_split = file.split('.')
-            if len(filename_split) == 1:
+            # Skip if extension is excluded
+            if any(file.endswith(ext) for ext in skip_extensions):
                 continue
-            extension = filename_split[-1]
-            if extension == 'pth' or extension == 'pkl':
+            if os.path.isdir(file):
                 continue
-            else:
-                if os.path.isdir(file):
-                    continue
-                target_dir = os.path.join(output_dir, 'code_backup', file)
-                os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+            target_dir = os.path.join(output_dir, 'code_backup', file)
+            os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+            try:
                 copyfile(file, target_dir)
+            except Exception as e:
+                # Skip files that can't be copied (e.g., broken symlinks)
+                pass
 
 def setup(args):
     cfg = get_cfg()
@@ -73,8 +79,10 @@ def setup(args):
     assert(cfg.MODEL.ROI_SCENEGRAPH_HEAD.MODE in ['predcls', 'sgls', 'sgdet']), "Mode {} not supported".format(cfg.MODEL.ROI_SCENEGRaGraph.MODE)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    if cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS:
-        # Avoid full-model loading when only DETR head weights are intended
+    # If using SAM3 backbone, we should not load ResNet backbone weights
+    # If LOAD_HEAD_ONLY is True, clear MODEL.WEIGHTS to avoid loading full model
+    if cfg.MODEL.SAM3.ENABLED or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS):
+        # Avoid full-model loading when using SAM3 or when only DETR head weights are intended
         cfg.MODEL.WEIGHTS = ""
     cfg.freeze()
     register_datasets(cfg)

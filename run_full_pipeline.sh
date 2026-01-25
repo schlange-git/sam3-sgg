@@ -8,8 +8,6 @@
 
 set -e  # 遇到错误立即退出
 
-rm -rf z_outputs
-
 # ============================================================================
 # 配置参数 (可通过命令行参数覆盖)
 # ============================================================================
@@ -30,9 +28,15 @@ SAM3_FEATURE_DIM=256
 SAM3_CHANNEL_REPEAT=1
 SAM3_FREEZE=True
 SAM3_EVAL_ENABLED=${SAM3_ENABLED}
-SAM3_DEVICE="cpu"
+SAM3_DEVICE="cuda"
+SAM3_TARGET_STRIDE=32
+SAM3_PRECOMPUTE=True
+SAM3_USE_PRECOMPUTED=True
+SAM3_ENABLED_PRETRAINED=False          # 预训练评测固定使用 ResNet，不走 SAM3
+SAM3_USE_PRECOMPUTED_PRETRAINED=False  # 预训练评测不使用预计算特征
+SAM3_FEATUREMAP_DIR="data/featuremaps"
 # DETR head-only loading
-DETR_HEAD_ONLY=True
+DETR_HEAD_ONLY=False
 DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"
 # DETR query settings
 DETR_NUM_OBJECT_QUERIES=10
@@ -104,6 +108,27 @@ while [[ $# -gt 0 ]]; do
             SAM3_DEVICE="$2"
             shift 2
             ;;
+        --sam3-precompute)
+            SAM3_PRECOMPUTE=True
+            SAM3_USE_PRECOMPUTED=True
+            shift 1
+            ;;
+        --sam3-use-precomputed)
+            SAM3_USE_PRECOMPUTED=True
+            shift 1
+            ;;
+        --sam3-eval-use-precomputed)
+            SAM3_USE_PRECOMPUTED_PRETRAINED=True
+            shift 1
+            ;;
+        --sam3-eval-no-precomputed)
+            SAM3_USE_PRECOMPUTED_PRETRAINED=False
+            shift 1
+            ;;
+        --sam3-featuremaps-dir)
+            SAM3_FEATUREMAP_DIR="$2"
+            shift 2
+            ;;
         --detr-head-only)
             DETR_HEAD_ONLY=True
             shift 1
@@ -162,6 +187,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --sam3-feature-dim DIM SAM3 输出特征维度 (默认: 256)"
             echo "  --sam3-channel-repeat N SAM3 通道重复次数 (默认: 1)"
             echo "  --sam3-device DEV      SAM3 设备 (cuda 或 cpu, 默认: cuda)"
+            echo "  --sam3-precompute      预先生成 SAM3 特征并在训练中使用"
+            echo "  --sam3-use-precomputed 使用已有 SAM3 特征"
+            echo "  --sam3-featuremaps-dir DIR SAM3 特征保存/读取目录"
             echo "  --sam3-freeze          冻结 SAM3 参数（默认）"
             echo "  --sam3-unfreeze        解冻 SAM3 参数"
             echo "  --sam3-eval            评测阶段启用 SAM3（默认跟随 --sam3）"
@@ -203,11 +231,15 @@ echo "  GPU 数量: ${NUM_GPUS}"
 echo "  批次大小: ${BATCH_SIZE}"
 echo "  SAM3 启用: ${SAM3_ENABLED}"
 echo "  SAM3 评测启用: ${SAM3_EVAL_ENABLED}"
+echo "  SAM3 评测是否用预计算: ${SAM3_USE_PRECOMPUTED_PRETRAINED}"
 echo "  SAM3 Checkpoint: ${SAM3_CHECKPOINT_PATH}"
 echo "  SAM3 Image Size: ${SAM3_IMAGE_SIZE}"
 echo "  SAM3 Feature Dim: ${SAM3_FEATURE_DIM}"
 echo "  SAM3 Channel Repeat: ${SAM3_CHANNEL_REPEAT}"
 echo "  SAM3 Device: ${SAM3_DEVICE}"
+echo "  SAM3 Precompute: ${SAM3_PRECOMPUTE}"
+echo "  SAM3 Use Precomputed: ${SAM3_USE_PRECOMPUTED}"
+echo "  SAM3 Featuremaps Dir: ${SAM3_FEATUREMAP_DIR}"
 echo "  SAM3 Freeze: ${SAM3_FREEZE}"
 echo "  DETR Head-only: ${DETR_HEAD_ONLY}"
 echo "  DETR Head weights: ${DETR_HEAD_WEIGHTS}"
@@ -244,47 +276,39 @@ export PYTHONPATH="$(pwd)/sam3:$(pwd):${PYTHONPATH}"
 # CUDA allocator hint to reduce fragmentation
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Verify SAM3 dependencies; install editable package if missing
-set +e
-python - <<'PY'
-import sys, os
-sys.path.insert(0, os.path.abspath("sam3"))
-try:
-    import sam3.model_builder  # noqa: F401
-    print("✓ sam3 import ok")
-    sys.exit(0)
-except Exception as e:
-    print("sam3 import failed:", type(e).__name__, e)
-    sys.exit(1)
-PY
-SAM3_IMPORT_STATUS=$?
-set -e
-if [ ${SAM3_IMPORT_STATUS} -ne 0 ]; then
-    echo "尝试安装 sam3 依赖 (pip install -e sam3)..."
-    python -m pip install -e sam3 || {
-        echo "❌ sam3 依赖安装失败，请手动执行: python -m pip install -e sam3"
-        exit 1
-    }
-    echo "补充安装 sam3 运行所需依赖 (einops)..."
-    python -m pip install einops || {
-        echo "❌ einops 安装失败，请手动执行: python -m pip install einops"
-        exit 1
-    }
-fi
-
-# 检查 Python 脚本
-if [ ! -f "train_iterative_model.py" ]; then
-    echo "❌ 错误: 找不到 train_iterative_model.py"
-    exit 1
-fi
-
-if [ ! -f "save_eval_results.py" ]; then
-    echo "❌ 错误: 找不到 save_eval_results.py"
-    exit 1
-fi
-
 echo "✓ 环境检查通过"
 echo ""
+
+# ============================================================================
+# Step 0: 预生成 SAM3 特征 (可选)
+# ============================================================================
+
+if [ "${SAM3_PRECOMPUTE}" = "True" ]; then
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Step 0/4: 预生成 SAM3 特征"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    python precompute_sam3_featuremaps.py --config-file configs/speaq.yaml \
+        --output-dir "${SAM3_FEATUREMAP_DIR}" \
+        DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+        DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+        DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+        DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+        DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+        DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+        DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+        MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+        MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+        MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+        MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+        MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+        MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+        MODEL.SAM3.USE_PRECOMPUTED False \
+        MODEL.DEVICE ${SAM3_DEVICE}
+    echo ""
+    echo "✓ Step 0 完成: SAM3 特征已保存到 ${SAM3_FEATUREMAP_DIR}"
+    echo ""
+fi
 
 # ============================================================================
 # Step 1: 评测预训练权重
@@ -295,6 +319,22 @@ echo "  Step 1/4: 评测预训练权重"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
+# Verify precomputed features for pretrained eval if required
+if [ "${SAM3_USE_PRECOMPUTED_PRETRAINED}" = "True" ]; then
+    if [ ! -d "${SAM3_FEATUREMAP_DIR}" ]; then
+        echo "❌ 错误: 预计算特征目录不存在: ${SAM3_FEATUREMAP_DIR}"
+        echo "   请先运行预计算步骤 (--sam3-precompute) 或设置 SAM3_USE_PRECOMPUTED=False"
+        exit 1
+    fi
+    feature_count=$(find "${SAM3_FEATUREMAP_DIR}" -name "*.pt" 2>/dev/null | wc -l)
+    if [ "${feature_count}" -eq 0 ]; then
+        echo "❌ 错误: 预计算特征目录为空: ${SAM3_FEATUREMAP_DIR}"
+        echo "   请先运行预计算步骤 (--sam3-precompute)"
+        exit 1
+    fi
+    echo "✓ 预计算特征目录检查通过: ${SAM3_FEATUREMAP_DIR} (${feature_count} 个 .pt 文件)"
+fi
+
 python train_iterative_model.py --eval-only --num-gpus ${NUM_GPUS} \
     --config-file configs/speaq.yaml --dist-url ${PORT_PRETRAINED} \
     OUTPUT_DIR "${OUTPUT_PRETRAINED}" \
@@ -303,11 +343,14 @@ python train_iterative_model.py --eval-only --num-gpus ${NUM_GPUS} \
     MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
     MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
     MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
-    MODEL.SAM3.ENABLED ${SAM3_EVAL_ENABLED} \
+    MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
     MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
     MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
     MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
     MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+    MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
+    MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
     MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
     MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
@@ -339,6 +382,21 @@ echo "  Step 2/4: Finetune 训练 (${FINETUNE_ITERS} 次迭代)"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
+# Verify precomputed features if required (same check as Step 1)
+if [ "${SAM3_USE_PRECOMPUTED}" = "True" ]; then
+    if [ ! -d "${SAM3_FEATUREMAP_DIR}" ]; then
+        echo "❌ 错误: 预计算特征目录不存在: ${SAM3_FEATUREMAP_DIR}"
+        echo "   请先运行预计算步骤 (--sam3-precompute) 或设置 SAM3_USE_PRECOMPUTED=False"
+        exit 1
+    fi
+    feature_count=$(find "${SAM3_FEATUREMAP_DIR}" -name "*.pt" 2>/dev/null | wc -l)
+    if [ "${feature_count}" -eq 0 ]; then
+        echo "❌ 错误: 预计算特征目录为空: ${SAM3_FEATUREMAP_DIR}"
+        echo "   请先运行预计算步骤 (--sam3-precompute)"
+        exit 1
+    fi
+fi
+
 python train_iterative_model.py --num-gpus ${NUM_GPUS} \
     --config-file configs/speaq.yaml --dist-url ${PORT_FINETUNE} \
     OUTPUT_DIR "${OUTPUT_FINETUNE}" \
@@ -352,6 +410,9 @@ python train_iterative_model.py --num-gpus ${NUM_GPUS} \
     MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
     MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
     MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+    MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED} \
+    MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
     MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
     MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
@@ -442,6 +503,9 @@ SpeaQ 全链路训练与评测流程 - 执行总结
   SAM3 Channel Repeat:${SAM3_CHANNEL_REPEAT}
   SAM3 Device:    ${SAM3_DEVICE}
   SAM3 Freeze:    ${SAM3_FREEZE}
+  SAM3 Precompute:${SAM3_PRECOMPUTE}
+  SAM3 Use Precomputed:${SAM3_USE_PRECOMPUTED}
+  SAM3 Featuremaps Dir:${SAM3_FEATUREMAP_DIR}
   DETR Head-only: ${DETR_HEAD_ONLY}
   DETR Head weights:${DETR_HEAD_WEIGHTS}
   DETR Obj Queries:${DETR_NUM_OBJECT_QUERIES}
