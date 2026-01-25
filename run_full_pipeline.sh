@@ -35,6 +35,9 @@ SAM3_USE_PRECOMPUTED=True
 SAM3_ENABLED_PRETRAINED=False          # 预训练评测固定使用 ResNet，不走 SAM3
 SAM3_USE_PRECOMPUTED_PRETRAINED=False  # 预训练评测不使用预计算特征
 SAM3_FEATUREMAP_DIR="data/featuremaps"
+# Visualization
+VIS_NUM_IMAGES=5
+VIS_DATASET_NAME="VG_train"
 # DETR head-only loading
 DETR_HEAD_ONLY=False
 DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"
@@ -245,6 +248,8 @@ echo "  DETR Head-only: ${DETR_HEAD_ONLY}"
 echo "  DETR Head weights: ${DETR_HEAD_WEIGHTS}"
 echo "  DETR Obj Queries: ${DETR_NUM_OBJECT_QUERIES}"
 echo "  DETR Rel Queries: ${DETR_NUM_RELATION_QUERIES}"
+echo "  Vis Num Images: ${VIS_NUM_IMAGES}"
+echo "  Vis Dataset: ${VIS_DATASET_NAME}"
 echo "  输出目录: ${OUTPUT_BASE}/"
 echo ""
 
@@ -373,6 +378,30 @@ echo "✓ Step 1 完成: 预训练权重评测结果已保存"
 echo "  结果文件: ${OUTPUT_PRETRAINED}/eval_results.txt"
 echo ""
 
+# 预训练可视化（使用 ResNet，SAM3 关闭，默认不用预计算）
+PRETRAINED_VIS_DIR="${OUTPUT_PRETRAINED}/vis"
+python visualize_predictions.py --config-file configs/speaq.yaml \
+    --model-weights "${PRETRAINED_WEIGHTS}" \
+    --output-dir "${PRETRAINED_VIS_DIR}" \
+    --dataset-name "${VIS_DATASET_NAME}" \
+    --num-images ${VIS_NUM_IMAGES} \
+    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+    MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
+    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
+    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+    DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+    DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+    DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+    DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+    DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+    SOLVER.IMS_PER_BATCH 1 \
+    DATALOADER.NUM_WORKERS 0
+
 # ============================================================================
 # Step 2: Finetune 训练
 # ============================================================================
@@ -432,6 +461,37 @@ echo ""
 echo "✓ Step 2 完成: Finetune 训练完成"
 echo "  模型文件: ${OUTPUT_FINETUNE}/model_final.pth"
 echo ""
+
+# Finetune 可视化（遵循当前 SAM3 配置）
+FINETUNE_VIS_DIR="${OUTPUT_FINETUNE}/vis"
+python visualize_predictions.py --config-file configs/speaq.yaml \
+    --model-weights "${OUTPUT_FINETUNE}/model_final.pth" \
+    --output-dir "${FINETUNE_VIS_DIR}" \
+    --dataset-name "${VIS_DATASET_NAME}" \
+    --num-images ${VIS_NUM_IMAGES} \
+    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+    MODEL.SAM3.ENABLED ${SAM3_ENABLED} \
+    MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+    MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+    MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+    MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+    MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED} \
+    MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
+    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+    MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
+    DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+    DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+    DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+    DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+    DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+    SOLVER.IMS_PER_BATCH 1 \
+    DATALOADER.NUM_WORKERS 0
 
 # ============================================================================
 # Step 3: 评测 Finetune 后的模型

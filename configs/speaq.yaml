@@ -35,8 +35,12 @@ MODEL:
     CHECKPOINT_PATH: ""
     IMAGE_SIZE: 1008
     FEATURE_DIM: 256
+    CHANNEL_REPEAT: 1
     FREEZE: True
     DEVICE: "cuda"
+    USE_PRECOMPUTED: False
+    FEATUREMAP_DIR: "data/featuremaps"
+    TARGET_STRIDE: 32
 DATASETS:
   TYPE: "VISUAL GENOME"
   TRAIN: ('VG_train',)
