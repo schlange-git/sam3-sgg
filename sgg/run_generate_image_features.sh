@@ -4,7 +4,7 @@
 
 # Activate conda environment
 source $(conda info --base)/etc/profile.d/conda.sh
-conda activate sam3
+#conda activate sam3
 
 # Navigate to project root
 cd "$(dirname "$0")/.."
@@ -13,16 +13,16 @@ export PYTHONPATH="$PWD:$PYTHONPATH"
 # Configuration
 # 使用相对路径（相对于项目根目录）
 # 注意：如果需要使用绝对路径，请修改下面的 VG_ROOT
-VG_ROOT="/home/shi/桌面/abschluss/sgg/dataset/vg150"  # 相对路径或绝对路径
+VG_ROOT="/home/shi/abschluss/dataset/vg150"  # 相对路径或绝对路径
 OUT_DIR="sgg/cache/image_features"
 SPLIT="train"  # "train" or "val"
 FEATURE_DIM=256
 IMAGE_SIZE=1008  # SAM3 默认分辨率为 1008（不是 1024）
 DEVICE="cuda"
-NUM_GPUS=2  # 使用双 GPU (两张 2080ti 22GB)
+NUM_GPUS=1  # 使用双 GPU (两张 2080ti 22GB)
 BATCH_SIZE=1  # 批处理大小（避免一次加载过多导致爆内存）
 NUM_WORKERS=0  # DataLoader 工作线程数（不要设置太高，因为内存有限）
-LIMIT=8000 # -1 or 0 = no limit (all images), or set to N for quick validation (first N images)
+LIMIT=8 # -1 or 0 = no limit (all images), or set to N for quick validation (first N images)
 START_IDX=0 # 从数据集的哪个样本开始处理，用于人工分段跑（例如前半/后半）
 SAVE_FP16=0  # 暂不启用 FP16 保存
 CHECKPOINT_PATH="weights/sam3.pt"  # 留空表示自动查找，或指定相对路径如 "sam3.pt" 或 "checkpoints/sam3.pt"
