@@ -302,6 +302,14 @@ class SceneGraphEvaluator(DatasetEvaluator):
             ret['SGMeanRecall@{}'.format(k)] = float(v)
         for k, v in self._evaluators['SGRecall'].result_dict[self._mode + '_recall'].items():
             ret['SGRecall@{}'.format(k)] = np.mean(v)
+        # Add No Graph Constraint Recall
+        if 'SGNoGraphConstraintRecall' in self._evaluators:
+            for k, v in self._evaluators['SGNoGraphConstraintRecall'].result_dict[self._mode + '_recall_nogc'].items():
+                ret['ng-R@{}'.format(k)] = np.mean(v)
+        # Add Zero-shot Recall
+        if 'SGZeroShotRecall' in self._evaluators:
+            for k, v in self._evaluators['SGZeroShotRecall'].result_dict[self._mode + '_zeroshot_recall'].items():
+                ret['zR@{}'.format(k)] = np.mean(v)
         return ret
 
     def evaluate_relation_of_one_image(self, groundtruth, prediction, global_container, i):

@@ -12,7 +12,7 @@ pip install h5py numpy
 
 ## 2. 数据集检查
 
-确保你的数据集路径 `/home/shi/abschluss/dataset/vg150` 包含：
+确保你的数据集路径 `/home/shi/桌面/abschluss/dataset/vg150` 包含：
 
 ```
 vg150/

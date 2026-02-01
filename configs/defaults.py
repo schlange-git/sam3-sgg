@@ -156,6 +156,8 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.USE_PRECOMPUTED = False
   _C.MODEL.SAM3.FEATUREMAP_DIR = "data/featuremaps"
   _C.MODEL.SAM3.TARGET_STRIDE = 32
+  _C.MODEL.SAM3.USE_FPN = False  # Enable FPN-style multi-scale features
+  _C.MODEL.SAM3.FPN_STRIDES = [4, 8, 16, 32]  # Feature pyramid strides
 
   # MODEL Variants 
   _C.MODEL.DF_DETR.WITH_BOX_REFINE = False

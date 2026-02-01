@@ -6,8 +6,21 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate sam3
 
 # ==================== 训练配置 ====================
-# 数据集路径
-DATA_ROOT="/home/shi/abschluss/dataset/visual_genome"
+# 数据集路径 - 使用相对路径查找
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# 尝试多个可能的数据集路径
+if [ -d "$PROJECT_ROOT/../dataset/visual_genome" ]; then
+    DATA_ROOT="$(cd "$PROJECT_ROOT/../dataset/visual_genome" && pwd)"
+elif [ -d "$PROJECT_ROOT/../../dataset/vg150" ]; then
+    DATA_ROOT="$(cd "$PROJECT_ROOT/../../dataset/vg150" && pwd)"
+elif [ -d "$HOME/桌面/abschluss/sgg/dataset/vg150" ]; then
+    DATA_ROOT="$HOME/桌面/abschluss/sgg/dataset/vg150"
+else
+    # 如果都找不到，使用相对路径（用户需要自己修改）
+    DATA_ROOT="$PROJECT_ROOT/../dataset/visual_genome"
+    echo "⚠️ 警告: 使用默认路径 $DATA_ROOT，如果不存在请修改脚本"
+fi
 
 # 训练参数
 BATCH_SIZE=4      

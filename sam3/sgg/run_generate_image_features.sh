@@ -11,9 +11,21 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH="$PWD:$PYTHONPATH"
 
 # Configuration
-# 使用相对路径（相对于项目根目录）
-# 注意：如果需要使用绝对路径，请修改下面的 VG_ROOT
-VG_ROOT="/home/shi/abschluss/dataset/vg150"  # 相对路径或绝对路径
+# 使用相对路径，尝试多个可能的数据集路径
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# 尝试多个可能的数据集路径
+if [ -d "$PROJECT_ROOT/../../dataset/vg150" ]; then
+    VG_ROOT="$(cd "$PROJECT_ROOT/../../dataset/vg150" && pwd)"
+elif [ -d "$PROJECT_ROOT/../../../dataset/vg150" ]; then
+    VG_ROOT="$(cd "$PROJECT_ROOT/../../../dataset/vg150" && pwd)"
+elif [ -d "$HOME/桌面/abschluss/sgg/dataset/vg150" ]; then
+    VG_ROOT="$HOME/桌面/abschluss/sgg/dataset/vg150"
+else
+    # 如果都找不到，使用相对路径（用户需要自己修改）
+    VG_ROOT="$PROJECT_ROOT/../../dataset/vg150"
+    echo "⚠️ 警告: 使用默认路径 $VG_ROOT，如果不存在请修改脚本"
+fi
 OUT_DIR="sgg/cache/image_features"
 SPLIT="train"  # "train" or "val"
 FEATURE_DIM=256

@@ -10,9 +10,15 @@ import datetime
 import pickle
 import itertools
 import pycocotools.mask as mask_util
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from detectron2.utils.logger import setup_logger, log_every_n_seconds
 from detectron2.engine import DefaultTrainer
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    NVML_AVAILABLE = True
+except:
+    NVML_AVAILABLE = False
 from detectron2.data import (
     MetadataCatalog,
     build_detection_test_loader,
@@ -24,6 +30,7 @@ from detectron2.evaluation import DatasetEvaluators, DatasetEvaluator, inference
 from imantics import Polygons, Mask
 
 from detectron2.engine import hooks, HookBase
+from detectron2.engine.hooks import get_bn_modules
 from ..data import DetrDatasetMapper
 from detectron2.evaluation import (
     COCOEvaluator,
@@ -102,6 +109,157 @@ class WandbWriter(EventWriter):
         if hasattr(self, "_writer"):
             self._writer.finish()
 
+
+class PerformanceMonitorHook(HookBase):
+    """性能监控 Hook：记录训练过程中的时间分布、GPU利用率、精度等信息"""
+    
+    def __init__(self, period=50):
+        """
+        Args:
+            period: 每隔多少次迭代输出一次性能报告
+        """
+        self.period = period
+        self.stats = defaultdict(list)
+        self.iter_times = []
+        self.data_times = []
+        self.forward_times = []
+        self.backward_times = []
+        self.optimizer_times = []
+        self.gpu_utilizations = []
+        self.precision_info = None
+        self.logger = logging.getLogger(__name__)
+        
+    def before_train(self):
+        """训练开始前初始化"""
+        if comm.is_main_process():
+            # 检测精度设置
+            trainer = self.trainer
+            if hasattr(trainer, 'model'):
+                # 检查模型参数精度
+                sample_param = next(iter(trainer.model.parameters()))
+                if sample_param.dtype == torch.float16:
+                    self.precision_info = "FP16"
+                elif sample_param.dtype == torch.bfloat16:
+                    self.precision_info = "BF16"
+                else:
+                    self.precision_info = "FP32"
+                
+                # 检查是否使用 AMP (通过检查是否有 grad_scaler)
+                if hasattr(trainer, 'grad_scaler') and trainer.grad_scaler is not None:
+                    self.precision_info = "AMP (自动混合精度) - " + self.precision_info
+            else:
+                self.precision_info = "未知"
+            
+            self.logger.info("=" * 80)
+            self.logger.info("训练性能监控初始化")
+            self.logger.info(f"  精度模式: {self.precision_info}")
+            self.logger.info(f"  GPU 数量: {torch.cuda.device_count()}")
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    props = torch.cuda.get_device_properties(i)
+                    self.logger.info(f"  GPU {i}: {props.name}, 显存: {props.total_memory / 1024**3:.1f} GB")
+            self.logger.info("=" * 80)
+    
+    def before_step(self):
+        """每次迭代前记录开始时间"""
+        if comm.is_main_process():
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            self.step_start_time = time.perf_counter()
+            self.data_start_time = time.perf_counter()
+    
+    def after_step(self):
+        """每次迭代后记录时间"""
+        if comm.is_main_process():
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            step_end_time = time.perf_counter()
+            step_time = step_end_time - self.step_start_time
+            
+            self.iter_times.append(step_time)
+            
+            # 记录到 event storage
+            storage = get_event_storage()
+            if hasattr(storage, 'latest'):
+                storage.put_scalar("time/iter_time", step_time)
+                if hasattr(self, 'data_time'):
+                    storage.put_scalar("time/data_time", self.data_time)
+                if hasattr(self, 'forward_time'):
+                    storage.put_scalar("time/forward_time", self.forward_time)
+                if hasattr(self, 'backward_time'):
+                    storage.put_scalar("time/backward_time", self.backward_time)
+                if hasattr(self, 'optimizer_time'):
+                    storage.put_scalar("time/optimizer_time", self.optimizer_time)
+            
+            # 获取 GPU 利用率
+            if NVML_AVAILABLE and torch.cuda.is_available():
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    self.gpu_utilizations.append(util.gpu)
+                except:
+                    pass
+            
+            # 定期输出性能报告
+            if len(self.iter_times) >= self.period:
+                self._print_performance_report()
+                # 清空统计（保留最近的数据用于平滑）
+                keep_last = min(20, self.period // 2)
+                self.iter_times = self.iter_times[-keep_last:]
+                self.data_times = self.data_times[-keep_last:] if hasattr(self, 'data_times') else []
+                self.forward_times = self.forward_times[-keep_last:] if hasattr(self, 'forward_times') else []
+                self.backward_times = self.backward_times[-keep_last:] if hasattr(self, 'backward_times') else []
+                self.optimizer_times = self.optimizer_times[-keep_last:] if hasattr(self, 'optimizer_times') else []
+                self.gpu_utilizations = self.gpu_utilizations[-keep_last:]
+    
+    def _print_performance_report(self):
+        """打印性能报告"""
+        if not self.iter_times:
+            return
+        
+        self.logger.info("=" * 80)
+        self.logger.info("训练性能报告")
+        self.logger.info("-" * 80)
+        
+        # 时间统计
+        avg_iter_time = np.mean(self.iter_times)
+        avg_data_time = np.mean(self.data_times) if self.data_times else 0.0
+        avg_forward_time = np.mean(self.forward_times) if self.forward_times else 0.0
+        avg_backward_time = np.mean(self.backward_times) if self.backward_times else 0.0
+        avg_optimizer_time = np.mean(self.optimizer_times) if self.optimizer_times else 0.0
+        
+        total_compute_time = avg_forward_time + avg_backward_time + avg_optimizer_time
+        other_time = avg_iter_time - avg_data_time - total_compute_time
+        
+        self.logger.info(f"精度模式: {self.precision_info}")
+        self.logger.info(f"平均迭代时间: {avg_iter_time*1000:.2f} ms")
+        self.logger.info("")
+        self.logger.info("时间分布:")
+        self.logger.info(f"  数据加载: {avg_data_time*1000:.2f} ms ({avg_data_time/avg_iter_time*100:.1f}%)")
+        self.logger.info(f"  前向传播: {avg_forward_time*1000:.2f} ms ({avg_forward_time/avg_iter_time*100:.1f}%)")
+        self.logger.info(f"  反向传播: {avg_backward_time*1000:.2f} ms ({avg_backward_time/avg_iter_time*100:.1f}%)")
+        self.logger.info(f"  优化器更新: {avg_optimizer_time*1000:.2f} ms ({avg_optimizer_time/avg_iter_time*100:.1f}%)")
+        self.logger.info(f"  其他开销: {other_time*1000:.2f} ms ({other_time/avg_iter_time*100:.1f}%)")
+        self.logger.info("")
+        
+        # GPU 利用率
+        if self.gpu_utilizations:
+            avg_gpu_util = np.mean(self.gpu_utilizations)
+            self.logger.info(f"平均 GPU 利用率: {avg_gpu_util:.1f}%")
+        
+        # GPU 内存
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            self.logger.info(f"GPU 显存: 已分配={allocated:.2f} GB, 已保留={reserved:.2f} GB, 峰值={max_allocated:.2f} GB")
+        
+        # 吞吐量
+        if avg_iter_time > 0:
+            throughput = 1.0 / avg_iter_time
+            self.logger.info(f"训练吞吐量: {throughput:.2f} iter/s")
+        
+        self.logger.info("=" * 80)
+
+
 class JointTransformerTrainer(DefaultTrainer):
     @classmethod
     def build_train_loader(cls, cfg):
@@ -146,6 +304,7 @@ class JointTransformerTrainer(DefaultTrainer):
 
         ret = [
             hooks.IterationTimer(),
+            PerformanceMonitorHook(period=50),  # 每50次迭代输出一次性能报告
             hooks.LRScheduler(self.optimizer, self.scheduler),
             hooks.PreciseBN(
                 # Run at the same freq as (but before) evaluation.
@@ -187,38 +346,114 @@ class JointTransformerTrainer(DefaultTrainer):
             ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
         return ret
 
-    # def run_step(self):
-    #     """
-    #     Implement the AMP training logic.
-    #     """
-    #     assert self._trainer.model.training, "[AMPTrainer] model was changed to eval mode!"
-    #     assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
-    #     from torch.cuda.amp import autocast
+    def run_step(self):
+        """
+        重写训练步骤，添加详细的性能监控
+        """
+        assert self.model.training, "[Trainer] model was changed to eval mode!"
+        start = time.perf_counter()
+        
+        # 数据加载时间
+        # 在 detectron2 中，_data_loader_iter 是一个 property（定义在 TrainerBase 中）
+        # 它会在第一次访问时自动创建迭代器（如果 _data_loader_iter_obj 是 None）
+        # 直接访问即可，property 会自动处理初始化
+        # 如果属性不存在，说明可能是在旧版本的 detectron2 中，尝试其他方式
+        try:
+            # 尝试访问 property（新版本 detectron2）
+            data = next(self._data_loader_iter)
+        except AttributeError:
+            # 如果 property 不存在，尝试直接访问 _data_loader_iter_obj
+            # 或者通过 data_loader 手动创建迭代器
+            if hasattr(self, '_data_loader_iter_obj') and self._data_loader_iter_obj is not None:
+                data = next(self._data_loader_iter_obj)
+            elif hasattr(self, 'data_loader'):
+                # 如果 data_loader 存在，手动创建迭代器
+                if not hasattr(self, '_data_loader_iter_obj'):
+                    self._data_loader_iter_obj = iter(self.data_loader)
+                data = next(self._data_loader_iter_obj)
+            else:
+                # 如果都找不到，回退到父类方法（但这样无法添加性能监控）
+                # 这通常不应该发生，因为 run_step 应该在 train 循环中被调用
+                logger = logging.getLogger(__name__)
+                logger.warning("Cannot find data loader iterator, falling back to parent run_step")
+                super().run_step()
+                return
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        data_time = time.perf_counter() - start
+        
+        # 记录数据加载时间到 hook
+        for hook in self._hooks:
+            if isinstance(hook, PerformanceMonitorHook):
+                hook.data_times.append(data_time)
+                hook.data_time = data_time
+                hook.data_start_time = time.perf_counter()
+        
+        # 前向传播时间（支持 AMP）
+        forward_start = time.perf_counter()
+        # 检查是否使用 AMP
+        use_amp = hasattr(self, 'grad_scaler') and self.grad_scaler is not None
+        if use_amp:
+            from torch.cuda.amp import autocast
+            with autocast():
+                loss_dict = self.model(data)
+        else:
+            loss_dict = self.model(data)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        forward_time = time.perf_counter() - forward_start
+        
+        # 记录前向传播时间
+        for hook in self._hooks:
+            if isinstance(hook, PerformanceMonitorHook):
+                hook.forward_times.append(forward_time)
+                hook.forward_time = forward_time
+        
+        if isinstance(loss_dict, torch.Tensor):
+            losses = loss_dict
+            loss_dict = {"total_loss": loss_dict}
+        else:
+            losses = sum(loss_dict.values())
+        
+        # 反向传播时间（支持 AMP）
+        backward_start = time.perf_counter()
+        self.optimizer.zero_grad()
+        if use_amp:
+            self.grad_scaler.scale(losses).backward()
+        else:
+            losses.backward()
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        backward_time = time.perf_counter() - backward_start
+        
+        # 记录反向传播时间
+        for hook in self._hooks:
+            if isinstance(hook, PerformanceMonitorHook):
+                hook.backward_times.append(backward_time)
+                hook.backward_time = backward_time
+        
+        # 优化器更新时间（支持 AMP）
+        optimizer_start = time.perf_counter()
+        if use_amp:
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            self.optimizer.step()
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        optimizer_time = time.perf_counter() - optimizer_start
+        
+        # 记录优化器更新时间
+        for hook in self._hooks:
+            if isinstance(hook, PerformanceMonitorHook):
+                hook.optimizer_times.append(optimizer_time)
+                hook.optimizer_time = optimizer_time
+        
+        # 写入指标（使用原有的方法）
+        # 注意：_write_metrics 在 _trainer (SimpleTrainer) 中，不在 DefaultTrainer 中
+        if hasattr(self, '_trainer') and hasattr(self._trainer, '_write_metrics'):
+            self._trainer._write_metrics(loss_dict, data_time)
+        else:
+            # 如果 _trainer 不存在，尝试直接调用（不应该发生）
+            logger = logging.getLogger(__name__)
+            logger.warning("Cannot find _trainer._write_metrics, metrics may not be written")
 
-    #     start = time.perf_counter()
-    #     data = next(self._trainer._data_loader_iter)
-    #     data_time = time.perf_counter() - start
-
-    #     with autocast():
-    #         loss_dict = self._trainer.model(data)
-    #         if isinstance(loss_dict, torch.Tensor):
-    #             losses = loss_dict
-    #             loss_dict = {"total_loss": loss_dict}
-    #         else:
-    #             losses = sum(loss_dict.values())
-
-    #     self._trainer.optimizer.zero_grad()
-    #     self._trainer.grad_scaler.scale(losses).backward()
-    #     for name, param in self._trainer.model.named_parameters():
-    #         try:
-    #             print (name, param.grad.norm())
-    #         except:
-    #             print (name, param.grad)
-    #     import ipdb; ipdb.set_trace()
-    #     self._write_metrics(loss_dict, data_time)
-
-    #     self.grad_scaler.step(self.optimizer)
-    #     self.grad_scaler.update()
 
     @classmethod
     def build_optimizer(cls, cfg, model):

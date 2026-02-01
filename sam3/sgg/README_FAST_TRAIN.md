@@ -45,9 +45,9 @@ bash sgg/run_build_cache.sh
 
 或者手动运行：
 
-cd /home/shi/abschluss/sam3
+cd /home/shi/桌面/abschluss/sam3
 python sgg/precompute/build_cache.py \
-    --vg_root /home/shi/abschluss/dataset/vg150 \
+    --vg_root /home/shi/桌面/abschluss/dataset/vg150 \
     --out_dir sgg/cache/train \
     --split train \
     --P 128 \
@@ -57,7 +57,7 @@ python sgg/precompute/build_cache.py \
 
 ```bash
 python sgg/precompute/build_cache.py \
-    --vg_root /home/shi/abschluss/dataset/vg150 \
+    --vg_root /home/shi/桌面/abschluss/dataset/vg150 \
     --out_dir sgg/cache/train \
     --split train \
     --P 128 \

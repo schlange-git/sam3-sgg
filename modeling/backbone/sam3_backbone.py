@@ -16,8 +16,8 @@ from ..transformer.util.utils import NestedTensor
 
 class Sam3MaskedBackbone(nn.Module):
     """
-    SAM3 backbone wrapper that returns a single feature map as NestedTensor.
-    This is a minimal integration without explicit FPN fusion.
+    SAM3 backbone wrapper that returns feature maps as NestedTensor.
+    Supports both single-scale and FPN-style multi-scale features.
     """
 
     def __init__(self, cfg):
@@ -33,6 +33,8 @@ class Sam3MaskedBackbone(nn.Module):
         self.featuremap_dir = cfg.MODEL.SAM3.FEATUREMAP_DIR
         self.feature_stride = 16
         self.target_stride = getattr(cfg.MODEL.SAM3, "TARGET_STRIDE", 0)
+        self.use_fpn = getattr(cfg.MODEL.SAM3, "USE_FPN", False)
+        self.fpn_strides = getattr(cfg.MODEL.SAM3, "FPN_STRIDES", [4, 8, 16, 32])
 
         # If using precomputed features, verify directory exists
         if self.use_precomputed:
@@ -83,10 +85,60 @@ class Sam3MaskedBackbone(nn.Module):
 
         # 1x1 projection to feature_dim (lazy init)
         self._proj_layer = None
+        
+        # FPN layers for multi-scale features (if enabled)
+        # Note: FPN layer creation is deferred until forward() when actual feature_stride is known
+        self.fpn_layers = None
+        self._fpn_layers_initialized = False
 
         # exposed for Joiner
         self.num_channels = self.feature_dim
-        self.feature_strides = [self.feature_stride]
+        if self.use_fpn:
+            self.feature_strides = self.fpn_strides
+        else:
+            self.feature_strides = [self.feature_stride]
+
+    def _initialize_fpn_layers(self) -> None:
+        """Initialize FPN layers based on actual feature_stride"""
+        if self._fpn_layers_initialized:
+            return
+        self.fpn_layers = nn.ModuleDict()
+        # Build FPN layers for each stride level
+        for stride in self.fpn_strides:
+            if stride == self.feature_stride:
+                # Identity - no layer needed
+                self.fpn_layers[f'fpn_{stride}'] = nn.Identity()
+            elif stride > self.feature_stride:
+                # Downsampling layers
+                factor = stride // self.feature_stride
+                self.fpn_layers[f'fpn_{stride}'] = nn.Conv2d(
+                    self.feature_dim, self.feature_dim, 
+                    kernel_size=3, stride=factor, 
+                    padding=1, bias=False
+                )
+            else:
+                # Upsampling layers
+                factor = self.feature_stride // stride
+                self.fpn_layers[f'fpn_{stride}'] = nn.Sequential(
+                    nn.Conv2d(self.feature_dim, self.feature_dim, kernel_size=1, bias=False),
+                    nn.Upsample(scale_factor=factor, mode='bilinear', align_corners=False)
+                )
+        # Initialize FPN layers
+        for layer in self.fpn_layers.values():
+            if isinstance(layer, nn.Conv2d):
+                nn.init.xavier_uniform_(layer.weight)
+            elif isinstance(layer, nn.Sequential):
+                for m in layer:
+                    if isinstance(m, nn.Conv2d):
+                        nn.init.xavier_uniform_(m.weight)
+            # Identity layers don't need initialization
+        # Move FPN layers to device
+        for layer in self.fpn_layers.values():
+            layer.to(self.device)
+            if self.freeze:
+                for p in layer.parameters():
+                    p.requires_grad_(False)
+        self._fpn_layers_initialized = True
 
     def _build_proj(self, in_channels: int) -> None:
         if self._proj_layer is not None:
@@ -149,7 +201,12 @@ class Sam3MaskedBackbone(nn.Module):
                     "SAM3 model is loaded but USE_PRECOMPUTED=True. "
                     "This should not happen - precomputed mode should not load SAM3 model."
                 )
-            return {"sam3": self._load_precomputed(images)}
+            precomputed_result = self._load_precomputed(images)
+            # If FPN is enabled, _load_precomputed returns a dict, otherwise returns NestedTensor
+            if self.use_fpn:
+                return precomputed_result  # Already a dict
+            else:
+                return {"sam3": precomputed_result}  # Wrap single NestedTensor in dict
 
         # Normalize images to SAM3 expected format
         image_batch = self._normalize_batch(images.tensor)
@@ -191,14 +248,43 @@ class Sam3MaskedBackbone(nn.Module):
             if factor > 1:
                 proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
                 self.feature_stride = self.feature_stride * factor
-        self.feature_strides = [self.feature_stride]
+        
+        if self.use_fpn:
+            # Initialize FPN layers on first forward (now we know actual feature_stride)
+            if not self._fpn_layers_initialized:
+                self._initialize_fpn_layers()
+            
+            # Generate multi-scale features using FPN
+            nested_features = {}
+            feature_shapes = []
+            fpn_feats = []
+            for stride in self.fpn_strides:
+                if stride == self.feature_stride:
+                    fpn_feat = proj_feat
+                else:
+                    fpn_feat = self.fpn_layers[f'fpn_{stride}'](proj_feat)
+                feature_shapes.append(fpn_feat.shape)
+                fpn_feats.append(fpn_feat)
+            
+            # Set feature_strides for mask generation (must match order of feature_shapes)
+            self.feature_strides = self.fpn_strides.copy()
+            
+            # Generate masks for all feature levels at once
+            masks = self._mask_out_padding(feature_shapes, images.image_sizes, proj_feat.device)
+            
+            # Create NestedTensor for each FPN level
+            for idx, stride in enumerate(self.fpn_strides):
+                nested_features[f'fpn_{stride}'] = NestedTensor(fpn_feats[idx], masks[idx])
+            
+            return nested_features
+        else:
+            # Single-scale output (original behavior)
+            self.feature_strides = [self.feature_stride]
+            masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
+            nested = NestedTensor(proj_feat, masks[0])
+            return {"sam3": nested}
 
-        masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
-        nested = NestedTensor(proj_feat, masks[0])
-
-        return {"sam3": nested}
-
-    def _load_precomputed(self, images: ImageList) -> NestedTensor:
+    def _load_precomputed(self, images: ImageList):
         image_ids = getattr(images, "image_ids", None)
         if not image_ids:
             raise ValueError(
@@ -233,9 +319,40 @@ class Sam3MaskedBackbone(nn.Module):
             if factor > 1:
                 proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
                 self.feature_stride = self.feature_stride * factor
-        self.feature_strides = [self.feature_stride]
-        masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
-        return NestedTensor(proj_feat, masks[0])
+        
+        if self.use_fpn:
+            # Initialize FPN layers on first forward (now we know actual feature_stride)
+            if not self._fpn_layers_initialized:
+                self._initialize_fpn_layers()
+            
+            # Generate multi-scale features using FPN
+            nested_features = {}
+            feature_shapes = []
+            fpn_feats = []
+            for stride in self.fpn_strides:
+                if stride == self.feature_stride:
+                    fpn_feat = proj_feat
+                else:
+                    fpn_feat = self.fpn_layers[f'fpn_{stride}'](proj_feat)
+                feature_shapes.append(fpn_feat.shape)
+                fpn_feats.append(fpn_feat)
+            
+            # Set feature_strides for mask generation (must match order of feature_shapes)
+            self.feature_strides = self.fpn_strides.copy()
+            
+            # Generate masks for all feature levels at once
+            masks = self._mask_out_padding(feature_shapes, images.image_sizes, proj_feat.device)
+            
+            # Create NestedTensor for each FPN level
+            for idx, stride in enumerate(self.fpn_strides):
+                nested_features[f'fpn_{stride}'] = NestedTensor(fpn_feats[idx], masks[idx])
+            
+            return nested_features
+        else:
+            # Single-scale output (original behavior)
+            self.feature_strides = [self.feature_stride]
+            masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
+            return NestedTensor(proj_feat, masks[0])
 
     def _mask_out_padding(self, feature_shapes, image_sizes, device):
         masks = []

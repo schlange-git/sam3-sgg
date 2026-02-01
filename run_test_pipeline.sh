@@ -21,8 +21,20 @@ BATCH_SIZE=4
 NUM_WORKERS=2
 CHECKPOINT_PERIOD=200
 
-# 数据集路径
-DATASET_ROOT="/home/shi/abschluss/dataset/vg150"
+# 数据集路径 - 使用相对路径查找
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 尝试多个可能的数据集路径
+if [ -d "$SCRIPT_DIR/../../dataset/vg150" ]; then
+    DATASET_ROOT="$(cd "$SCRIPT_DIR/../../dataset/vg150" && pwd)"
+elif [ -d "$SCRIPT_DIR/../../../dataset/vg150" ]; then
+    DATASET_ROOT="$(cd "$SCRIPT_DIR/../../../dataset/vg150" && pwd)"
+elif [ -d "$HOME/桌面/abschluss/sgg/dataset/vg150" ]; then
+    DATASET_ROOT="$HOME/桌面/abschluss/sgg/dataset/vg150"
+else
+    # 如果都找不到，使用相对路径（用户需要自己修改）
+    DATASET_ROOT="$SCRIPT_DIR/../../dataset/vg150"
+    echo "⚠️ 警告: 使用默认路径 $DATASET_ROOT，如果不存在请修改脚本"
+fi
 VG_IMAGES="${DATASET_ROOT}/images/VG_100K"
 VG_MAPPING="${DATASET_ROOT}/VG-SGG-dicts-with-attri.json"
 VG_IMAGE_DATA="${DATASET_ROOT}/image_data.json"
@@ -83,7 +95,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --overfit NUM_IMAGES    过拟合数据集大小 (默认: 10)"
             echo "  --batch-size SIZE       批次大小 (默认: 2)"
             echo "  --pretrained PATH       预训练权重路径 (默认: vg_objectdetector_pretrained.pth)"
-            echo "  --dataset PATH          数据集根目录 (默认: /home/shi/abschluss/dataset/vg150)"
+            echo "  --dataset PATH          数据集根目录 (默认: 自动检测)"
             echo "  -h, --help              显示此帮助信息"
             echo ""
             echo "示例:"

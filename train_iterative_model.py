@@ -64,8 +64,8 @@ def backup_source_codes(cfg):
                 continue
             if os.path.isdir(file):
                 continue
-            target_dir = os.path.join(output_dir, 'code_backup', file)
-            os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+                target_dir = os.path.join(output_dir, 'code_backup', file)
+                os.makedirs(os.path.dirname(target_dir), exist_ok=True)
             try:
                 copyfile(file, target_dir)
             except Exception as e:

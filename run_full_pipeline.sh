@@ -12,50 +12,57 @@ set -e  # 遇到错误立即退出
 # 配置参数 (可通过命令行参数覆盖)
 # ============================================================================
 
-# 默认参数
-NUM_GPUS=1
-FINETUNE_ITERS=200
-OVERFIT_NUM_IMAGES=2
-OVERFIT_SEED=42
-BATCH_SIZE=1
-NUM_WORKERS=2
-CHECKPOINT_PERIOD=50
-# SAM3 backbone settings
-SAM3_ENABLED=True
-SAM3_CHECKPOINT_PATH="sam3/weights/sam3.pt"
-SAM3_IMAGE_SIZE=1008
-SAM3_FEATURE_DIM=256
-SAM3_CHANNEL_REPEAT=1
-SAM3_FREEZE=True
-SAM3_EVAL_ENABLED=${SAM3_ENABLED}
-SAM3_DEVICE="cuda"
-SAM3_TARGET_STRIDE=32
-SAM3_PRECOMPUTE=True
-SAM3_USE_PRECOMPUTED=True
-SAM3_ENABLED_PRETRAINED=False          # 预训练评测固定使用 ResNet，不走 SAM3
-SAM3_USE_PRECOMPUTED_PRETRAINED=False  # 预训练评测不使用预计算特征
-SAM3_FEATUREMAP_DIR="data/featuremaps"
-# Visualization
-VIS_NUM_IMAGES=5
-VIS_DATASET_NAME="VG_train"
-# DETR head-only loading
-DETR_HEAD_ONLY=False
-DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"
-# DETR query settings
-DETR_NUM_OBJECT_QUERIES=10
-DETR_NUM_RELATION_QUERIES=10
+# 默认参数（可通过命令行覆盖）
+NUM_GPUS=2                              # 使用的 GPU 数量（传给 --num-gpus）
+FINETUNE_ITERS=150000                  # finetune 阶段训练迭代数
+OVERFIT_NUM_IMAGES=-1                  # 过拟合实验使用的图像数量
+OVERFIT_SEED=42                        # 过拟合子集采样随机种子
+BATCH_SIZE=20                          # 训练 batch size（SOLVER.IMS_PER_BATCH，必须能被 NUM_GPUS 整除）
+NUM_WORKERS=8                          # DataLoader 的 worker 数量
+CHECKPOINT_PERIOD=5000                 # 每隔多少 iter 保存一次 checkpoint
+
+# 训练恢复相关
+RESUME=true                           # 是否从已有 finetune 目录恢复训练
+RESUME_DIR="/home/shi/桌面/abschluss/SpeaQ_20260129_021007/z_outputs/output_pipeline_20260203_213540/finetune_150000iter"                          # 恢复的 finetune 输出目录，例如：z_outputs/output_pipeline_xxx/finetune_150000iter
+
+# SAM3 backbone 相关设置
+SAM3_ENABLED=True                       # 是否启用 SAM3 作为 backbone（False 时用 ResNet）
+SAM3_CHECKPOINT_PATH="sam3/weights/sam3.pt"   # SAM3 权重路径（为空则自动下载）
+SAM3_IMAGE_SIZE=1008                    # SAM3 输入分辨率
+SAM3_FEATURE_DIM=256                    # SAM3 输出特征通道数（需与 DETR HIDDEN_DIM 对齐）
+SAM3_CHANNEL_REPEAT=1                   # 将 SAM3 输出通道重复的倍数（1 表示不重复）
+SAM3_FREEZE=True                        # 是否冻结 SAM3 参数（True 时 SAM3 不参与反向传播）
+SAM3_EVAL_ENABLED=${SAM3_ENABLED}       # Eval 阶段是否也启用 SAM3
+SAM3_DEVICE="cuda"                      # SAM3 运行设备（cuda / cpu）
+SAM3_TARGET_STRIDE=32                   # SAM3 输出目标步长（用于下采样减小显存）
+SAM3_PRECOMPUTE=True                    # 是否在 Step 0 预计算 SAM3 特征
+SAM3_USE_PRECOMPUTED=True               # 训练/评测是否使用预计算特征（不再实时跑 SAM3）
+SAM3_ENABLED_PRETRAINED=False           # 预训练评测是否启用 SAM3（这里固定用 ResNet）
+SAM3_USE_PRECOMPUTED_PRETRAINED=False   # 预训练评测是否使用预计算特征
+SAM3_FEATUREMAP_DIR="data/featuremaps"  # SAM3 预计算特征目录
+
+# 可视化相关
+VIS_NUM_IMAGES=50                        # 每个阶段用于可视化的图像数量
+VIS_DATASET_NAME="VG_train"             # 可视化使用的数据集名称
+VIS_REL_SCORE_THRESH=0.3                # 可视化时的关系/框分数阈值 (--rel-score-thresh)
+
+# DETR head-only / 查询设置
+DETR_HEAD_ONLY=False                    # 是否只从权重中加载 DETR 头部
+DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"  # DETR 头部权重文件
+DETR_NUM_OBJECT_QUERIES=300              # DETR object query 数量
+DETR_NUM_RELATION_QUERIES=300            # DETR relation query 数量
 
 # 数据集路径
-DATASET_ROOT="/home/shi/abschluss/dataset/vg150"
-VG_IMAGES="${DATASET_ROOT}/images/VG_100K"
-VG_MAPPING="${DATASET_ROOT}/VG-SGG-dicts-with-attri.json"
-VG_IMAGE_DATA="${DATASET_ROOT}/image_data.json"
-VG_ATTRIBUTE_H5="${DATASET_ROOT}/VG-SGG-with-attri.h5"
+DATASET_ROOT="${HOME}/桌面/abschluss/sgg/dataset/vg150"      # VG150 数据集根目录
+VG_IMAGES="${DATASET_ROOT}/images/VG_100K"            # 图像目录
+VG_MAPPING="${DATASET_ROOT}/VG-SGG-dicts-with-attri.json"  # 类别/关系字典
+VG_IMAGE_DATA="${DATASET_ROOT}/image_data.json"       # 图像元信息 json
+VG_ATTRIBUTE_H5="${DATASET_ROOT}/VG-SGG-with-attri.h5"     # GT box / rel / attr h5
 
 # 预训练权重路径
-PRETRAINED_WEIGHTS="vg_objectdetector_pretrained.pth"
+PRETRAINED_WEIGHTS="vg_objectdetector_pretrained.pth" # 预训练 DETR+ResNet 权重
 
-# 输出目录
+# 输出目录（默认使用时间戳；如果启用 RESUME，会在后面覆盖）
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_BASE="z_outputs/output_pipeline_${TIMESTAMP}"
 OUTPUT_PRETRAINED="${OUTPUT_BASE}/pretrained_eval"
@@ -132,6 +139,12 @@ while [[ $# -gt 0 ]]; do
             SAM3_FEATUREMAP_DIR="$2"
             shift 2
             ;;
+        --resume-dir)
+            # 指定已有的 finetune 输出目录，开启真正的 resume（包括 optimizer、scheduler 等）
+            RESUME=true
+            RESUME_DIR="$2"
+            shift 2
+            ;;
         --detr-head-only)
             DETR_HEAD_ONLY=True
             shift 1
@@ -176,6 +189,12 @@ while [[ $# -gt 0 ]]; do
             VG_ATTRIBUTE_H5="${DATASET_ROOT}/VG-SGG-with-attri.h5"
             shift 2
             ;;
+        --resume-dir)
+            # 指定已有的 finetune 输出目录，开启真正的 resume（包括 optimizer、scheduler 等）
+            RESUME=true
+            RESUME_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "用法: $0 [选项]"
             echo ""
@@ -202,7 +221,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --obj-queries N        DETR 对象 query 数 (默认: 300)"
             echo "  --rel-queries N        DETR 关系 query 数 (默认: 300)"
             echo "  --pretrained PATH       预训练权重路径 (默认: vg_objectdetector_pretrained.pth)"
-            echo "  --dataset PATH          数据集根目录 (默认: /home/shi/abschluss/dataset/vg150)"
+            echo "  --dataset PATH          数据集根目录 (默认: 自动检测)"
+            echo "  --resume-dir DIR        从指定 finetune 目录恢复训练（真正的 resume，包括 Adam 等优化器状态）"
             echo "  -h, --help              显示此帮助信息"
             echo ""
             echo "示例:"
@@ -217,6 +237,22 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# 如果指定了 RESUME_DIR，则覆盖输出目录并开启 resume
+if [ "${RESUME}" = "true" ]; then
+    if [ -z "${RESUME_DIR}" ]; then
+        echo "❌ 错误: 已启用 RESUME，但 --resume-dir 未指定"
+        exit 1
+    fi
+    if [ ! -d "${RESUME_DIR}" ]; then
+        echo "❌ 错误: 指定的 RESUME_DIR 不存在: ${RESUME_DIR}"
+        exit 1
+    fi
+    # RESUME_DIR 期望为 finetune 子目录，例如 z_outputs/output_pipeline_xxx/finetune_150000iter
+    OUTPUT_FINETUNE="${RESUME_DIR}"
+    OUTPUT_BASE="$(dirname "${RESUME_DIR}")"
+    OUTPUT_PRETRAINED="${OUTPUT_BASE}/pretrained_eval"
+fi
 
 # ============================================================================
 # 环境检查
@@ -276,6 +312,13 @@ echo "激活 conda 环境: speaq"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate speaq
 
+# 设置 PyTorch 库路径（解决 detectron2 找不到 libtorch_cuda_cu.so 的问题）
+TORCH_LIB_PATH=$(python -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))" 2>/dev/null)
+if [ -n "${TORCH_LIB_PATH}" ] && [ -d "${TORCH_LIB_PATH}" ]; then
+    export LD_LIBRARY_PATH="${TORCH_LIB_PATH}:${LD_LIBRARY_PATH}"
+    echo "✓ 已设置 LD_LIBRARY_PATH: ${TORCH_LIB_PATH}"
+fi
+
 # Ensure SAM3 package is importable
 export PYTHONPATH="$(pwd)/sam3:$(pwd):${PYTHONPATH}"
 # CUDA allocator hint to reduce fragmentation
@@ -288,126 +331,177 @@ echo ""
 # Step 0: 预生成 SAM3 特征 (可选)
 # ============================================================================
 
-if [ "${SAM3_PRECOMPUTE}" = "True" ]; then
-    echo "════════════════════════════════════════════════════════════════"
-    echo "  Step 0/4: 预生成 SAM3 特征"
-    echo "════════════════════════════════════════════════════════════════"
-    echo ""
-    python precompute_sam3_featuremaps.py --config-file configs/speaq.yaml \
-        --output-dir "${SAM3_FEATUREMAP_DIR}" \
-        DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
-        DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
-        DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
-        DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
-        DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
-        DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
-        DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
-        MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
-        MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
-        MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
-        MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
-        MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
-        MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
-        MODEL.SAM3.USE_PRECOMPUTED False \
-        MODEL.DEVICE ${SAM3_DEVICE}
-    echo ""
-    echo "✓ Step 0 完成: SAM3 特征已保存到 ${SAM3_FEATUREMAP_DIR}"
-    echo ""
-fi
+# if [ "${SAM3_PRECOMPUTE}" = "True" ]; then
+#     echo "════════════════════════════════════════════════════════════════"
+#     echo "  Step 0/4: 预生成 SAM3 特征"
+#     echo "════════════════════════════════════════════════════════════════"
+#     echo ""
+#     python precompute_sam3_featuremaps.py --config-file configs/speaq.yaml \
+#         --output-dir "${SAM3_FEATUREMAP_DIR}" \
+#         --num-gpus ${NUM_GPUS} \
+#         DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+#         DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+#         DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+#         DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+#         DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+#         DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+#         DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+#         MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+#         MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+#         MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+#         MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+#         MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+#         MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+#         MODEL.SAM3.USE_PRECOMPUTED False \
+#         MODEL.DEVICE ${SAM3_DEVICE}
+    
+#     # 等待所有 GPU 进程完全退出并清理资源
+#     echo "Waiting for GPU processes to fully terminate..."
+#     sleep 3
+    
+#     # 清理 GPU 缓存
+#     python -c "import torch; [torch.cuda.set_device(i) or torch.cuda.empty_cache() or torch.cuda.synchronize() for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else None" 2>/dev/null || true
+    
+#     echo ""
+#     echo "✓ Step 0 完成: SAM3 特征已保存到 ${SAM3_FEATUREMAP_DIR}"
+#     echo ""
+# fi
 
-# ============================================================================
-# Step 1: 评测预训练权重
-# ============================================================================
+# # ============================================================================
+# # Step 1: 评测预训练权重
+# # ============================================================================
 
-echo "════════════════════════════════════════════════════════════════"
-echo "  Step 1/4: 评测预训练权重"
-echo "════════════════════════════════════════════════════════════════"
-echo ""
+# echo "════════════════════════════════════════════════════════════════"
+# echo "  Step 1/4: 评测预训练权重"
+# echo "════════════════════════════════════════════════════════════════"
+# echo ""
 
-# Verify precomputed features for pretrained eval if required
-if [ "${SAM3_USE_PRECOMPUTED_PRETRAINED}" = "True" ]; then
-    if [ ! -d "${SAM3_FEATUREMAP_DIR}" ]; then
-        echo "❌ 错误: 预计算特征目录不存在: ${SAM3_FEATUREMAP_DIR}"
-        echo "   请先运行预计算步骤 (--sam3-precompute) 或设置 SAM3_USE_PRECOMPUTED=False"
-        exit 1
-    fi
-    feature_count=$(find "${SAM3_FEATUREMAP_DIR}" -name "*.pt" 2>/dev/null | wc -l)
-    if [ "${feature_count}" -eq 0 ]; then
-        echo "❌ 错误: 预计算特征目录为空: ${SAM3_FEATUREMAP_DIR}"
-        echo "   请先运行预计算步骤 (--sam3-precompute)"
-        exit 1
-    fi
-    echo "✓ 预计算特征目录检查通过: ${SAM3_FEATUREMAP_DIR} (${feature_count} 个 .pt 文件)"
-fi
+# # 检查 GPU 状态并清理
+# echo "Checking GPU status..."
+# python -c "
+# import torch
+# if torch.cuda.is_available():
+#     for i in range(torch.cuda.device_count()):
+#         try:
+#             torch.cuda.set_device(i)
+#             torch.cuda.empty_cache()
+#             torch.cuda.synchronize()
+#             print(f'✓ GPU {i} is ready')
+#         except Exception as e:
+#             print(f'⚠ Warning: GPU {i} may have issues: {e}')
+# else:
+#     print('CUDA not available')
+# " 2>/dev/null || echo "Warning: Could not check GPU status"
 
-python train_iterative_model.py --eval-only --num-gpus ${NUM_GPUS} \
-    --config-file configs/speaq.yaml --dist-url ${PORT_PRETRAINED} \
-    OUTPUT_DIR "${OUTPUT_PRETRAINED}" \
-    MODEL.WEIGHTS "${PRETRAINED_WEIGHTS}" \
-    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
-    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
-    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
-    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
-    MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
-    MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
-    MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
-    MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
-    MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
-    MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
-    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
-    MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
-    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
-    MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
-    DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
-    DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
-    DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
-    DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
-    DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
-    DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
-    DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
-    SOLVER.IMS_PER_BATCH ${BATCH_SIZE} \
-    DATALOADER.NUM_WORKERS ${NUM_WORKERS}
+# # 额外等待确保 GPU 完全释放
+# sleep 2
 
-# 保存预训练评测结果
-python save_eval_results.py "${OUTPUT_PRETRAINED}" \
-    --name "Pretrained Weights (${OVERFIT_NUM_IMAGES}-clip)" \
-    --output eval_results.txt
+# # Verify precomputed features for pretrained eval if required
+# if [ "${SAM3_USE_PRECOMPUTED_PRETRAINED}" = "True" ]; then
+#     if [ ! -d "${SAM3_FEATUREMAP_DIR}" ]; then
+#         echo "❌ 错误: 预计算特征目录不存在: ${SAM3_FEATUREMAP_DIR}"
+#         echo "   请先运行预计算步骤 (--sam3-precompute) 或设置 SAM3_USE_PRECOMPUTED=False"
+#         exit 1
+#     fi
+#     feature_count=$(find "${SAM3_FEATUREMAP_DIR}" -name "*.pt" 2>/dev/null | wc -l)
+#     if [ "${feature_count}" -eq 0 ]; then
+#         echo "❌ 错误: 预计算特征目录为空: ${SAM3_FEATUREMAP_DIR}"
+#         echo "   请先运行预计算步骤 (--sam3-precompute)"
+#         exit 1
+#     fi
+#     echo "✓ 预计算特征目录检查通过: ${SAM3_FEATUREMAP_DIR} (${feature_count} 个 .pt 文件)"
+# fi
 
-echo ""
-echo "✓ Step 1 完成: 预训练权重评测结果已保存"
-echo "  结果文件: ${OUTPUT_PRETRAINED}/eval_results.txt"
-echo ""
+# python train_iterative_model.py --eval-only --num-gpus ${NUM_GPUS} \
+#     --config-file configs/speaq.yaml --dist-url ${PORT_PRETRAINED} \
+#     OUTPUT_DIR "${OUTPUT_PRETRAINED}" \
+#     MODEL.WEIGHTS "${PRETRAINED_WEIGHTS}" \
+#     MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+#     MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+#     MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+#     MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+#     MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
+#     MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}" \
+#     MODEL.SAM3.IMAGE_SIZE ${SAM3_IMAGE_SIZE} \
+#     MODEL.SAM3.FEATURE_DIM ${SAM3_FEATURE_DIM} \
+#     MODEL.SAM3.CHANNEL_REPEAT ${SAM3_CHANNEL_REPEAT} \
+#     MODEL.SAM3.TARGET_STRIDE ${SAM3_TARGET_STRIDE} \
+#     MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
+#     MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
+#     MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+#     MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
+#     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+#     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+#     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+#     DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+#     DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+#     SOLVER.IMS_PER_BATCH ${BATCH_SIZE} \
+#     DATALOADER.NUM_WORKERS ${NUM_WORKERS}
 
-# 预训练可视化（使用 ResNet，SAM3 关闭，默认不用预计算）
-PRETRAINED_VIS_DIR="${OUTPUT_PRETRAINED}/vis"
-python visualize_predictions.py --config-file configs/speaq.yaml \
-    --model-weights "${PRETRAINED_WEIGHTS}" \
-    --output-dir "${PRETRAINED_VIS_DIR}" \
-    --dataset-name "${VIS_DATASET_NAME}" \
-    --num-images ${VIS_NUM_IMAGES} \
-    MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
-    MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
-    MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
-    MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
-    MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
-    MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
-    MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
-    DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
-    DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
-    DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
-    DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
-    DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
-    DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
-    DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
-    SOLVER.IMS_PER_BATCH 1 \
-    DATALOADER.NUM_WORKERS 0
+# # 保存预训练评测结果
+# python save_eval_results.py "${OUTPUT_PRETRAINED}" \
+#     --name "Pretrained Weights (${OVERFIT_NUM_IMAGES}-clip)" \
+#     --output eval_results.txt
+
+# echo ""
+# echo "✓ Step 1 完成: 预训练权重评测结果已保存"
+# echo "  结果文件: ${OUTPUT_PRETRAINED}/eval_results.txt"
+# echo ""
+
+# # 预训练可视化（使用 ResNet，SAM3 关闭，默认不用预计算）
+# PRETRAINED_VIS_DIR="${OUTPUT_PRETRAINED}/vis"
+# python visualize_predictions.py --config-file configs/speaq.yaml \
+#     --model-weights "${PRETRAINED_WEIGHTS}" \
+#     --output-dir "${PRETRAINED_VIS_DIR}" \
+#     --dataset-name "${VIS_DATASET_NAME}" \
+#     --num-images ${VIS_NUM_IMAGES} \
+#     --rel-score-thresh ${VIS_REL_SCORE_THRESH} \
+#     MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
+#     MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
+#     MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
+#     MODEL.DETR.NUM_RELATION_QUERIES ${DETR_NUM_RELATION_QUERIES} \
+#     MODEL.SAM3.ENABLED ${SAM3_ENABLED_PRETRAINED} \
+#     MODEL.SAM3.USE_PRECOMPUTED ${SAM3_USE_PRECOMPUTED_PRETRAINED} \
+#     MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
+#     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+#     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+#     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+#     DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+#     DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+#     SOLVER.IMS_PER_BATCH 1 \
+#     DATALOADER.NUM_WORKERS 0
+
+# # GT 可视化（与 eval 对齐：左边 det，右边 det+relation）
+# PRETRAINED_GT_VIS_DIR="${OUTPUT_PRETRAINED}/vis_gt"
+# python visualize_predictions.py --config-file configs/speaq.yaml \
+#     --output-dir "${PRETRAINED_GT_VIS_DIR}" \
+#     --dataset-name "${VIS_DATASET_NAME}" \
+#     --num-images ${VIS_NUM_IMAGES} \
+#     --gt-only \
+#     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+#     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+#     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+#     DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+#     DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+#     DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+#     SOLVER.IMS_PER_BATCH 1 \
+#     DATALOADER.NUM_WORKERS 0
 
 # ============================================================================
 # Step 2: Finetune 训练
 # ============================================================================
 
 echo "════════════════════════════════════════════════════════════════"
-echo "  Step 2/4: Finetune 训练 (${FINETUNE_ITERS} 次迭代)"
+if [ "${RESUME}" = "true" ]; then
+    echo "  Step 2/4: Finetune 训练 (恢复自 ${OUTPUT_FINETUNE}，目标迭代数 ${FINETUNE_ITERS})"
+else
+    echo "  Step 2/4: Finetune 训练 (${FINETUNE_ITERS} 次迭代)"
+fi
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -426,8 +520,15 @@ if [ "${SAM3_USE_PRECOMPUTED}" = "True" ]; then
     fi
 fi
 
+# 根据是否启用 RESUME 构建参数
+RESUME_ARG=""
+if [ "${RESUME}" = "true" ]; then
+    RESUME_ARG="--resume"
+fi
+
 python train_iterative_model.py --num-gpus ${NUM_GPUS} \
     --config-file configs/speaq.yaml --dist-url ${PORT_FINETUNE} \
+    ${RESUME_ARG} \
     OUTPUT_DIR "${OUTPUT_FINETUNE}" \
     MODEL.WEIGHTS "${PRETRAINED_WEIGHTS}" \
     MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
@@ -469,6 +570,7 @@ python visualize_predictions.py --config-file configs/speaq.yaml \
     --output-dir "${FINETUNE_VIS_DIR}" \
     --dataset-name "${VIS_DATASET_NAME}" \
     --num-images ${VIS_NUM_IMAGES} \
+    --rel-score-thresh ${VIS_REL_SCORE_THRESH} \
     MODEL.DETR.LOAD_HEAD_ONLY ${DETR_HEAD_ONLY} \
     MODEL.DETR.HEAD_WEIGHTS "${DETR_HEAD_WEIGHTS}" \
     MODEL.DETR.NUM_OBJECT_QUERIES ${DETR_NUM_OBJECT_QUERIES} \
@@ -483,6 +585,23 @@ python visualize_predictions.py --config-file configs/speaq.yaml \
     MODEL.SAM3.FEATUREMAP_DIR "${SAM3_FEATUREMAP_DIR}" \
     MODEL.SAM3.DEVICE ${SAM3_DEVICE} \
     MODEL.SAM3.FREEZE ${SAM3_FREEZE} \
+    DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
+    DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
+    DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \
+    DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 "${VG_ATTRIBUTE_H5}" \
+    DATASETS.VISUAL_GENOME.OVERFIT_NUM_IMAGES ${OVERFIT_NUM_IMAGES} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SEED ${OVERFIT_SEED} \
+    DATASETS.VISUAL_GENOME.OVERFIT_SOURCE_SPLIT train \
+    SOLVER.IMS_PER_BATCH 1 \
+    DATALOADER.NUM_WORKERS 0
+
+# Finetune GT 可视化（与 eval 对齐：左边 det，右边 det+relation）
+FINETUNE_GT_VIS_DIR="${OUTPUT_FINETUNE}/vis_gt"
+python visualize_predictions.py --config-file configs/speaq.yaml \
+    --output-dir "${FINETUNE_GT_VIS_DIR}" \
+    --dataset-name "${VIS_DATASET_NAME}" \
+    --num-images ${VIS_NUM_IMAGES} \
+    --gt-only \
     DATASETS.VISUAL_GENOME.IMAGES "${VG_IMAGES}" \
     DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY "${VG_MAPPING}" \
     DATASETS.VISUAL_GENOME.IMAGE_DATA "${VG_IMAGE_DATA}" \

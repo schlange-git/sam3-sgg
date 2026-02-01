@@ -278,7 +278,21 @@ class VisualGenomeTrainData:
             record = {}
             #Get image metadata
             image_data = self.image_data[image_indexer[idx]]
-            record['file_name'] = os.path.join(self.cfg.DATASETS.VISUAL_GENOME.IMAGES, '{}.jpg'.format(image_data['image_id']))
+            image_filename = '{}.jpg'.format(image_data['image_id'])
+            # 尝试 images/VG_100K 和 images2/VG_100K_2 两个目录
+            base_path = self.cfg.DATASETS.VISUAL_GENOME.IMAGES
+            # 如果配置的是 images/VG_100K，也尝试 images2/VG_100K_2
+            if 'images/VG_100K' in base_path or 'images\\VG_100K' in base_path:
+                path1 = os.path.join(base_path, image_filename)
+                path2 = os.path.join(base_path.replace('images/VG_100K', 'images2/VG_100K_2').replace('images\\VG_100K', 'images2\\VG_100K_2'), image_filename)
+                if os.path.exists(path1):
+                    record['file_name'] = path1
+                elif os.path.exists(path2):
+                    record['file_name'] = path2
+                else:
+                    record['file_name'] = path1  # 默认使用第一个路径
+            else:
+                record['file_name'] = os.path.join(base_path, image_filename)
             record['image_id'] = image_data['image_id']
             record['height'] = image_data['height']
             record['width'] = image_data['width']

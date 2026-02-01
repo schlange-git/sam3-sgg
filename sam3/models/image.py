@@ -22,12 +22,29 @@ print("模型加载完成！")
 # 默认值是0.5，如果检测不到对象，可以降低这个值
 processor = Sam3Processor(model, confidence_threshold=0.3)
 # Load an image
-image_path = "/home/shi/abschluss/dataset/visual genome/images/VG_100K/2.jpg"
+# 使用相对路径，从当前脚本位置查找数据集
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))  # 回到项目根目录
+# 尝试多个可能的数据集路径
+possible_paths = [
+    os.path.join(project_root, "..", "..", "dataset", "visual genome", "images", "VG_100K", "2.jpg"),
+    os.path.join(project_root, "..", "..", "..", "dataset", "vg150", "images", "VG_100K", "2.jpg"),
+    os.path.join(os.path.expanduser("~"), "桌面", "abschluss", "sgg", "dataset", "vg150", "images", "VG_100K", "2.jpg"),
+]
+image_path = None
+for path in possible_paths:
+    abs_path = os.path.abspath(path)
+    if os.path.exists(abs_path):
+        image_path = abs_path
+        break
+if image_path is None:
+    # 如果都找不到，使用第一个路径（用户需要自己修改）
+    image_path = possible_paths[0]
+    print(f"⚠️ 警告: 使用默认路径 {image_path}，如果不存在请修改脚本")
 image = Image.open(image_path)
 inference_state = processor.set_image(image)
-# 保存结果到 results 文件夹
-
-results_dir = "/home/shi/abschluss/sam3/results/visual_genome"
+# 保存结果到 results 文件夹（相对于项目根目录）
+results_dir = os.path.join(project_root, "sam3", "results", "visual_genome")
 os.makedirs(results_dir, exist_ok=True)
 
 

@@ -64,7 +64,7 @@
 | `--overfit` | 10 | 过拟合数据集大小（图片数量） |
 | `--batch-size` | 2 | 每个 GPU 的批次大小 |
 | `--pretrained` | `vg_objectdetector_pretrained.pth` | 预训练权重路径 |
-| `--dataset` | `/home/shi/abschluss/dataset/vg150` | 数据集根目录 |
+| `--dataset` | `/home/shi/桌面/abschluss/dataset/vg150` | 数据集根目录 |
 
 ---
 

@@ -89,7 +89,7 @@ pip install h5py  # 用于读取 h5 文件
 
 ```bash
 # 在 run_build_cache.sh 中
-VG_ROOT="/home/shi/abschluss/dataset/vg150"  # 修改为你的 VG150 数据集路径
+VG_ROOT="/home/shi/桌面/abschluss/dataset/vg150"  # 修改为你的 VG150 数据集路径
 
 # 在 run_train_fast.sh 中
 CACHE_DIR="sgg/cache/train"  # 缓存目录
