@@ -11,12 +11,14 @@ data/featuremaps
 
 # Training outputs
 output*/
+z_outputs/
 tmp/
 wandb/
 runs/
 logs/
 
 # Model weights and checkpoints
+*.pt
 *.pth
 *.pkl
 *.h5

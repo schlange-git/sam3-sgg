@@ -1,7 +1,7 @@
 import os
 import sys
 
-from ..datasets import VisualGenomeTrainData
+from ..datasets import VisualGenomeTrainData, ActionGenomeTrainData
 from detectron2.data.datasets import register_coco_instances
 
 def register_datasets(cfg):
@@ -24,4 +24,16 @@ def register_datasets(cfg):
         # Register only needed splits
         for split in splits_to_register:
             dataset_instance = VisualGenomeTrainData(cfg, split=split)
+    elif cfg.DATASETS.TYPE == 'ACTION GENOME':
+        splits_to_register = set()
+        for dataset_name in cfg.DATASETS.TRAIN:
+            if dataset_name.startswith('AG_'):
+                splits_to_register.add(dataset_name.split('_')[1])
+        for dataset_name in cfg.DATASETS.TEST:
+            if dataset_name.startswith('AG_'):
+                splits_to_register.add(dataset_name.split('_')[1])
+        if not splits_to_register:
+            splits_to_register = {'train', 'val'}
+        for split in splits_to_register:
+            dataset_instance = ActionGenomeTrainData(cfg, split=split)
         

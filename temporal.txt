@@ -1,0 +1,21 @@
+数据集：
+1. 使用action genome数据集，位置在于 {HOME}/桌面/abschluss/sgg/dataset/actiongenome
+2. 数据集使用的是480p的大小，动态场景
+3. 使用规则和读取方式可以参考data/ActionGenome位置，作者给出的标准代码
+4. 标准代码里面是否包含有视频转化成为帧的代码。我的理解是，如果我们需要多次训练和调试，在节省计算开销的角度可以直接把视频转化为帧存储起来，以后直接使用转化后的节省开销
+5. 如果上面的步骤需要进行，请单独写一个文件或者脚本，不要嵌入到训练流程里面，方便独立管理
+
+特征提取和传递：
+1.目前特征提取使用sam3不变
+2.适配480p的视频分辨率，sam3特征输出端保持不变，做最小改动
+
+
+时序建模：
+1.目前不进行显式时序建模，这部分工作在跑通之后进行时序拓展
+2.但是需要进行的是，保证一组数据的输入来源都是同一个视频
+3.前面的一点的原因进行详细解释。后续我们会使用两状态时序记忆（current + compressed history）。
+为了不把另一个视频的内容带入到当前存储的时序，所以我们的batch内部，只能存储来自同一个视频的图像或者特征图
+
+
+最小化训练：
+python train_iterative_model.py --num-gpus 1 --config-file configs/speaq_actiongenome_minimal.yaml OUTPUT_DIR z_outputs/ag_minimal_run

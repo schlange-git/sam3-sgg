@@ -11,6 +11,7 @@ import pickle
 import itertools
 import pycocotools.mask as mask_util
 from collections import OrderedDict, defaultdict
+from torch.utils.data import Sampler
 from detectron2.utils.logger import setup_logger, log_every_n_seconds
 from detectron2.engine import DefaultTrainer
 try:
@@ -108,6 +109,49 @@ class WandbWriter(EventWriter):
     def close(self):
         if hasattr(self, "_writer"):
             self._writer.finish()
+
+
+class MemoryMonitorHook(HookBase):
+    """内存监控 Hook：当系统内存占用超过阈值时自动终止训练"""
+    
+    def __init__(self, threshold=90.0, check_interval=10):
+        """
+        Args:
+            threshold: 内存使用率阈值（%），超过此值将终止训练
+            check_interval: 每隔多少次迭代检查一次内存
+        """
+        self.threshold = threshold
+        self.check_interval = check_interval
+        self.check_count = 0
+        self.logger = logging.getLogger(__name__)
+    
+    def after_step(self):
+        """每次迭代后检查内存"""
+        self.check_count += 1
+        if self.check_count % self.check_interval == 0:
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                mem_usage_percent = mem.percent
+                
+                if mem_usage_percent >= self.threshold:
+                    self.logger.error(
+                        f"⚠️  内存使用率 {mem_usage_percent:.1f}% 超过阈值 {self.threshold}%！"
+                        f"正在终止训练以防止系统崩溃..."
+                    )
+                    import os
+                    import signal
+                    # 发送 SIGTERM 信号给当前进程
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    # 如果 SIGTERM 无效，等待1秒后发送 SIGKILL
+                    import time
+                    time.sleep(1)
+                    os.kill(os.getpid(), signal.SIGKILL)
+            except ImportError:
+                # psutil 未安装，跳过内存监控
+                pass
+            except Exception as e:
+                self.logger.warning(f"内存监控出错: {e}")
 
 
 class PerformanceMonitorHook(HookBase):
@@ -260,9 +304,87 @@ class PerformanceMonitorHook(HookBase):
         self.logger.info("=" * 80)
 
 
+class SameVideoBatchSampler(Sampler):
+    """
+    将同一视频的帧分组到同一个batch中的采样器。
+    这个类必须在模块级别定义（而不是在方法内部），以便可以被pickle序列化，
+    从而支持多GPU训练时的多进程数据加载。
+    """
+    def __init__(self, records, batch_size, base_seed):
+        self.batch_size = max(1, int(batch_size))
+        self.base_seed = int(base_seed)
+        self.rank = comm.get_rank()
+        self.world_size = comm.get_world_size()
+        grouped = defaultdict(list)
+        for idx, rec in enumerate(records):
+            grouped[str(rec.get("video_id", "__novid__"))].append(idx)
+        videos = sorted(grouped.keys())
+        self.video_to_indices = {k: grouped[k] for k in videos}
+        self.videos = videos[self.rank :: self.world_size] if self.world_size > 1 else videos
+        if len(self.videos) == 0:
+            self.videos = videos
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.base_seed + self.rank)
+        while True:
+            order = torch.randperm(len(self.videos), generator=g).tolist()
+            for vid_idx in order:
+                vid = self.videos[vid_idx]
+                indices = list(self.video_to_indices[vid])
+                if len(indices) == 0:
+                    continue
+                perm = torch.randperm(len(indices), generator=g).tolist()
+                shuffled = [indices[i] for i in perm]
+                start = 0
+                while start < len(shuffled):
+                    chunk = shuffled[start : start + self.batch_size]
+                    start += self.batch_size
+                    if len(chunk) < self.batch_size:
+                        pad_idx = torch.randint(0, len(indices), (self.batch_size - len(chunk),), generator=g).tolist()
+                        chunk.extend([indices[p] for p in pad_idx])
+                    for x in chunk:
+                        yield x
+
+    def __len__(self):
+        return sum(len(v) for v in self.video_to_indices.values())
+
+
 class JointTransformerTrainer(DefaultTrainer):
+    @staticmethod
+    def _build_same_video_sampler(dataset_dicts, per_worker_batch_size, seed=42):
+        return SameVideoBatchSampler(dataset_dicts, per_worker_batch_size, seed)
+
     @classmethod
     def build_train_loader(cls, cfg):
+        if cfg.DATASETS.TYPE == "ACTION GENOME" and cfg.DATASETS.ACTION_GENOME.FORMAT_VID_WISE:
+            dataset_dicts = get_detection_dataset_dicts(
+                cfg.DATASETS.TRAIN,
+                filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
+                min_keypoints=cfg.MODEL.ROI_KEYPOINT_HEAD.MIN_KEYPOINTS_PER_IMAGE
+                if cfg.MODEL.KEYPOINT_ON
+                else 0,
+                proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
+            )
+            dataset = DatasetFromList(dataset_dicts, copy=False)
+            dataset = MapDataset(dataset, DetrDatasetMapper(cfg, True))
+            world_size = max(1, get_world_size())
+            assert (
+                cfg.SOLVER.IMS_PER_BATCH % world_size == 0
+            ), "SOLVER.IMS_PER_BATCH must be divisible by world size."
+            per_worker_batch = cfg.SOLVER.IMS_PER_BATCH // world_size
+            sampler = cls._build_same_video_sampler(
+                dataset_dicts,
+                per_worker_batch_size=per_worker_batch,
+                seed=cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED,
+            )
+            return build_batch_data_loader(
+                dataset,
+                sampler,
+                total_batch_size=cfg.SOLVER.IMS_PER_BATCH,
+                aspect_ratio_grouping=False,
+                num_workers=cfg.DATALOADER.NUM_WORKERS,
+            )
         return build_detection_train_loader(cfg, mapper=DetrDatasetMapper(cfg, True))
 
     @classmethod
@@ -305,6 +427,7 @@ class JointTransformerTrainer(DefaultTrainer):
         ret = [
             hooks.IterationTimer(),
             PerformanceMonitorHook(period=50),  # 每50次迭代输出一次性能报告
+            MemoryMonitorHook(threshold=90.0, check_interval=10),  # 内存监控：每10次迭代检查一次，超过90%自动终止
             hooks.LRScheduler(self.optimizer, self.scheduler),
             hooks.PreciseBN(
                 # Run at the same freq as (but before) evaluation.
@@ -332,7 +455,10 @@ class JointTransformerTrainer(DefaultTrainer):
         def test_at_end_of_training():
             copy_cfg = copy.deepcopy(self.cfg)
             copy_cfg.defrost()
-            copy_cfg.DATASETS.TEST = ('VG_test',)
+            if copy_cfg.DATASETS.TYPE == "ACTION GENOME":
+                copy_cfg.DATASETS.TEST = ("AG_val",)
+            else:
+                copy_cfg.DATASETS.TEST = ("VG_test",)
             copy_cfg.freeze()
             self._final_eval_results_on_test = self.test(copy_cfg, self.model)
             return self._final_eval_results_on_test

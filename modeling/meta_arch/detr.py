@@ -404,7 +404,9 @@ class IterativeRelationDetr(Detr):
             scores_s, labels_s, scores_o, labels_o = map(lambda u: u.unsqueeze(-1).repeat(1,1,M).reshape(B, -1), (scores_s, labels_s, scores_o, labels_o))
 
             scores_r, labels_r = map(lambda u: u.reshape(B, -1), logits_r[:,:,:-1].topk(M,-1))
-            logits_r = logits_r.repeat(1,1,M).reshape(1,-1, 51)
+            # Use dynamic number of relation classes (+bg) instead of hard-coded 51
+            num_rel_classes_plus_bg = logits_r.shape[-1]
+            logits_r = logits_r.repeat(1,1,M).reshape(1,-1, num_rel_classes_plus_bg)
             box_s = output['relation_subject_boxes']
             box_o = output['relation_object_boxes']
             box_s, box_o = map(lambda u: u.repeat(1,1,M).reshape(B,-1,4), (box_s, box_o))

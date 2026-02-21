@@ -45,12 +45,70 @@ class Sam3MaskedBackbone(nn.Module):
                 )
 
         # Ensure sam3 is importable from repo local path
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # sam3_backbone.py is at: SpeaQ/modeling/backbone/sam3_backbone.py
+        # So we need to go up 3 levels to reach project root
+        current_file_dir = os.path.dirname(os.path.abspath(__file__))
+        # Go up: backbone -> modeling -> SpeaQ -> project_root
+        repo_root = os.path.abspath(os.path.join(current_file_dir, "..", "..", ".."))
         sam3_path = os.path.join(repo_root, "sam3")
         if sam3_path not in sys.path:
             sys.path.insert(0, sam3_path)
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
+
+        # Find BPE file path manually (pkg_resources may fail if sam3 is not installed as package)
+        bpe_path = None
+        bpe_candidates = [
+            os.path.join(repo_root, "sam3", "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz"),
+            os.path.join(repo_root, "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz"),
+            os.path.join(sam3_path, "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz"),
+            os.path.join(sam3_path, "assets", "bpe_simple_vocab_16e6.txt.gz"),
+        ]
+        for candidate in bpe_candidates:
+            if os.path.exists(candidate):
+                bpe_path = candidate
+                logging.getLogger("detectron2").info(f"Found BPE file at: {bpe_path}")
+                break
+        
+        # If not found, try pkg_resources as fallback
+        if bpe_path is None:
+            try:
+                import pkg_resources
+                bpe_path = pkg_resources.resource_filename(
+                    "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+                )
+                if os.path.exists(bpe_path):
+                    logging.getLogger("detectron2").info(f"Found BPE file via pkg_resources: {bpe_path}")
+            except Exception as e:
+                logging.getLogger("detectron2").debug(f"pkg_resources failed: {e}")
+                # If pkg_resources also fails, try to find it relative to sam3 module
+                try:
+                    import sam3
+                    if hasattr(sam3, '__file__') and sam3.__file__:
+                        sam3_dir = os.path.dirname(os.path.dirname(sam3.__file__))
+                        bpe_path = os.path.join(sam3_dir, "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz")
+                        if os.path.exists(bpe_path):
+                            logging.getLogger("detectron2").info(f"Found BPE file via sam3 module: {bpe_path}")
+                        else:
+                            bpe_path = None
+                except Exception:
+                    pass
+        
+        if bpe_path is None or not os.path.exists(bpe_path):
+            logging.getLogger("detectron2").warning(
+                f"BPE file not found at expected locations. Tried: {bpe_candidates}. "
+                "Will let build_sam3_image_model handle it (may fail or download)."
+            )
+            # Set to None to let build_sam3_image_model handle it
+            bpe_path = None
+
+        # SAM3 权重固定路径（相对项目根）
+        sam3_ckpt = os.path.join(repo_root, "sam3", "weights", "sam3.pt")
+        checkpoint_path = sam3_ckpt if os.path.isfile(sam3_ckpt) else None
+        if checkpoint_path is None:
+            logging.getLogger("detectron2").info(
+                f"SAM3 checkpoint not found at {sam3_ckpt}, will try HuggingFace."
+            )
 
         self.sam3_model = None
         self.transform = None
@@ -65,7 +123,9 @@ class Sam3MaskedBackbone(nn.Module):
             logging.getLogger("detectron2").info("Loading SAM3 image backbone...")
             self.sam3_model = build_sam3_image_model(
                 device=str(self.sam3_device),
-                checkpoint_path=self.checkpoint_path if self.checkpoint_path else None,
+                checkpoint_path=checkpoint_path,
+                load_from_HF=False,
+                bpe_path=bpe_path,
             ).to(self.sam3_device)
             self.sam3_model.eval()
 

@@ -380,6 +380,9 @@ class IterativeRelationCriterionBase(nn.Module):
         idx = self._get_src_permutation_idx_rel(indices)
         
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # Ensure dtype matches target_classes (long)
+        if target_classes_o.dtype != torch.long:
+            target_classes_o = target_classes_o.long()
         target_classes = torch.full(src_logits.shape[:2], self.num_rel_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o

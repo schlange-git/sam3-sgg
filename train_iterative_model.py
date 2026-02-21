@@ -84,8 +84,17 @@ def setup(args):
     if cfg.MODEL.SAM3.ENABLED or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS):
         # Avoid full-model loading when using SAM3 or when only DETR head weights are intended
         cfg.MODEL.WEIGHTS = ""
-    cfg.freeze()
     register_datasets(cfg)
+    if cfg.DATASETS.TYPE == "ACTION GENOME" and len(cfg.DATASETS.TRAIN) > 0:
+        train_name = cfg.DATASETS.TRAIN[0]
+        metadata = MetadataCatalog.get(train_name)
+        num_obj = len(getattr(metadata, "thing_classes", []))
+        num_rel = len(getattr(metadata, "predicate_classes", []))
+        if num_obj > 0 and num_rel > 0:
+            cfg.MODEL.DETR.NUM_CLASSES = num_obj
+            cfg.MODEL.DETR.NUM_RELATION_CLASSES = num_rel
+            print(f"[ActionGenome] Auto-set classes: NUM_CLASSES={num_obj}, NUM_RELATION_CLASSES={num_rel}")
+    cfg.freeze()
     # register_coco_data(cfg)
     default_setup(cfg, args)
     
@@ -115,18 +124,28 @@ def main(args):
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    try:
-        # use the last 4 numbers in the job id as the id
-        # default_port = os.environ['SLURM_JOB_ID']
-        # default_port = default_port[-4:]
-        #
-        # # all ports should be in the 10k+ range
-        # default_port = int(default_port) + 15000
-        default_port = args.dist_url
-    except Exception:
-        default_port = 30050
-
-    args.dist_url = 'tcp://127.0.0.1:'+str(default_port)
+    # 如果 dist_url 已经是完整的URL（以 tcp:// 开头），直接使用
+    # 否则，从环境变量或默认值获取端口号并拼接URL
+    if args.dist_url and args.dist_url.startswith('tcp://'):
+        # 已经是完整的URL，直接使用
+        pass
+    else:
+        try:
+            # use the last 4 numbers in the job id as the id
+            # default_port = os.environ['SLURM_JOB_ID']
+            # default_port = default_port[-4:]
+            #
+            # # all ports should be in the 10k+ range
+            # default_port = int(default_port) + 15000
+            if args.dist_url:
+                # 如果 dist_url 是端口号字符串，提取端口号
+                default_port = int(args.dist_url) if args.dist_url.isdigit() else 30050
+            else:
+                default_port = 30050
+        except Exception:
+            default_port = 30050
+        
+        args.dist_url = 'tcp://127.0.0.1:'+str(default_port)
     print(args)
 
     launch(

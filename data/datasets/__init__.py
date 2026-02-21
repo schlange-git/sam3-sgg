@@ -1,1 +1,2 @@
 from .visual_genome import VisualGenomeTrainData
+from .action_genome import ActionGenomeTrainData
