@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 data/featuremaps
+dataset/
 
 # Training outputs
 output*/

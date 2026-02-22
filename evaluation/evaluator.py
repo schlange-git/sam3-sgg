@@ -7,7 +7,6 @@ from collections import Counter
 import torch
 
 from detectron2.utils.comm import get_world_size, is_main_process
-from detectron2.utils.logger import log_every_n_seconds
 
 
 from detectron2.evaluation import COCOEvaluator
@@ -65,18 +64,7 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
             seconds_per_img = total_compute_time / iters_after_start
 
-            if idx >= num_warmup * 2 or seconds_per_img > 5:
-                total_seconds_per_img = (time.perf_counter() - start_time) / iters_after_start
-                eta = datetime.timedelta(seconds=int(total_seconds_per_img * (total - idx - 1)))
-                # logger.info("Inference done {}/{}. {:.4f} s / img. ETA={}".format(idx + 1, total, seconds_per_img, str(eta)))
-                log_every_n_seconds(
-                    logging.INFO,
-                    "Inference done {}/{}. {:.4f} s / img. ETA={}".format(
-                        idx + 1, total, seconds_per_img, str(eta)
-                    ),
-                    n=5,
-                    name='detectron2'
-                )
+            # 不再每 N 秒打印 "Inference done ..."，避免 log 被刷屏；仅保留结束时汇总
 
             if cfg.DEV_RUN and idx==2:
                 break

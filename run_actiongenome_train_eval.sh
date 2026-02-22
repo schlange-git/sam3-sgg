@@ -23,9 +23,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-OUTPUT_DIR="${1:-z_outputs/sam3_baseline_2gpus_debug}"
-NUM_GPUS="${2:-2}"
-NUM_VIDEOS_TRAIN="${3:-5}"
+# Fix invalid OMP_NUM_THREADS value (if set to 0 or invalid)
+if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
+  unset OMP_NUM_THREADS
+fi
+
+OUTPUT_DIR="${1:-z_outputs/sam3_baseline_4090_freeze_backbone}"
+NUM_GPUS="${2:-1}"
+NUM_VIDEOS_TRAIN="${3:--1}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29500}"
@@ -41,9 +46,9 @@ if [[ -f "${CONFIG}" ]]; then
 fi
 
 # 数据路径（可按需修改）
-AG_ANNOTATIONS="${AG_ANNOTATIONS:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/annotations}"
-AG_FRAMES="${AG_FRAMES:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/frames}"
-AG_VIDEOS="${AG_VIDEOS:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/videos}"
+AG_ANNOTATIONS="${AG_ANNOTATIONS:-dataset/annotations}"
+AG_FRAMES="${AG_FRAMES:-dataset/frames}"
+AG_VIDEOS="${AG_VIDEOS:-dataset/videos}"
 
 # 预训练权重配置
 # SAM3权重路径（仅在MODEL.SAM3.ENABLED=True时使用）
@@ -54,6 +59,10 @@ BACKBONE_WEIGHTS="${BACKBONE_WEIGHTS:-detectron2://ImageNetPretrained/MSRA/R-101
 # DETR_HEAD_WEIGHTS: VG 上训好的 DETR 权重（包含 transformer + 检测头 + 关系头）
 # 设置为空字符串则只使用 backbone，不加载 DETR head 预训练
 DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-vg_objectdetector_pretrained.pth}"
+# 是否额外在 overfit 训练集上评测（1/0）
+EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-0}"
+# 可视化最大图片数（-1 = 全部）
+VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-1000}"
 
 echo "=============================================="
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
@@ -62,6 +71,8 @@ echo "NUM_VIDEOS_TRAIN=${NUM_VIDEOS_TRAIN} (use -1 for all videos)"
 echo "SAM3_CHECKPOINT_PATH=${SAM3_CHECKPOINT_PATH}"
 echo "BACKBONE_WEIGHTS=${BACKBONE_WEIGHTS} (ignored if SAM3.ENABLED=True)"
 echo "DETR_HEAD_WEIGHTS=${DETR_HEAD_WEIGHTS}"
+echo "EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN}"
+echo "VIS_MAX_IMAGES=${VIS_MAX_IMAGES}"
 echo "=============================================="
 
 # 构建训练命令的参数
@@ -167,13 +178,15 @@ else
   echo "Waiting 10s for memory release before evaluation ..."
   sleep 10
 
+  VAL_EVAL_DIR="${OUTPUT_DIR}/eval_AG_val"
+  mkdir -p "${VAL_EVAL_DIR}"
   echo "Running evaluation on AG_val (with memory monitor) ..."
   python train_iterative_model.py \
     --eval-only \
     --num-gpus "${NUM_GPUS}" \
     --config-file "${CONFIG}" \
     --dist-url "tcp://127.0.0.1:${PORT}" \
-    OUTPUT_DIR "${OUTPUT_DIR}" \
+    OUTPUT_DIR "${VAL_EVAL_DIR}" \
     DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
     DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
     DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
@@ -193,7 +206,43 @@ else
     echo "Evaluation failed with exit code: ${EVAL_EXIT_CODE}"
     exit "${EVAL_EXIT_CODE}"
   fi
-  echo "Evaluation done."
+  echo "Evaluation on AG_val done. Output: ${VAL_EVAL_DIR}"
+
+  # 可选：在 overfit 训练集上再评测一次，验证是否真的学到训练样本
+  if [[ "${EVAL_OVERFIT_TRAIN}" == "1" && "${NUM_VIDEOS_TRAIN}" -gt 0 ]]; then
+    TRAIN_EVAL_DIR="${OUTPUT_DIR}/eval_AG_train_overfit"
+    mkdir -p "${TRAIN_EVAL_DIR}"
+    echo "Running evaluation on AG_train overfit split (with memory monitor) ..."
+    python train_iterative_model.py \
+      --eval-only \
+      --num-gpus "${NUM_GPUS}" \
+      --config-file "${CONFIG}" \
+      --dist-url "tcp://127.0.0.1:${PORT}" \
+      OUTPUT_DIR "${TRAIN_EVAL_DIR}" \
+      DATASETS.TEST "('AG_train',)" \
+      DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
+      DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
+      DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
+      MODEL.WEIGHTS "${CHECKPOINT}" \
+      ${OPTS:-} &
+    EVAL_TRAIN_PID=$!
+
+    monitor_memory "${EVAL_TRAIN_PID}" &
+    MONITOR_PID=$!
+
+    wait "${EVAL_TRAIN_PID}"
+    EVAL_TRAIN_EXIT_CODE=$?
+    kill "${MONITOR_PID}" 2>/dev/null || true
+    wait "${MONITOR_PID}" 2>/dev/null || true
+
+    if [ "${EVAL_TRAIN_EXIT_CODE}" -ne 0 ]; then
+      echo "Overfit-train evaluation failed with exit code: ${EVAL_TRAIN_EXIT_CODE}"
+      exit "${EVAL_TRAIN_EXIT_CODE}"
+    fi
+    echo "Evaluation on AG_train overfit split done. Output: ${TRAIN_EVAL_DIR}"
+  else
+    echo "Skip AG_train overfit evaluation (EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN}, NUM_VIDEOS_TRAIN=${NUM_VIDEOS_TRAIN})"
+  fi
 fi
 
 # -----------------------------
@@ -208,7 +257,7 @@ if [[ -f "${CHECKPOINT}" && -f "${VIS_SCRIPT}" ]]; then
     --model-weights "${CHECKPOINT}" \
     --output-dir "${VIS_DIR}" \
     --dataset-name "AG_val" \
-    --num-images -1 \
+    --num-images "${VIS_MAX_IMAGES}" \
     DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
     DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
     DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \

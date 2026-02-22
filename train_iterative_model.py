@@ -79,10 +79,12 @@ def setup(args):
     assert(cfg.MODEL.ROI_SCENEGRAPH_HEAD.MODE in ['predcls', 'sgls', 'sgdet']), "Mode {} not supported".format(cfg.MODEL.ROI_SCENEGRaGraph.MODE)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    # If using SAM3 backbone, we should not load ResNet backbone weights
-    # If LOAD_HEAD_ONLY is True, clear MODEL.WEIGHTS to avoid loading full model
-    if cfg.MODEL.SAM3.ENABLED or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS):
-        # Avoid full-model loading when using SAM3 or when only DETR head weights are intended
+    # 仅在训练阶段清空 MODEL.WEIGHTS：
+    # - 训练时若启用 SAM3 / LOAD_HEAD_ONLY，避免错误地整模型加载 backbone 权重
+    # - eval_only 必须保留用户传入的 MODEL.WEIGHTS（如 model_final.pth），否则会退化为“未加载checkpoint评测”
+    if (not args.eval_only) and (
+        cfg.MODEL.SAM3.ENABLED or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS)
+    ):
         cfg.MODEL.WEIGHTS = ""
     register_datasets(cfg)
     if cfg.DATASETS.TYPE == "ACTION GENOME" and len(cfg.DATASETS.TRAIN) > 0:

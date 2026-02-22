@@ -4,9 +4,9 @@ set -euo pipefail
 # Standalone frame extraction for Action Genome.
 # This script is intentionally independent from training for easier reuse/debug.
 
-VIDEO_DIR="${VIDEO_DIR:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/Charades_v1_480}"
-FRAME_DIR="${FRAME_DIR:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/frames}"
-ANNOTATION_DIR="${ANNOTATION_DIR:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome}"
+VIDEO_DIR="${VIDEO_DIR:-dataset/Charades_v1_480}"
+FRAME_DIR="${FRAME_DIR:-dataset/frames}"
+ANNOTATION_DIR="${ANNOTATION_DIR:-dataset/annotations}"
 
 KEEP_ALL_FRAMES="${KEEP_ALL_FRAMES:-0}"  # 1 -> pass --all_frames
 
