@@ -93,7 +93,8 @@ def setup(args):
         if num_obj > 0 and num_rel > 0:
             cfg.MODEL.DETR.NUM_CLASSES = num_obj
             cfg.MODEL.DETR.NUM_RELATION_CLASSES = num_rel
-            print(f"[ActionGenome] Auto-set classes: NUM_CLASSES={num_obj}, NUM_RELATION_CLASSES={num_rel}")
+            cfg.MODEL.ROI_SCENEGRAPH_HEAD.NUM_CLASSES = num_rel  # 评估用关系类别数，与 relationship_classes.txt 一致
+            print(f"[ActionGenome] Auto-set classes: NUM_CLASSES={num_obj}, NUM_RELATION_CLASSES={num_rel} (from AG_ANNOTATIONS class files)")
     cfg.freeze()
     # register_coco_data(cfg)
     default_setup(cfg, args)
@@ -113,6 +114,9 @@ def main(args):
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         res = JointTransformerTrainer.test(cfg, model)
         # if comm.is_main_process():
         #     verify_results(cfg, res)

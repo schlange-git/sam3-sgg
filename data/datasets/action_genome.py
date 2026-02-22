@@ -115,21 +115,34 @@ class ActionGenomeTrainData:
                 rels.append(str(item))
         return rels
 
+    def _load_class_file(self, filename):
+        """Load lines from a class file under ann_dir; strip whitespace, skip empty."""
+        path = os.path.join(self.ann_dir, filename)
+        if not os.path.isfile(path):
+            return None
+        names = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    names.append(name)
+        return names
+
     def _collect_vocab(self):
-        classes = set(["person"])
-        predicates = set()
-        for frame_key, objects in self.object_anno.items():
-            if "/" not in frame_key:
-                continue
-            video, _ = frame_key.split("/", 1)
-            if video not in self.split_videos:
-                continue
-            for obj in objects:
-                cls_name = str(obj.get("class", "object"))
-                classes.add(cls_name)
-                for rel in self._extract_rel_labels(obj):
-                    predicates.add(rel)
-        return sorted(classes), sorted(predicates)
+        """
+        Use AG_ANNOTATIONS class files as the single source of truth for object and
+        predicate vocab. Indices 0..K-1 are real classes; +1 is used as no-object /
+        no-relation (background) in the model and is not listed in these files.
+        """
+        class_names = self._load_class_file("object_classes.txt")
+        predicate_names = self._load_class_file("relationship_classes.txt")
+        if class_names is None or predicate_names is None:
+            raise FileNotFoundError(
+                "Action Genome vocab must be loaded from annotations. "
+                "Ensure both object_classes.txt and relationship_classes.txt exist under "
+                f"DATASETS.ACTION_GENOME.ANNOTATIONS={self.ann_dir}"
+            )
+        return class_names, predicate_names
 
     def _get_frame_path(self, video, frame_name):
         path = os.path.join(self.frames_root, video, frame_name)

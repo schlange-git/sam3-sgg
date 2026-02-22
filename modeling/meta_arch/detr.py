@@ -1,3 +1,4 @@
+import gc
 import logging
 import math
 import os
@@ -96,8 +97,10 @@ class Detr(nn.Module):
                     else:
                         print(f"Skipping loading weight {k} from frozen model")
                 del weight
+                gc.collect()
                 self.detr.load_state_dict(new_weight)
                 del new_weight
+                gc.collect()
             self.detr = DETRsegm(self.detr, freeze_detr=(frozen_weights != ''))
             self.seg_postprocess = PostProcessSegm
         if cfg.MODEL.DETR.FROZEN_WEIGHTS != '':
@@ -149,36 +152,101 @@ class Detr(nn.Module):
 
     def load_detr_from_pretrained(self, path):
         print("Loading DETR checkpoint from pretrained: ", path)
-        pretrained_detr = torch.load(path)['model']
+        ckpt = torch.load(path, map_location="cpu")
+        pretrained_detr = ckpt.get("model", ckpt)
+        del ckpt
         pretrained_detr_without_class_head = {k: v for k, v in pretrained_detr.items() if 'class_embed' not in k}
+        del pretrained_detr
+        gc.collect()
         self.detr.load_state_dict(pretrained_detr_without_class_head, strict=False)
+        del pretrained_detr_without_class_head
+        gc.collect()
 
     def _load_detr_head_only(self, path):
+        """
+        按「除分类头以外所有权重 + 重建 AG 分类头」两步加载，与当前数据集 anno 的 class 配置一致，
+        避免与 vg_objectdetector_pretrained.pth 中 VG 类别数冲突。
+        第一步：加载除 class_embed / relation 以外且 shape 匹配的权重。
+        第二步：重建并初始化 object 分类头与 relation 分类头（AG 类别数）。
+        """
         logger = logging.getLogger("detectron2")
-        logger.info("Loading DETR head-only checkpoint: %s", path)
-        checkpoint = torch.load(path, map_location="cpu")
-        state = checkpoint.get("model", checkpoint)
-        detr_state = {}
-        current_state = self.detr.state_dict()
-        skipped = []
-        for k, v in state.items():
-            if not k.startswith("detr."):
+        logger.info("Loading DETR head (exclude class/relation heads, then re-init for AG): %s", path)
+        ckpt = torch.load(path, map_location="cpu")
+        state_dict = ckpt.get("model", ckpt)
+        del ckpt
+        model_dict = self.state_dict()
+        filtered = {}
+        for k, v in state_dict.items():
+            if "class_embed" in k:
                 continue
-            key = k[len("detr."):]
-            if key not in current_state:
-                skipped.append(f"{key} (missing in current)")
+            if "relation" in k:
                 continue
-            if current_state[key].shape != v.shape:
-                skipped.append(f"{key} (shape {tuple(v.shape)} != {tuple(current_state[key].shape)})")
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered[k] = v
+        del state_dict
+        model_dict.update(filtered)
+        self.load_state_dict(model_dict, strict=False)
+        logger.info("DETR head: loaded %d keys (excluded class_embed and relation heads)", len(filtered))
+        del model_dict
+        del filtered
+        gc.collect()
+
+        # 第二步：重建 AG 分类头（与当前数据集 class 文件一致）
+        if hasattr(self.detr, "class_embed"):
+            torch.nn.init.normal_(self.detr.class_embed.weight, std=0.01)
+            torch.nn.init.constant_(self.detr.class_embed.bias, 0)
+        if hasattr(self.detr, "relation_class_embed"):
+            torch.nn.init.normal_(self.detr.relation_class_embed.weight, std=0.01)
+            torch.nn.init.constant_(self.detr.relation_class_embed.bias, 0)
+        if hasattr(self.detr, "transformer"):
+            t = self.detr.transformer
+            if hasattr(t, "object_embed"):
+                torch.nn.init.normal_(t.object_embed.weight, std=0.01)
+                torch.nn.init.constant_(t.object_embed.bias, 0)
+            if hasattr(t, "relation_embed"):
+                torch.nn.init.normal_(t.relation_embed.weight, std=0.01)
+                torch.nn.init.constant_(t.relation_embed.bias, 0)
+        logger.info("DETR head: re-inited AG class_embed and relation_class_embed (object_embed / relation_embed)")
+
+    def load_vg_pretrained_for_ag(self, path):
+        """
+        从 VG 预训练权重加载，排除 object 分类头与 relation 头，避免与 AG 的 class 文件冲突；
+        然后按当前模型结构重建并初始化 AG 分类头与关系头。
+        - 跳过: class_embed（VG 旧名）, object_embed（当前物体头）, 所有含 relation 的键
+        - 之后对 detr.transformer.object_embed 与 detr.transformer.relation_embed 做 normal(0, 0.01) / constant(0)
+        """
+        logger = logging.getLogger("detectron2")
+        logger.info("Loading VG pretrained for AG (excluding class/relation heads): %s", path)
+        ckpt = torch.load(path, map_location="cpu")
+        state_dict = ckpt.get("model", ckpt)
+        del ckpt
+        model_dict = self.state_dict()
+        filtered = {}
+        for k, v in state_dict.items():
+            if "class_embed" in k:
                 continue
-            detr_state[key] = v
-        missing, unexpected = self.detr.load_state_dict(detr_state, strict=False)
-        if missing:
-            logger.info("DETR head-only missing keys: %s", missing)
-        if unexpected:
-            logger.info("DETR head-only unexpected keys: %s", unexpected)
-        if skipped:
-            logger.info("DETR head-only skipped keys: %s", skipped)
+            if "object_embed" in k:
+                continue
+            if "relation" in k:
+                continue
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered[k] = v
+        del state_dict
+        model_dict.update(filtered)
+        self.load_state_dict(model_dict, strict=False)
+        del model_dict
+        del filtered
+        gc.collect()
+        # 按 AG 类别数重建并初始化两个头
+        if hasattr(self.detr, "transformer"):
+            t = self.detr.transformer
+            if hasattr(t, "object_embed"):
+                torch.nn.init.normal_(t.object_embed.weight, std=0.01)
+                torch.nn.init.constant_(t.object_embed.bias, 0)
+            if hasattr(t, "relation_embed"):
+                torch.nn.init.normal_(t.relation_embed.weight, std=0.01)
+                torch.nn.init.constant_(t.relation_embed.bias, 0)
+        logger.info("VG-for-AG: loaded %d keys, re-inited object_embed and relation_embed", len(filtered))
 
     def forward(self, batched_inputs):
         """

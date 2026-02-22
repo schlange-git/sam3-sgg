@@ -1,10 +1,13 @@
+import gc
 import logging
 import math
 import os
 import sys
+import time
 from typing import Dict
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torchvision.transforms import v2
@@ -120,14 +123,47 @@ class Sam3MaskedBackbone(nn.Module):
                     "sam3 is not available on PYTHONPATH or dependencies missing. "
                     "Ensure SpeaQ/sam3 is present and required packages are installed."
                 ) from exc
-            logging.getLogger("detectron2").info("Loading SAM3 image backbone...")
-            self.sam3_model = build_sam3_image_model(
-                device=str(self.sam3_device),
-                checkpoint_path=checkpoint_path,
-                load_from_HF=False,
-                bpe_path=bpe_path,
-            ).to(self.sam3_device)
-            self.sam3_model.eval()
+            # 无 barrier 的可中断加载：
+            # - 避免分布式 barrier 卡死（Ctrl+C 难中断）
+            # - 可选按 rank 延迟错峰，降低同时加载峰值内存
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            stagger_sec = int(os.environ.get("SAM3_LOAD_STAGGER_SEC", "8"))
+            if world_size > 1 and stagger_sec > 0:
+                delay = rank * stagger_sec
+                logging.getLogger("detectron2").info(
+                    "SAM3 load stagger enabled: rank %s/%s sleeps %ss before loading.",
+                    rank, world_size, delay
+                )
+                time.sleep(delay)
+            try:
+                logging.getLogger("detectron2").info(
+                    "Loading SAM3 image backbone (rank %s/%s, on CPU first to save memory)...", rank, world_size
+                )
+                self.sam3_model = build_sam3_image_model(
+                    device="cpu",
+                    checkpoint_path=checkpoint_path,
+                    load_from_HF=(checkpoint_path is None),
+                    bpe_path=bpe_path,
+                )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.sam3_model = self.sam3_model.to(self.sam3_device)
+                self.sam3_model.eval()
+            except Exception as e:
+                logging.getLogger("detectron2").error(
+                    "SAM3 load failed on rank %s/%s: %s. Shutting down.", rank, world_size, e
+                )
+                raise RuntimeError(f"SAM3 image backbone load failed on rank {rank}/{world_size}: {e}") from e
+
+            if self.sam3_model is None:
+                raise RuntimeError(
+                    f"SAM3 image backbone was not loaded on rank {rank}/{world_size}. Aborting."
+                )
+            logging.getLogger("detectron2").info(
+                "SAM3 image backbone loaded on rank %s/%s.", rank, world_size
+            )
 
             if self.freeze:
                 for p in self.sam3_model.parameters():
@@ -367,6 +403,7 @@ class Sam3MaskedBackbone(nn.Module):
             if feature_stride is None:
                 feature_stride = int(payload.get("feature_stride", self.feature_stride))
             feats.append(feat)
+            del payload
         proj_feat = torch.cat(feats, dim=0)
         if proj_feat.shape[1] != self.feature_dim:
             raise ValueError(

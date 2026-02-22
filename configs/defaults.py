@@ -130,6 +130,8 @@ def add_dataset_config(cfg):
   _C.MODEL.DETR.TEST_INDEX = -1
   _C.MODEL.DETR.LOAD_HEAD_ONLY = False
   _C.MODEL.DETR.HEAD_WEIGHTS = ""
+  # 当使用 ACTION GENOME 且从 VG 预训练加载时：只加载除分类头/关系头外的权重，然后按 AG 类别数重建并初始化两个头
+  _C.MODEL.DETR.VG_PRETRAINED_FOR_AG = False
 
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10

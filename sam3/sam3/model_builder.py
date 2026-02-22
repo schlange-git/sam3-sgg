@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
+import gc
 import os
 from typing import Optional
 
@@ -545,6 +546,9 @@ def _load_checkpoint(model, checkpoint_path):
             f"loaded {checkpoint_path} and found "
             f"missing and/or unexpected keys:\n{missing_keys=}"
         )
+    del sam3_image_ckpt
+    del ckpt
+    gc.collect()
 
 
 def _setup_device_and_mode(model, device, eval_mode):

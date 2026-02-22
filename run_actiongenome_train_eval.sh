@@ -23,12 +23,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-OUTPUT_DIR="${1:-z_outputs/res101_baseline_2gpus}"
+OUTPUT_DIR="${1:-z_outputs/sam3_baseline_2gpus_debug}"
 NUM_GPUS="${2:-2}"
-NUM_VIDEOS_TRAIN="${3:--1}"
+NUM_VIDEOS_TRAIN="${3:-5}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29500}"
+
+# SAM3 多卡提示：不再强制改单卡，由用户自行决定 NUM_GPUS。
+# 若担心加载峰值内存，可设置环境变量 SAM3_LOAD_STAGGER_SEC（见 sam3_backbone.py）。
+if [[ -f "${CONFIG}" ]]; then
+  if grep -q "SAM3:" "${CONFIG}" 2>/dev/null && grep -A5 "SAM3:" "${CONFIG}" 2>/dev/null | grep -qi "ENABLED: *True"; then
+    if [[ "${NUM_GPUS}" -gt 1 ]]; then
+      echo "[SAM3] 检测到 SAM3.ENABLED=True，当前保留 NUM_GPUS=${NUM_GPUS}（不再强制降到1）。"
+    fi
+  fi
+fi
 
 # 数据路径（可按需修改）
 AG_ANNOTATIONS="${AG_ANNOTATIONS:-/home/shi/桌面/abschluss/sgg/dataset/actiongenome/annotations}"
@@ -77,11 +87,11 @@ else
 fi
 
 # -----------------------------
-# 内存监控函数：当内存占用超过90%时自动kill训练进程
+# 内存监控函数：当内存占用超过93%时自动kill训练进程
 # -----------------------------
 monitor_memory() {
     local pid=$1
-    local threshold=90  # 内存使用率阈值（%）
+    local threshold=93  # 内存使用率阈值（%）
     local check_interval=5  # 检查间隔（秒）
     
     echo "[内存监控] 开始监控进程 ${pid}，阈值: ${threshold}%"

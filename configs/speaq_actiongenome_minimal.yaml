@@ -13,21 +13,21 @@ MODEL:
     TRANSFORMER: "IterativeRelationTransformer"
     CRITERION: "IterativeRelationCriterion"
     MATCHER: "SpeaQHungarianMatcher"
-    NUM_OBJECT_QUERIES: 300
-    NUM_RELATION_QUERIES: 300
-    # Minimal starter values; override after first annotation statistics check.
-    NUM_CLASSES: 50
-    NUM_RELATION_CLASSES: 30
+    NUM_OBJECT_QUERIES: 100
+    NUM_RELATION_QUERIES: 100
+    # 与 ANNOTATIONS 下 object_classes.txt / relationship_classes.txt 行数一致（当前为 36/26）。训练时会自动覆盖；+1 no-object/no-relation 在模型内部处理。
+    NUM_CLASSES: 36
+    NUM_RELATION_CLASSES: 26
     OBJECT_DEC_LAYERS: 6
     REWEIGHT_RELATIONS: True
     REWEIGHT_REL_EOS_COEF: 0.1
     NO_OBJECT_WEIGHT: 0.1
     NO_REL_WEIGHT: 0.1
   SAM3:
-    ENABLED: False
+    ENABLED: True
     USE_PRECOMPUTED: False
-    # SAM3权重路径（如果为空或文件不存在，会尝试从HuggingFace下载）
-    CHECKPOINT_PATH: "sam3.pt"
+    # SAM3 权重：放 sam3/weights/sam3.pt，或设为本项（相对项目根/绝对路径）。缺失时会尝试 HuggingFace 下载。
+    CHECKPOINT_PATH: "sam3/weights/sam3.pt"
     # SAM3输入图像尺寸
     IMAGE_SIZE: 1008
     # SAM3输出特征维度（需要与DETR的HIDDEN_DIM匹配）
@@ -40,6 +40,9 @@ MODEL:
     DEVICE: "cuda"
     # 如果使用预计算的特征图，设置特征图目录
     FEATUREMAP_DIR: "data/featuremaps"
+  # 评估时关系类别数需与 relationship_classes.txt 一致（不含 +1 background）
+  ROI_SCENEGRAPH_HEAD:
+    NUM_CLASSES: 26
 
 DATASETS:
   TYPE: "ACTION GENOME"
@@ -58,12 +61,12 @@ DATASETS:
     VAL_SET_RANDOMIZED: False
 
 SOLVER:
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 6
   BASE_LR: 0.0001
-  STEPS: (80000,120000)
-  MAX_ITER: 150000
+  STEPS: (6000,)
+  MAX_ITER: 8000
   WARMUP_FACTOR: 0.001
-  WARMUP_ITERS: 2000
+  WARMUP_ITERS: 500
   WEIGHT_DECAY: 0.0001
   OPTIMIZER: "ADAMW"
   BACKBONE_MULTIPLIER: 0.1
@@ -85,7 +88,7 @@ INPUT:
   FORMAT: "RGB"
 
 TEST:
-  EVAL_PERIOD: 15000
+  EVAL_PERIOD: 2000
 
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False

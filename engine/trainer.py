@@ -391,6 +391,14 @@ class JointTransformerTrainer(DefaultTrainer):
     def build_test_loader(cls, cfg, dataset_name):
         return build_detection_test_loader(cfg, dataset_name, mapper=DetrDatasetMapper(cfg, False))
 
+    def resume_or_load(self, resume=True):
+        """当启用 VG_PRETRAINED_FOR_AG 时，用「除分类头/关系头外」的 VG 权重加载并重建 AG 头，替代默认的 resume_or_load 初始权重加载。"""
+        if not resume and getattr(self.cfg.MODEL.DETR, "VG_PRETRAINED_FOR_AG", False) and self.cfg.MODEL.WEIGHTS:
+            if hasattr(self.model, "load_vg_pretrained_for_ag"):
+                self.model.load_vg_pretrained_for_ag(self.cfg.MODEL.WEIGHTS)
+                return
+        super().resume_or_load(resume=resume)
+
     def build_writers(self):
         output_dir = self.cfg.OUTPUT_DIR
         max_iter = self.max_iter
