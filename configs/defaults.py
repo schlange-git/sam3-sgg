@@ -160,6 +160,8 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.TARGET_STRIDE = 32
   _C.MODEL.SAM3.USE_FPN = False  # Enable FPN-style multi-scale features
   _C.MODEL.SAM3.FPN_STRIDES = [4, 8, 16, 32]  # Feature pyramid strides
+  _C.MODEL.SAM3.USE_BACKBONE_FPN = True  # Prefer native SAM3 backbone_fpn levels
+  _C.MODEL.SAM3.MULTISCALE_MERGE = "last"  # last | sum | concat
 
   # MODEL Variants 
   _C.MODEL.DF_DETR.WITH_BOX_REFINE = False

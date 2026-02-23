@@ -4,7 +4,7 @@ import math
 import os
 import sys
 import time
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -38,6 +38,17 @@ class Sam3MaskedBackbone(nn.Module):
         self.target_stride = getattr(cfg.MODEL.SAM3, "TARGET_STRIDE", 0)
         self.use_fpn = getattr(cfg.MODEL.SAM3, "USE_FPN", False)
         self.fpn_strides = getattr(cfg.MODEL.SAM3, "FPN_STRIDES", [4, 8, 16, 32])
+        # Prefer native SAM3 multi-scale outputs when available.
+        self.use_backbone_fpn = getattr(cfg.MODEL.SAM3, "USE_BACKBONE_FPN", True)
+        # Multi-scale merge strategy: "last" | "sum" | "concat"
+        self.multiscale_merge = str(
+            getattr(cfg.MODEL.SAM3, "MULTISCALE_MERGE", "last")
+        ).lower()
+        if self.multiscale_merge not in ("last", "sum", "concat"):
+            raise ValueError(
+                f"Unsupported MODEL.SAM3.MULTISCALE_MERGE={self.multiscale_merge}, "
+                "expected one of: last, sum, concat"
+            )
 
         # If using precomputed features, verify directory exists
         if self.use_precomputed:
@@ -150,7 +161,10 @@ class Sam3MaskedBackbone(nn.Module):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 self.sam3_model = self.sam3_model.to(self.sam3_device)
-                self.sam3_model.eval()
+                if self.freeze:
+                    self.sam3_model.eval()
+                else:
+                    self.sam3_model.train()
             except Exception as e:
                 logging.getLogger("detectron2").error(
                     "SAM3 load failed on rank %s/%s: %s. Shutting down.", rank, world_size, e
@@ -181,6 +195,10 @@ class Sam3MaskedBackbone(nn.Module):
 
         # 1x1 projection to feature_dim (lazy init)
         self._proj_layer = None
+        # Per-level projection layers for native SAM3 multi-scale features
+        self._level_proj_layers = nn.ModuleDict()
+        # Optional fusion layer for concat multi-scale merge
+        self._merge_proj_layer: Optional[nn.Module] = None
         
         # FPN layers for multi-scale features (if enabled)
         # Note: FPN layer creation is deferred until forward() when actual feature_stride is known
@@ -249,9 +267,56 @@ class Sam3MaskedBackbone(nn.Module):
                 for ch in range(copy_channels):
                     self._proj_layer.weight[ch, ch, 0, 0] = 1.0
         self._proj_layer.to(self.device)
-        self._proj_layer.eval()
+        if self.freeze:
+            self._proj_layer.eval()
+        else:
+            self._proj_layer.train()
         for p in self._proj_layer.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(not self.freeze)
+
+    def _build_level_proj(self, level_key: str, in_channels: int) -> nn.Module:
+        if level_key in self._level_proj_layers:
+            return self._level_proj_layers[level_key]
+        if in_channels == self.feature_dim:
+            layer = nn.Identity()
+        else:
+            layer = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, bias=False)
+            with torch.no_grad():
+                layer.weight.zero_()
+                copy_channels = min(in_channels, self.feature_dim)
+                for ch in range(copy_channels):
+                    layer.weight[ch, ch, 0, 0] = 1.0
+        layer.to(self.device)
+        if self.freeze:
+            layer.eval()
+        else:
+            layer.train()
+        for p in layer.parameters():
+            p.requires_grad_(not self.freeze)
+        self._level_proj_layers[level_key] = layer
+        return self._level_proj_layers[level_key]
+
+    def _build_merge_proj(self, in_channels: int) -> nn.Module:
+        if self._merge_proj_layer is not None:
+            return self._merge_proj_layer
+        if in_channels == self.feature_dim:
+            layer = nn.Identity()
+        else:
+            layer = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, bias=False)
+            with torch.no_grad():
+                layer.weight.zero_()
+                copy_channels = min(in_channels, self.feature_dim)
+                for ch in range(copy_channels):
+                    layer.weight[ch, ch, 0, 0] = 1.0
+        layer.to(self.device)
+        if self.freeze:
+            layer.eval()
+        else:
+            layer.train()
+        for p in layer.parameters():
+            p.requires_grad_(not self.freeze)
+        self._merge_proj_layer = layer
+        return self._merge_proj_layer
 
     def _normalize_batch(self, images: torch.Tensor) -> torch.Tensor:
         # images: [B, 3, H, W] (uint8 or float)
@@ -274,7 +339,9 @@ class Sam3MaskedBackbone(nn.Module):
             candidate = backbone_out["vision_features"]
         if candidate is None:
             raise RuntimeError("SAM3 backbone returned no usable features")
+        return self._to_4d_feature(candidate)
 
+    def _to_4d_feature(self, candidate: torch.Tensor) -> torch.Tensor:
         # ensure [B, C, H, W]
         if candidate.dim() == 3:
             # assume [B, C, HW] with square spatial size
@@ -288,6 +355,77 @@ class Sam3MaskedBackbone(nn.Module):
         else:
             raise ValueError(f"Unexpected SAM3 feature shape: {candidate.shape}")
         return candidate
+
+    def _extract_native_multiscale(
+        self, backbone_out: Dict[str, torch.Tensor], image_h: int
+    ) -> Optional[List[Tuple[int, torch.Tensor]]]:
+        fpn_feats = backbone_out.get("backbone_fpn", None)
+        if not (isinstance(fpn_feats, (list, tuple)) and len(fpn_feats) > 0):
+            return None
+        features: List[torch.Tensor] = []
+        strides: List[int] = []
+        for idx, feat in enumerate(fpn_feats):
+            feat = self._to_4d_feature(feat)
+            if self.channel_repeat > 1:
+                feat = feat.repeat(1, self.channel_repeat, 1, 1)
+            if feat.device != self.device:
+                feat = feat.to(self.device)
+            layer = self._build_level_proj(f"native_{idx}", int(feat.shape[1]))
+            proj_feat = feat if isinstance(layer, nn.Identity) else layer(feat)
+            stride = max(1, int(round(float(image_h) / float(proj_feat.shape[2]))))
+            features.append(proj_feat)
+            strides.append(stride)
+        if len(features) <= 1:
+            return None
+        return sorted(zip(strides, features), key=lambda x: x[0])
+
+    def _build_nested_from_multiscale(
+        self, ordered_feats: List[Tuple[int, torch.Tensor]], images: ImageList
+    ) -> Dict[str, NestedTensor]:
+        feature_shapes = [feat.shape for _, feat in ordered_feats]
+        self.feature_strides = [stride for stride, _ in ordered_feats]
+        masks = self._mask_out_padding(feature_shapes, images.image_sizes, self.device)
+
+        if self.multiscale_merge == "last":
+            nested_features: Dict[str, NestedTensor] = {}
+            for idx, (stride, feat) in enumerate(ordered_feats):
+                nested_features[f"fpn_{stride}"] = NestedTensor(feat, masks[idx])
+            return nested_features
+
+        target_h = ordered_feats[-1][1].shape[-2]
+        target_w = ordered_feats[-1][1].shape[-1]
+        resized_feats = []
+        resized_masks = []
+        for idx, (_, feat) in enumerate(ordered_feats):
+            if feat.shape[-2:] != (target_h, target_w):
+                feat = F.interpolate(
+                    feat, size=(target_h, target_w), mode="bilinear", align_corners=False
+                )
+                m = F.interpolate(
+                    masks[idx][None].float(),
+                    size=(target_h, target_w),
+                    mode="nearest",
+                )[0].to(torch.bool)
+            else:
+                m = masks[idx]
+            resized_feats.append(feat)
+            resized_masks.append(m)
+
+        if self.multiscale_merge == "sum":
+            merged = resized_feats[0]
+            for feat in resized_feats[1:]:
+                merged = merged + feat
+        else:  # concat
+            concat_feat = torch.cat(resized_feats, dim=1)
+            merge_proj = self._build_merge_proj(int(concat_feat.shape[1]))
+            merged = concat_feat if isinstance(merge_proj, nn.Identity) else merge_proj(concat_feat)
+
+        merged_mask = resized_masks[0]
+        for m in resized_masks[1:]:
+            merged_mask = merged_mask | m
+        merged_stride = ordered_feats[-1][0]
+        self.feature_strides = [merged_stride]
+        return {f"fpn_merged_{self.multiscale_merge}": NestedTensor(merged, merged_mask)}
 
     def forward(self, images: ImageList) -> Dict[str, NestedTensor]:
         if self.use_precomputed:
@@ -314,8 +452,13 @@ class Sam3MaskedBackbone(nn.Module):
         if image_batch.device != model_device:
             image_batch = image_batch.to(model_device)
 
-        with torch.no_grad():
+        with torch.set_grad_enabled(not self.freeze):
             backbone_out = self.sam3_model.backbone.forward_image(image_batch)
+
+        if self.use_fpn and self.use_backbone_fpn:
+            ordered_native = self._extract_native_multiscale(backbone_out, image_batch.shape[2])
+            if ordered_native is not None:
+                return self._build_nested_from_multiscale(ordered_native, images)
 
         feat = self._select_feature(backbone_out)
         if self.channel_repeat > 1:
@@ -351,28 +494,16 @@ class Sam3MaskedBackbone(nn.Module):
                 self._initialize_fpn_layers()
             
             # Generate multi-scale features using FPN
-            nested_features = {}
-            feature_shapes = []
             fpn_feats = []
             for stride in self.fpn_strides:
                 if stride == self.feature_stride:
                     fpn_feat = proj_feat
                 else:
                     fpn_feat = self.fpn_layers[f'fpn_{stride}'](proj_feat)
-                feature_shapes.append(fpn_feat.shape)
                 fpn_feats.append(fpn_feat)
             
-            # Set feature_strides for mask generation (must match order of feature_shapes)
-            self.feature_strides = self.fpn_strides.copy()
-            
-            # Generate masks for all feature levels at once
-            masks = self._mask_out_padding(feature_shapes, images.image_sizes, proj_feat.device)
-            
-            # Create NestedTensor for each FPN level
-            for idx, stride in enumerate(self.fpn_strides):
-                nested_features[f'fpn_{stride}'] = NestedTensor(fpn_feats[idx], masks[idx])
-            
-            return nested_features
+            ordered = list(zip(self.fpn_strides, fpn_feats))
+            return self._build_nested_from_multiscale(ordered, images)
         else:
             # Single-scale output (original behavior)
             self.feature_strides = [self.feature_stride]
@@ -423,28 +554,16 @@ class Sam3MaskedBackbone(nn.Module):
                 self._initialize_fpn_layers()
             
             # Generate multi-scale features using FPN
-            nested_features = {}
-            feature_shapes = []
             fpn_feats = []
             for stride in self.fpn_strides:
                 if stride == self.feature_stride:
                     fpn_feat = proj_feat
                 else:
                     fpn_feat = self.fpn_layers[f'fpn_{stride}'](proj_feat)
-                feature_shapes.append(fpn_feat.shape)
                 fpn_feats.append(fpn_feat)
             
-            # Set feature_strides for mask generation (must match order of feature_shapes)
-            self.feature_strides = self.fpn_strides.copy()
-            
-            # Generate masks for all feature levels at once
-            masks = self._mask_out_padding(feature_shapes, images.image_sizes, proj_feat.device)
-            
-            # Create NestedTensor for each FPN level
-            for idx, stride in enumerate(self.fpn_strides):
-                nested_features[f'fpn_{stride}'] = NestedTensor(fpn_feats[idx], masks[idx])
-            
-            return nested_features
+            ordered = list(zip(self.fpn_strides, fpn_feats))
+            return self._build_nested_from_multiscale(ordered, images)
         else:
             # Single-scale output (original behavior)
             self.feature_strides = [self.feature_stride]

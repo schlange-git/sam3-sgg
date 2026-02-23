@@ -34,12 +34,22 @@ MODEL:
     FEATURE_DIM: 256
     # 通道重复倍数（1表示不重复）
     CHANNEL_REPEAT: 1
-    # 是否冻结SAM3参数（True时不参与反向传播，节省显存）
-    FREEZE: True
+    # 是否冻结SAM3参数（False时参与反向传播做微调）
+    FREEZE: False
     # SAM3运行的设备（通常与MODEL.DEVICE相同）
     DEVICE: "cuda"
     # 如果使用预计算的特征图，设置特征图目录
     FEATUREMAP_DIR: "data/featuremaps"
+    # 控制特征图粗细：16 比 32 更细粒度
+    TARGET_STRIDE: 16
+    # 打开多尺度特征
+    USE_FPN: True
+    # FPN 目标步长（从细到粗）
+    FPN_STRIDES: [8, 16, 32]
+    # 优先使用 SAM3 原生 backbone_fpn 多尺度输出
+    USE_BACKBONE_FPN: True
+    # 多尺度融合策略：last(不融合) / sum(相加融合) / concat(拼接融合)
+    MULTISCALE_MERGE: "sum"
   # 评估时关系类别数需与 relationship_classes.txt 一致（不含 +1 background）
   ROI_SCENEGRAPH_HEAD:
     NUM_CLASSES: 26
@@ -69,7 +79,7 @@ SOLVER:
   WARMUP_ITERS: 1000
   WEIGHT_DECAY: 0.0001
   OPTIMIZER: "ADAMW"
-  BACKBONE_MULTIPLIER: 0.1
+  BACKBONE_MULTIPLIER: 0.05
   CHECKPOINT_PERIOD: 1000
   CLIP_GRADIENTS:
     ENABLED: True
