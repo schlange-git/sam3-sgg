@@ -110,6 +110,59 @@ class WandbWriter(EventWriter):
         if hasattr(self, "_writer"):
             self._writer.finish()
 
+class EpochProgressWriter(EventWriter):
+    """
+    额外打印 epoch / iter 进度以及「总训练时间」估计的日志 Writer。
+    不替换 detectron2 自带的 CommonMetricPrinter，而是额外打一行类似：
+      epoch: 1/10  iter: 1235/50000  total_eta: 5:12:34
+    """
+
+    def __init__(self, cfg, max_iter: int, window_size: int = 20):
+        """
+        Args:
+            cfg: detectron2 配置，用于读取自定义的 SOLVER.MAX_EPOCH（可选）
+            max_iter: 训练的最大迭代次数
+            window_size: 用于平滑 time/iter 的窗口大小
+        """
+        self._cfg = cfg
+        self._max_iter = int(max_iter)
+        self._window_size = int(window_size)
+        # 允许在 config 里显式指定最大 epoch 数；否则退化为 “只有 1 个 epoch”
+        self._max_epoch = int(getattr(getattr(cfg, "SOLVER", cfg), "MAX_EPOCH", 1))
+        if self._max_epoch <= 0:
+            self._max_epoch = 1
+        self._logger = logging.getLogger("d2.utils.events")
+
+    def write(self):
+        storage = get_event_storage()
+        cur_iter = int(storage.iter)
+
+        # 基于最近若干次迭代的平均耗时，估计总训练时间（total_eta）
+        iter_time = None
+        try:
+            # detectron2 的 EventStorage 会在 "time" 里记录每次迭代耗时
+            iter_time = storage.history("time").median(self._window_size)
+        except KeyError:
+            pass
+
+        total_eta_str = "N/A"
+        if iter_time is not None and iter_time > 0:
+            total_seconds = float(iter_time) * float(max(self._max_iter, 1))
+            total_eta_str = str(datetime.timedelta(seconds=int(total_seconds)))
+
+        # 通过 max_iter 和 max_epoch 之间的均分关系来近似 epoch 进度
+        iters_per_epoch = max(self._max_iter // self._max_epoch, 1)
+        cur_epoch = min(self._max_epoch, cur_iter // iters_per_epoch + 1)
+
+        self._logger.info(
+            f"epoch: {cur_epoch}/{self._max_epoch}  "
+            f"iter: {cur_iter}/{self._max_iter}  "
+            f"total_eta: {total_eta_str}"
+        )
+
+    def close(self):
+        # 按接口需要实现，但这里没有资源需要手动释放
+        pass
 
 class MemoryMonitorHook(HookBase):
     """内存监控 Hook：当系统内存占用超过阈值时自动终止训练"""
@@ -328,21 +381,23 @@ class SameVideoBatchSampler(Sampler):
         g = torch.Generator()
         g.manual_seed(self.base_seed + self.rank)
         while True:
+            # Shuffle only at video granularity; keep frame order inside each video.
             order = torch.randperm(len(self.videos), generator=g).tolist()
             for vid_idx in order:
                 vid = self.videos[vid_idx]
                 indices = list(self.video_to_indices[vid])
                 if len(indices) == 0:
                     continue
-                perm = torch.randperm(len(indices), generator=g).tolist()
-                shuffled = [indices[i] for i in perm]
+                # Keep temporal order for frames within this video.
+                # `indices` follows dataset order, which is expected to be frame order.
+                ordered = indices
                 start = 0
-                while start < len(shuffled):
-                    chunk = shuffled[start : start + self.batch_size]
+                while start < len(ordered):
+                    chunk = ordered[start : start + self.batch_size]
                     start += self.batch_size
                     if len(chunk) < self.batch_size:
-                        pad_idx = torch.randint(0, len(indices), (self.batch_size - len(chunk),), generator=g).tolist()
-                        chunk.extend([indices[p] for p in pad_idx])
+                        # Pad using the last frame index to avoid introducing temporal jumps.
+                        chunk.extend([ordered[-1]] * (self.batch_size - len(chunk)))
                     for x in chunk:
                         yield x
 
@@ -408,6 +463,8 @@ class JointTransformerTrainer(DefaultTrainer):
             return [
                 # It may not always print what you want to see, since it prints "common" metrics only.
                 CommonMetricPrinter(max_iter),
+                # 额外打印 epoch / iter / total_eta 信息
+                EpochProgressWriter(self.cfg, max_iter),
                 JSONWriter(os.path.join(output_dir, "metrics.json")),
                 TensorboardXWriter(output_dir),
                 WandbWriter(self.cfg, self.model)
@@ -416,6 +473,8 @@ class JointTransformerTrainer(DefaultTrainer):
             return [
                 # It may not always print what you want to see, since it prints "common" metrics only.
                 CommonMetricPrinter(max_iter),
+                # 额外打印 epoch / iter / total_eta 信息
+                EpochProgressWriter(self.cfg, max_iter),
                 JSONWriter(os.path.join(output_dir, "metrics.json")),
                 TensorboardXWriter(output_dir),
             ]

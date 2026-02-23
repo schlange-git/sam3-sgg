@@ -163,6 +163,12 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.USE_BACKBONE_FPN = True  # Prefer native SAM3 backbone_fpn levels
   _C.MODEL.SAM3.MULTISCALE_MERGE = "last"  # last | sum | concat
 
+  # Temporal aggregation (two-state memory) before DETR transformer
+  _C.MODEL.TEMPORAL = CN()
+  _C.MODEL.TEMPORAL.ENABLED = False
+  _C.MODEL.TEMPORAL.EVAL_ENABLED = False
+  _C.MODEL.TEMPORAL.ALPHA_INIT = 0.7
+
   # MODEL Variants 
   _C.MODEL.DF_DETR.WITH_BOX_REFINE = False
   _C.MODEL.DF_DETR.TWO_STAGE = False

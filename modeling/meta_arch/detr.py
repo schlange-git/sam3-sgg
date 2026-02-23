@@ -364,6 +364,7 @@ class Detr(nn.Module):
             images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
         images = ImageList.from_tensors(images)
         images.image_ids = [x.get("image_id") for x in batched_inputs]
+        images.video_ids = [x.get("video_id", x.get("image_id")) for x in batched_inputs]
         return images
 
 @META_ARCH_REGISTRY.register()

@@ -28,7 +28,7 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_baseline_4090_freeze_backbone}"
+OUTPUT_DIR="${1:-z_outputs/sam3_baseline_4090_train_backbone_debug}"
 NUM_GPUS="${2:-1}"
 NUM_VIDEOS_TRAIN="${3:--1}"
 

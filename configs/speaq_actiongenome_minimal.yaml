@@ -41,15 +41,22 @@ MODEL:
     # 如果使用预计算的特征图，设置特征图目录
     FEATUREMAP_DIR: "data/featuremaps"
     # 控制特征图粗细：16 比 32 更细粒度
-    TARGET_STRIDE: 16
+    TARGET_STRIDE: 32
     # 打开多尺度特征
     USE_FPN: True
     # FPN 目标步长（从细到粗）
     FPN_STRIDES: [8, 16, 32]
     # 优先使用 SAM3 原生 backbone_fpn 多尺度输出
-    USE_BACKBONE_FPN: True
+    USE_BACKBONE_FPN: False
     # 多尺度融合策略：last(不融合) / sum(相加融合) / concat(拼接融合)
     MULTISCALE_MERGE: "sum"
+  TEMPORAL:
+    # 两帧记忆式时序建模：在 transformer 前聚合 H_{t-1} 与 F_t
+    ENABLED: True
+    # 评估阶段是否也启用时序聚合
+    EVAL_ENABLED: True
+    # 可学习时间门控 alpha 的初始化值（实际使用 sigmoid(alpha)）
+    ALPHA_INIT: 0.7
   # 评估时关系类别数需与 relationship_classes.txt 一致（不含 +1 background）
   ROI_SCENEGRAPH_HEAD:
     NUM_CLASSES: 26
@@ -71,7 +78,7 @@ DATASETS:
     VAL_SET_RANDOMIZED: False
 
 SOLVER:
-  IMS_PER_BATCH: 6
+  IMS_PER_BATCH: 1
   BASE_LR: 0.0001
   STEPS: (35000, 45000)
   MAX_ITER: 50000

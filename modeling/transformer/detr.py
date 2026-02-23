@@ -18,6 +18,51 @@ import math
 DETR_REGISTRY = Registry("DETR_REGISTRY")
 
 
+class TemporalAggregator(nn.Module):
+    """
+    Two-state temporal memory:
+      - current frame feature F_t
+      - historical aggregated feature H_{t-1}
+    Update:
+      H_t = sigma(alpha) * H_{t-1} + (1 - sigma(alpha)) * g(F_t)
+    """
+
+    def __init__(self, hidden_dim: int = 256, alpha_init: float = 0.7):
+        super().__init__()
+        self.update = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.memory = {}
+
+    def reset(self):
+        self.memory.clear()
+
+    def forward(self, x: torch.Tensor, video_ids):
+        # x: [B, C, H, W]
+        if video_ids is None or len(video_ids) == 0:
+            return x
+        uniq = {str(v) for v in video_ids if v is not None}
+        if len(uniq) != 1:
+            # Not a single-video batch, skip temporal aggregation for safety.
+            return x
+        vid = next(iter(uniq))
+
+        x_proj = self.update(x)
+        x_state = x_proj.mean(dim=0, keepdim=True)
+
+        h_prev = self.memory.get(vid, None)
+        if h_prev is None or h_prev.shape != x_state.shape or h_prev.device != x_state.device:
+            self.memory[vid] = x_state.detach()
+            return x
+
+        gate = torch.sigmoid(self.alpha)
+        h_new = gate * h_prev + (1.0 - gate) * x_state
+        self.memory[vid] = h_new.detach()
+
+        h_expand = h_new.expand(x_proj.shape[0], -1, -1, -1)
+        # Return temporally enhanced feature with unchanged shape.
+        return gate * h_expand + (1.0 - gate) * x_proj
+
+
 @DETR_REGISTRY.register()
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
@@ -92,6 +137,14 @@ class IterativeRelationDETR(DETR):
 
         self.only_predicate_multiply = cfg.MODEL.DETR.ONLY_PREDICATE_MULTIPLY
         self.multiply_query = cfg.MODEL.DETR.MULTIPLY_QUERY
+        self.temporal_enabled = bool(getattr(cfg.MODEL.TEMPORAL, "ENABLED", False))
+        self.temporal_eval = bool(getattr(cfg.MODEL.TEMPORAL, "EVAL_ENABLED", False))
+        self.temporal_agg = None
+        if self.temporal_enabled:
+            alpha_init = float(getattr(cfg.MODEL.TEMPORAL, "ALPHA_INIT", 0.7))
+            self.temporal_agg = TemporalAggregator(
+                hidden_dim=transformer.d_model, alpha_init=alpha_init
+            )
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -114,6 +167,9 @@ class IterativeRelationDETR(DETR):
         
         src, mask = features[-1].decompose()
         assert mask is not None
+        if self.temporal_agg is not None and (self.training or self.temporal_eval):
+            video_ids = getattr(samples, "video_ids", None)
+            src = self.temporal_agg(src, video_ids)
         output = self.transformer(self.input_proj(src), mask, self.query_embed.weight, self.object_query_embed.weight, self.relation_query_embed.weight, pos[-1])
 
         if self.only_predicate_multiply:
