@@ -4,6 +4,7 @@ import gc
 import numpy as np
 import torch
 import warnings
+import math
 sys.path.insert(0, '../../')
 sys.path.insert(0, '../')
 
@@ -15,6 +16,7 @@ from detectron2.utils.logger import setup_logger
 from detectron2.engine import default_argument_parser, default_setup, launch
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.data import get_detection_dataset_dicts
 
 from SpeaQ.engine import JointTransformerTrainer
 from SpeaQ.data import VisualGenomeTrainData, register_datasets, DatasetCatalog, MetadataCatalog
@@ -97,6 +99,31 @@ def setup(args):
             cfg.MODEL.DETR.NUM_RELATION_CLASSES = num_rel
             cfg.MODEL.ROI_SCENEGRAPH_HEAD.NUM_CLASSES = num_rel  # 评估用关系类别数，与 relationship_classes.txt 一致
             print(f"[ActionGenome] Auto-set classes: NUM_CLASSES={num_obj}, NUM_RELATION_CLASSES={num_rel} (from AG_ANNOTATIONS class files)")
+
+        # 若显式设置了 MAX_EPOCH，则基于“每个 epoch = 全部帧”推导 MAX_ITER
+        if getattr(cfg.SOLVER, "MAX_EPOCH", 0) > 0:
+            train_sets = cfg.DATASETS.TRAIN
+            dataset_dicts = get_detection_dataset_dicts(
+                train_sets,
+                filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
+                min_keypoints=cfg.MODEL.ROI_KEYPOINT_HEAD.MIN_KEYPOINTS_PER_IMAGE
+                if getattr(cfg.MODEL, "KEYPOINT_ON", False)
+                else 0,
+                proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN
+                if getattr(cfg.DATASETS, "PROPOSAL_FILES_TRAIN", None)
+                else None,
+            )
+            num_samples = max(1, len(dataset_dicts))
+            ims_per_batch = max(1, int(cfg.SOLVER.IMS_PER_BATCH))
+            iters_per_epoch = math.ceil(num_samples / float(ims_per_batch))
+            max_epoch = int(cfg.SOLVER.MAX_EPOCH)
+            new_max_iter = iters_per_epoch * max_epoch
+            print(
+                f"[EpochMode] ACTION GENOME: num_samples={num_samples}, "
+                f"ims_per_batch={ims_per_batch}, iters_per_epoch={iters_per_epoch}, "
+                f"MAX_EPOCH={max_epoch} -> MAX_ITER={new_max_iter}"
+            )
+            cfg.SOLVER.MAX_ITER = new_max_iter
     cfg.freeze()
     # register_coco_data(cfg)
     default_setup(cfg, args)

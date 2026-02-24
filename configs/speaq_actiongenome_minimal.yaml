@@ -79,6 +79,8 @@ DATASETS:
 
 SOLVER:
   IMS_PER_BATCH: 1
+  # 以 epoch 为主导：每个 epoch 遍历全部帧，训练总长度由 MAX_EPOCH 决定
+  MAX_EPOCH: 10
   BASE_LR: 0.0001
   STEPS: (35000, 45000)
   MAX_ITER: 50000

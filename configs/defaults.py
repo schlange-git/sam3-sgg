@@ -142,6 +142,8 @@ def add_dataset_config(cfg):
   _C.SOLVER.BACKBONE_MULTIPLIER = 0.1
   _C.SOLVER.RELATION_MULTIPLIER = 1.0
   _C.SOLVER.ENTITY_MULTIPLIER = 1.0
+  # 以 epoch 为主导的训练长度控制；若 >0，则用它和数据集长度推导 MAX_ITER
+  _C.SOLVER.MAX_EPOCH = 1
   _C.SOLVER.MAX_TO_KEEP = 2
   _C.MODEL.DF_DETR = CN()
   _C.MODEL.DF_DETR.NUM_CLASSES = 80
