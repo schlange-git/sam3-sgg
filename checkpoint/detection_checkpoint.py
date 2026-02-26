@@ -28,6 +28,9 @@ class PeriodicCheckpointerWithEval(HookBase):
         self.checkpointer.max_iter = self.trainer.max_iter
 
     def _do_eval(self):
+        # 在评估前清理显存，释放训练阶段占用的内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         results = self.eval._func()
         comm.synchronize()
         return results

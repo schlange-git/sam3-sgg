@@ -49,8 +49,12 @@ from detectron2.utils.file_io import PathManager
 from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter, EventWriter, get_event_storage
 from typing import Any, Dict, List, Set
 from detectron2.solver.build import maybe_add_gradient_clipping
+from detectron2.checkpoint import DetectionCheckpointer
 import wandb
 from PIL import Image
+import weakref
+from detectron2.engine.defaults import create_ddp_model
+from detectron2.engine.train_loop import AMPTrainer, SimpleTrainer
 
 class WandbWriter(EventWriter):
     """
@@ -406,6 +410,42 @@ class SameVideoBatchSampler(Sampler):
 
 
 class JointTransformerTrainer(DefaultTrainer):
+    def __init__(self, cfg):
+        """
+        与 DefaultTrainer 基本一致，但在多卡训练时显式开启
+        DDP find_unused_parameters，以兼容存在条件分支/未参与反传参数的模型。
+        """
+        super(DefaultTrainer, self).__init__()
+        logger = logging.getLogger("detectron2")
+        if not logger.isEnabledFor(logging.INFO):
+            setup_logger()
+        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
+
+        model = self.build_model(cfg)
+        optimizer = self.build_optimizer(cfg, model)
+        data_loader = self.build_train_loader(cfg)
+
+        model = create_ddp_model(
+            model,
+            broadcast_buffers=False,
+            find_unused_parameters=(comm.get_world_size() > 1),
+        )
+        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
+            model, data_loader, optimizer
+        )
+
+        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        self.checkpointer = DetectionCheckpointer(
+            model,
+            cfg.OUTPUT_DIR,
+            trainer=weakref.proxy(self),
+        )
+        self.start_iter = 0
+        self.max_iter = cfg.SOLVER.MAX_ITER
+        self.cfg = cfg
+
+        self.register_hooks(self.build_hooks())
+
     @staticmethod
     def _build_same_video_sampler(dataset_dicts, per_worker_batch_size, seed=42):
         return SameVideoBatchSampler(dataset_dicts, per_worker_batch_size, seed)

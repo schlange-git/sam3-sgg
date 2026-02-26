@@ -42,6 +42,12 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
     
     evaluator.reset(total*num_devices)
     num_warmup = min(5, total - 1)
+    
+    # 在评估开始前清理显存，释放训练阶段占用的内存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("Cleared CUDA cache before evaluation")
+    
     start_time = time.perf_counter()
     total_compute_time = 0
     with inference_context(model), torch.no_grad():
@@ -60,6 +66,10 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
                 torch.cuda.synchronize()
             total_compute_time += time.perf_counter() - start_compute_time
             evaluator.process(inputs, outputs)
+            
+            # 定期清理显存，避免内存碎片化（每100个样本清理一次）
+            if torch.cuda.is_available() and (idx + 1) % 100 == 0:
+                torch.cuda.empty_cache()
 
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
             seconds_per_img = total_compute_time / iters_after_start

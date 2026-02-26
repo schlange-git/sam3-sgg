@@ -46,8 +46,12 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        self.person_class_weight = kwargs.get('person_class_weight', 1.0)
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
+        if self.num_classes > 0:
+            # Action Genome object_classes 中 person 位于索引 0。
+            empty_weight[0] = self.person_class_weight
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
@@ -225,9 +229,13 @@ class IterativeRelationCriterionBase(nn.Module):
         self.statistics = kwargs['statistics']
         self.reweight_rel = kwargs['reweight_relations']
         self.use_reweight_log = kwargs['use_reweight_log']
+        self.person_class_weight = kwargs.get('person_class_weight', 1.0)
 
         empty_weight_obj = torch.ones(self.num_classes + 1)
         empty_weight_obj[-1] = self.eos_coef
+        if self.num_classes > 0:
+            # Action Genome object_classes 中 person 位于索引 0。
+            empty_weight_obj[0] = self.person_class_weight
         empty_rel_weight = torch.ones(self.num_rel_classes + 1)
         empty_rel_weight[-1] = kwargs['rel_eos_coef']
         if self.reweight_rel:

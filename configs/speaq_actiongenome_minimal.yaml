@@ -22,6 +22,7 @@ MODEL:
     REWEIGHT_RELATIONS: True
     REWEIGHT_REL_EOS_COEF: 0.1
     NO_OBJECT_WEIGHT: 0.1
+    PERSON_CLASS_WEIGHT: 0.1
     NO_REL_WEIGHT: 0.1
   SAM3:
     ENABLED: True
@@ -39,11 +40,11 @@ MODEL:
     # SAM3运行的设备（通常与MODEL.DEVICE相同）
     DEVICE: "cuda"
     # 如果使用预计算的特征图，设置特征图目录
-    FEATUREMAP_DIR: "data/featuremaps"
+    FEATUREMAP_DIR: ""
     # 控制特征图粗细：16 比 32 更细粒度
     TARGET_STRIDE: 32
     # 打开多尺度特征
-    USE_FPN: True
+    USE_FPN: False
     # FPN 目标步长（从细到粗）
     FPN_STRIDES: [8, 16, 32]
     # 优先使用 SAM3 原生 backbone_fpn 多尺度输出
@@ -52,9 +53,9 @@ MODEL:
     MULTISCALE_MERGE: "sum"
   TEMPORAL:
     # 两帧记忆式时序建模：在 transformer 前聚合 H_{t-1} 与 F_t
-    ENABLED: True
+    ENABLED: False
     # 评估阶段是否也启用时序聚合
-    EVAL_ENABLED: True
+    EVAL_ENABLED: False
     # 可学习时间门控 alpha 的初始化值（实际使用 sigmoid(alpha)）
     ALPHA_INIT: 0.7
   # 评估时关系类别数需与 relationship_classes.txt 一致（不含 +1 background）
@@ -78,14 +79,14 @@ DATASETS:
     VAL_SET_RANDOMIZED: False
 
 SOLVER:
-  IMS_PER_BATCH: 1
+  IMS_PER_BATCH: 4
   # 以 epoch 为主导：每个 epoch 遍历全部帧，训练总长度由 MAX_EPOCH 决定
-  MAX_EPOCH: 10
+  MAX_EPOCH: 1
   BASE_LR: 0.0001
-  STEPS: (35000, 45000)
-  MAX_ITER: 50000
+  STEPS: (105000, 135000)
+  MAX_ITER: 150000
   WARMUP_FACTOR: 0.001
-  WARMUP_ITERS: 1000
+  WARMUP_ITERS: 2000
   WEIGHT_DECAY: 0.0001
   OPTIMIZER: "ADAMW"
   BACKBONE_MULTIPLIER: 0.05
@@ -99,16 +100,24 @@ SOLVER:
     ENABLED: True
 
 INPUT:
-  MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704)
+  # 固定为1008以匹配SAM3.IMAGE_SIZE，避免双重resize导致的对齐问题
+  # SAM3 backbone会强制resize到IMAGE_SIZE(1008)，所以这里设为固定值确保一致性
+  # 注意：必须使用tuple格式 (1008,) 以匹配Detectron2的默认类型
+  MIN_SIZE_TRAIN: (1008,)
+  MAX_SIZE_TRAIN: 1008
+  # 测试阶段也使用固定尺寸1008，与训练和SAM3.IMAGE_SIZE一致
+  # 注意：MIN_SIZE_TEST 和 MAX_SIZE_TEST 在 INPUT 下，使用 int 格式即可（不需要 tuple）
+  MIN_SIZE_TEST: 1008
+  MAX_SIZE_TEST: 1008
+  # 关闭CROP以避免额外的resize/crop操作破坏对齐
   CROP:
-    ENABLED: True
+    ENABLED: False
     TYPE: "absolute_range"
     SIZE: (360, 640)
   FORMAT: "RGB"
 
 TEST:
   EVAL_PERIOD: 5000
-
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False
   NUM_WORKERS: 8

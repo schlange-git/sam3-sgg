@@ -28,8 +28,8 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_baseline_4090_train_backbone_debug}"
-NUM_GPUS="${2:-1}"
+OUTPUT_DIR="${1:-z_outputs/sam3_150000iters_unfreeze_backbone_reduce_person_weight}"
+NUM_GPUS="${2:-2}"
 NUM_VIDEOS_TRAIN="${3:--1}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
@@ -58,7 +58,8 @@ SAM3_CHECKPOINT_PATH="${SAM3_CHECKPOINT_PATH:-sam3.pt}"
 BACKBONE_WEIGHTS="${BACKBONE_WEIGHTS:-detectron2://ImageNetPretrained/MSRA/R-101.pkl}"
 # DETR_HEAD_WEIGHTS: VG 上训好的 DETR 权重（包含 transformer + 检测头 + 关系头）
 # 设置为空字符串则只使用 backbone，不加载 DETR head 预训练
-DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-vg_objectdetector_pretrained.pth}"
+DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-/root/autodl-tmp/sam3-sgg/z_outputs/sam3_baseline_4090_freeze_backbone.pth}"
+# DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-vg_objectdetector_pretrained.pth}"
 # 是否额外在 overfit 训练集上评测（1/0）
 EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-0}"
 # 可视化最大图片数（-1 = 全部）
@@ -95,6 +96,29 @@ if [[ -n "${DETR_HEAD_WEIGHTS}" && "${DETR_HEAD_WEIGHTS}" != "none" && "${DETR_H
   )
 else
   echo "DETR_HEAD_WEIGHTS not set, will only use backbone pretrained weights."
+fi
+
+# 自动恢复：检测 OUTPUT_DIR 下最新 .pth 并 resume
+RESUME_ARGS=()
+LATEST_CKPT=""
+if [[ -d "${OUTPUT_DIR}" ]]; then
+  shopt -s nullglob
+  CKPT_CANDIDATES=("${OUTPUT_DIR}"/*.pth)
+  shopt -u nullglob
+  if (( ${#CKPT_CANDIDATES[@]} > 0 )); then
+    IFS=$'\n' SORTED_CKPTS=($(ls -1t "${CKPT_CANDIDATES[@]}"))
+    unset IFS
+    LATEST_CKPT="${SORTED_CKPTS[0]}"
+  fi
+fi
+
+if [[ -n "${LATEST_CKPT}" ]]; then
+  echo "Auto-resume enabled. Latest checkpoint: ${LATEST_CKPT}"
+  RESUME_ARGS=(--resume)
+  # 当 OUTPUT_DIR 下不存在 last_checkpoint 时，--resume 会回退到 MODEL.WEIGHTS。
+  TRAIN_OPTS+=(MODEL.WEIGHTS "${LATEST_CKPT}")
+else
+  echo "Auto-resume: no checkpoint found under ${OUTPUT_DIR}, start from scratch."
 fi
 
 # -----------------------------
@@ -140,6 +164,7 @@ monitor_memory() {
 # 1) 训练（带内存监控）
 # -----------------------------
 python train_iterative_model.py \
+  "${RESUME_ARGS[@]}" \
   --num-gpus "${NUM_GPUS}" \
   --config-file "${CONFIG}" \
   --dist-url "tcp://127.0.0.1:${PORT}" \
