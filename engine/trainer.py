@@ -361,6 +361,60 @@ class PerformanceMonitorHook(HookBase):
         self.logger.info("=" * 80)
 
 
+class Sam3UnfreezeHook(HookBase):
+    """训练到指定 iter 后自动解冻 SAM3 backbone（仅执行一次）。"""
+
+    def __init__(self, unfreeze_at_iter: int, cfg=None):
+        self.unfreeze_at_iter = int(unfreeze_at_iter)
+        self.cfg = cfg
+        self._done = False
+        self.logger = logging.getLogger(__name__)
+
+    def after_step(self):
+        if self._done:
+            return
+        cur_iter = self.trainer.iter + 1
+        if cur_iter < self.unfreeze_at_iter:
+            return
+        self._done = True
+        module = self.trainer.model.module if hasattr(self.trainer.model, "module") else self.trainer.model
+        backbone = self._find_sam3_backbone(module)
+        if backbone is None:
+            self.logger.warning("[Sam3UnfreezeHook] SAM3 backbone not found, skip unfreeze")
+            return
+        if hasattr(backbone, "set_freeze"):
+            backbone.set_freeze(False)
+        backbone.train()
+        for p in backbone.parameters():
+            p.requires_grad_(True)
+        # 将新解冻参数加入优化器（初始化时因 requires_grad=False 被跳过）
+        if self.cfg is not None and hasattr(self.trainer, "optimizer"):
+            lr = self.cfg.SOLVER.BASE_LR * getattr(self.cfg.SOLVER, "BACKBONE_MULTIPLIER", 0.1)
+            new_params = [p for p in backbone.parameters() if p.requires_grad]
+            if new_params:
+                self.trainer.optimizer.add_param_group({"params": new_params, "lr": lr})
+        self.logger.info("[Sam3UnfreezeHook] Unfroze SAM3 backbone at iter=%d", cur_iter)
+
+    def _find_sam3_backbone(self, module):
+        if hasattr(module, "backbone") and hasattr(module.backbone, "bottom_up"):
+            bb = module.backbone.bottom_up
+            if hasattr(bb, "sam3_model") or hasattr(bb, "set_freeze"):
+                return bb
+        if hasattr(module, "backbone"):
+            bb = module.backbone
+            if isinstance(bb, (torch.nn.Sequential, torch.nn.ModuleList)):
+                bb = bb[0] if len(bb) > 0 else None
+            if bb is not None and (hasattr(bb, "sam3_model") or hasattr(bb, "set_freeze")):
+                return bb
+        if hasattr(module, "detr") and hasattr(module.detr, "backbone"):
+            bb = module.detr.backbone
+            if isinstance(bb, (torch.nn.Sequential, torch.nn.ModuleList)):
+                bb = bb[0] if len(bb) > 0 else None
+            if bb is not None and (hasattr(bb, "sam3_model") or hasattr(bb, "set_freeze")):
+                return bb
+        return None
+
+
 class SameVideoBatchSampler(Sampler):
     """
     将同一视频的帧分组到同一个batch中的采样器。
@@ -536,17 +590,16 @@ class JointTransformerTrainer(DefaultTrainer):
             PerformanceMonitorHook(period=50),  # 每50次迭代输出一次性能报告
             MemoryMonitorHook(threshold=90.0, check_interval=10),  # 内存监控：每10次迭代检查一次，超过90%自动终止
             hooks.LRScheduler(self.optimizer, self.scheduler),
-            hooks.PreciseBN(
-                # Run at the same freq as (but before) evaluation.
-                cfg.TEST.EVAL_PERIOD,
-                self.model,
-                # Build a new data loader to not affect training
-                self.build_train_loader(cfg),
-                cfg.TEST.PRECISE_BN.NUM_ITER,
-            )
-            if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
-            else None,
         ]
+        if cfg.MODEL.SAM3.ENABLED and cfg.MODEL.SAM3.FREEZE and cfg.MODEL.SAM3.UNFREEZE_AT_ITER >= 0:
+            ret.append(Sam3UnfreezeHook(cfg.MODEL.SAM3.UNFREEZE_AT_ITER))
+        precise_bn = hooks.PreciseBN(
+            cfg.TEST.EVAL_PERIOD,
+            self.model,
+            self.build_train_loader(cfg),
+            cfg.TEST.PRECISE_BN.NUM_ITER,
+        ) if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model) else None
+        ret.append(precise_bn)
 
         # Do PreciseBN before checkpointer, because it updates the model and need to
         # be saved by checkpointer.
@@ -693,8 +746,14 @@ class JointTransformerTrainer(DefaultTrainer):
         params: List[Dict[str, Any]] = []
         memo: Set[torch.nn.parameter.Parameter] = set()
         logger = logging.getLogger("detectron2")
+        sam3_delayed_unfreeze = (
+            cfg.MODEL.SAM3.ENABLED
+            and cfg.MODEL.SAM3.FREEZE
+            and int(getattr(cfg.MODEL.SAM3, "UNFREEZE_AFTER_ITER", -1)) >= 0
+        )
         for key, value in model.named_parameters(recurse=True):
-            if not value.requires_grad:
+            include_frozen_sam3 = sam3_delayed_unfreeze and ("sam3_model" in key)
+            if (not value.requires_grad) and (not include_frozen_sam3):
                 continue
             # Avoid duplicating parameters
             if value in memo:
@@ -710,6 +769,12 @@ class JointTransformerTrainer(DefaultTrainer):
             if "detr.transformer.encoder" in key or "detr.transformer.decoder.layers" in key or "detr.query_embed" in key or 'backbone' in key or 'detr.transformer.decoder.norm' in key:
                 lr = lr * cfg.SOLVER.ENTITY_MULTIPLIER
                 logger.info("Setting LR for {} to {}".format(key, lr))
+            if include_frozen_sam3 and (not value.requires_grad):
+                logger.info(
+                    "Include frozen SAM3 param for delayed unfreeze: %s (iter=%d)",
+                    key,
+                    int(getattr(cfg.MODEL.SAM3, "UNFREEZE_AFTER_ITER", -1)),
+                )
             params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
 
         def maybe_add_full_model_gradient_clipping(optim):  # optim: the optimizer class

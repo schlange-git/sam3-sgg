@@ -318,6 +318,50 @@ class Sam3MaskedBackbone(nn.Module):
         self._merge_proj_layer = layer
         return self._merge_proj_layer
 
+    def set_freeze(self, freeze: bool) -> None:
+        """
+        更新 SAM3 backbone 的冻结状态。
+        切换 sam3_model、_proj_layer、多尺度层 的 train/eval 与 requires_grad，
+        使 forward 中 torch.set_grad_enabled(not self.freeze) 与新状态一致。
+        """
+        self.freeze = freeze
+        if self.sam3_model is not None:
+            if freeze:
+                self.sam3_model.eval()
+            else:
+                self.sam3_model.train()
+            for p in self.sam3_model.parameters():
+                p.requires_grad_(not freeze)
+        if self._proj_layer is not None:
+            if freeze:
+                self._proj_layer.eval()
+            else:
+                self._proj_layer.train()
+            for p in self._proj_layer.parameters():
+                p.requires_grad_(not freeze)
+        for layer in self._level_proj_layers.values():
+            if freeze:
+                layer.eval()
+            else:
+                layer.train()
+            for p in layer.parameters():
+                p.requires_grad_(not freeze)
+        if self._merge_proj_layer is not None:
+            if freeze:
+                self._merge_proj_layer.eval()
+            else:
+                self._merge_proj_layer.train()
+            for p in self._merge_proj_layer.parameters():
+                p.requires_grad_(not freeze)
+        if self.fpn_layers is not None:
+            for layer in self.fpn_layers.values():
+                if freeze:
+                    layer.eval()
+                else:
+                    layer.train()
+                for p in layer.parameters():
+                    p.requires_grad_(not freeze)
+
     def _normalize_batch(self, images: torch.Tensor) -> torch.Tensor:
         # images: [B, 3, H, W] (uint8 or float)
         processed = []
@@ -569,6 +613,53 @@ class Sam3MaskedBackbone(nn.Module):
             self.feature_strides = [self.feature_stride]
             masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
             return NestedTensor(proj_feat, masks[0])
+
+    def set_freeze(self, freeze: bool) -> None:
+        """
+        Dynamically switch SAM3 freeze state during training.
+        """
+        self.freeze = bool(freeze)
+
+        if self.sam3_model is not None:
+            if self.freeze:
+                self.sam3_model.eval()
+            else:
+                self.sam3_model.train()
+            for p in self.sam3_model.parameters():
+                p.requires_grad_(not self.freeze)
+
+        if self._proj_layer is not None:
+            if self.freeze:
+                self._proj_layer.eval()
+            else:
+                self._proj_layer.train()
+            for p in self._proj_layer.parameters():
+                p.requires_grad_(not self.freeze)
+
+        if self._merge_proj_layer is not None:
+            if self.freeze:
+                self._merge_proj_layer.eval()
+            else:
+                self._merge_proj_layer.train()
+            for p in self._merge_proj_layer.parameters():
+                p.requires_grad_(not self.freeze)
+
+        for layer in self._level_proj_layers.values():
+            if self.freeze:
+                layer.eval()
+            else:
+                layer.train()
+            for p in layer.parameters():
+                p.requires_grad_(not self.freeze)
+
+        if self.fpn_layers is not None:
+            for layer in self.fpn_layers.values():
+                if self.freeze:
+                    layer.eval()
+                else:
+                    layer.train()
+                for p in layer.parameters():
+                    p.requires_grad_(not self.freeze)
 
     def _mask_out_padding(self, feature_shapes, image_sizes, device):
         masks = []

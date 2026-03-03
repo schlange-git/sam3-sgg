@@ -130,6 +130,8 @@ def add_dataset_config(cfg):
   _C.MODEL.DETR.FREEZE_LAYERS = []
   _C.MODEL.DETR.TEST_INDEX = -1
   _C.MODEL.DETR.LOAD_HEAD_ONLY = False
+  _C.MODEL.DETR.LOAD_FULL_WEIGHTS = False  # True=用 HEAD_WEIGHTS 作为 MODEL.WEIGHTS 全量加载
+  _C.MODEL.DETR.LOAD_CLASS_HEAD = False  # 仅 LOAD_HEAD_ONLY 时生效：True=加载 class_embed，False=跳过并重建
   _C.MODEL.DETR.HEAD_WEIGHTS = ""
   # 当使用 ACTION GENOME 且从 VG 预训练加载时：只加载除分类头/关系头外的权重，然后按 AG 类别数重建并初始化两个头
   _C.MODEL.DETR.VG_PRETRAINED_FOR_AG = False
@@ -157,6 +159,8 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.FEATURE_DIM = 256
   _C.MODEL.SAM3.CHANNEL_REPEAT = 1
   _C.MODEL.SAM3.FREEZE = True
+  # -1 表示不自动解冻；>=0 时，训练到该 iter 自动解冻 SAM3 backbone（需配合 FREEZE=True 使用）
+  _C.MODEL.SAM3.UNFREEZE_AT_ITER = -1
   _C.MODEL.SAM3.DEVICE = "cuda"
   _C.MODEL.SAM3.USE_PRECOMPUTED = False
   _C.MODEL.SAM3.FEATUREMAP_DIR = "data/featuremaps"

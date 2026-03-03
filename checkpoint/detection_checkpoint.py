@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 import torch
 from detectron2.utils import comm
 from detectron2.engine import hooks, HookBase
@@ -28,7 +29,8 @@ class PeriodicCheckpointerWithEval(HookBase):
         self.checkpointer.max_iter = self.trainer.max_iter
 
     def _do_eval(self):
-        # 在评估前清理显存，释放训练阶段占用的内存
+        # 在评估前尽量释放显存，避免训练态 + 推理同时占用导致 OOM
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         results = self.eval._func()
@@ -43,6 +45,10 @@ class PeriodicCheckpointerWithEval(HookBase):
     def after_step(self):
         next_iter = self.trainer.iter + 1
         is_final = next_iter == self.trainer.max_iter
+        # 先保存 checkpoint，再跑 eval，避免 eval 时 OOM 导致整段训练没有落盘
+        if comm.is_main_process():
+            self.checkpointer.step(self.trainer.iter)
+        comm.synchronize()
         if is_final or (self.eval._period > 0 and next_iter % self.eval._period == 0):
             results = self._do_eval()
             if comm.is_main_process():
@@ -63,8 +69,6 @@ class PeriodicCheckpointerWithEval(HookBase):
                         self.checkpointer.checkpointer.save(
                         "best_model_final.pth", **additional_state
                         )
-        if comm.is_main_process():
-            self.checkpointer.step(self.trainer.iter)
         comm.synchronize()
 
     def after_train(self):

@@ -136,12 +136,14 @@ class Detr(nn.Module):
         pytorch_total_params = sum(p.numel() for p in self.parameters())
         print ("Number of Parameters:", pytorch_total_params)
 
-        # Load DETR head weights if:
-        # 1. LOAD_HEAD_ONLY is explicitly True, OR
-        # 2. Using SAM3 backbone (to avoid loading ResNet backbone weights)
+        # Load DETR pretrained weights from MODEL.DETR.HEAD_WEIGHTS:
+        # - LOAD_HEAD_ONLY=True  -> exclude class/relation heads, then re-init AG heads
+        # - LOAD_HEAD_ONLY=False -> load all compatible DETR params (including class/relation heads)
         if cfg.MODEL.DETR.HEAD_WEIGHTS:
-            if cfg.MODEL.DETR.LOAD_HEAD_ONLY or cfg.MODEL.SAM3.ENABLED:
-                self._load_detr_head_only(cfg.MODEL.DETR.HEAD_WEIGHTS)
+            if cfg.MODEL.DETR.LOAD_HEAD_ONLY:
+                self._load_detr_head_only(cfg.MODEL.DETR.HEAD_WEIGHTS, cfg)
+            else:
+                self._load_detr_full(cfg.MODEL.DETR.HEAD_WEIGHTS)
 
     def _freeze_layers(self, layers):
         # Freeze layers
@@ -162,22 +164,26 @@ class Detr(nn.Module):
         del pretrained_detr_without_class_head
         gc.collect()
 
-    def _load_detr_head_only(self, path):
+    def _load_detr_head_only(self, path, cfg):
         """
         按「除分类头以外所有权重 + 重建 AG 分类头」两步加载，与当前数据集 anno 的 class 配置一致，
         避免与 vg_objectdetector_pretrained.pth 中 VG 类别数冲突。
-        第一步：加载除 class_embed / relation 以外且 shape 匹配的权重。
-        第二步：重建并初始化 object 分类头与 relation 分类头（AG 类别数）。
+        LOAD_CLASS_HEAD=False（默认）：跳过 class_embed，加载后重建；relation 始终跳过并重建。
+        LOAD_CLASS_HEAD=True：加载 class_embed（分类头已匹配时）；relation 仍跳过并重建。
         """
+        load_class_head = getattr(cfg.MODEL.DETR, "LOAD_CLASS_HEAD", False)
         logger = logging.getLogger("detectron2")
-        logger.info("Loading DETR head (exclude class/relation heads, then re-init for AG): %s", path)
+        logger.info(
+            "Loading DETR head: path=%s, LOAD_CLASS_HEAD=%s (False=skip class_embed & re-init, True=load class_embed)",
+            path, load_class_head
+        )
         ckpt = torch.load(path, map_location="cpu")
         state_dict = ckpt.get("model", ckpt)
         del ckpt
         model_dict = self.state_dict()
         filtered = {}
         for k, v in state_dict.items():
-            if "class_embed" in k:
+            if not load_class_head and "class_embed" in k:
                 continue
             if "relation" in k:
                 continue
@@ -186,13 +192,16 @@ class Detr(nn.Module):
         del state_dict
         model_dict.update(filtered)
         self.load_state_dict(model_dict, strict=False)
-        logger.info("DETR head: loaded %d keys (excluded class_embed and relation heads)", len(filtered))
+        logger.info(
+            "DETR head: loaded %d keys (excluded relation heads%s)",
+            len(filtered), ", excluded class_embed" if not load_class_head else ""
+        )
         del model_dict
         del filtered
         gc.collect()
 
-        # 第二步：重建 AG 分类头（与当前数据集 class 文件一致）
-        if hasattr(self.detr, "class_embed"):
+        # 第二步：仅当未加载 class_embed 时重建 object 分类头；relation 始终重建
+        if not load_class_head and hasattr(self.detr, "class_embed"):
             torch.nn.init.normal_(self.detr.class_embed.weight, std=0.01)
             torch.nn.init.constant_(self.detr.class_embed.bias, 0)
         if hasattr(self.detr, "relation_class_embed"):
@@ -200,13 +209,54 @@ class Detr(nn.Module):
             torch.nn.init.constant_(self.detr.relation_class_embed.bias, 0)
         if hasattr(self.detr, "transformer"):
             t = self.detr.transformer
-            if hasattr(t, "object_embed"):
+            if hasattr(t, "object_embed") and not load_class_head:
                 torch.nn.init.normal_(t.object_embed.weight, std=0.01)
                 torch.nn.init.constant_(t.object_embed.bias, 0)
             if hasattr(t, "relation_embed"):
                 torch.nn.init.normal_(t.relation_embed.weight, std=0.01)
                 torch.nn.init.constant_(t.relation_embed.bias, 0)
-        logger.info("DETR head: re-inited AG class_embed and relation_class_embed (object_embed / relation_embed)")
+        logger.info(
+            "DETR head: re-inited relation heads; class_embed%s",
+            " (skipped, was loaded)" if load_class_head else " re-inited"
+        )
+
+    def _load_detr_full(self, path):
+        """
+        加载所有 shape 匹配的 DETR 相关权重（包含 class/relation heads）。
+        适用于类别头已对齐当前任务的专用预训练权重。
+        """
+        logger = logging.getLogger("detectron2")
+        logger.info("Loading full DETR weights (including class/relation heads): %s", path)
+        ckpt = torch.load(path, map_location="cpu")
+        state_dict = ckpt.get("model", ckpt)
+        del ckpt
+        model_dict = self.state_dict()
+        filtered = {}
+        for k, v in state_dict.items():
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered[k] = v
+        del state_dict
+        model_dict.update(filtered)
+        self.load_state_dict(model_dict, strict=False)
+        logger.info("Full DETR load: loaded %d compatible keys", len(filtered))
+        del model_dict
+        del filtered
+        gc.collect()
+
+    def set_sam3_freeze(self, freeze: bool) -> bool:
+        """
+        Toggle SAM3 backbone freeze state at runtime.
+        Returns True when SAM3 backbone is found and updated.
+        """
+        if not self.use_sam3_backbone:
+            return False
+        if not hasattr(self.detr, "backbone"):
+            return False
+        backbone = self.detr.backbone[0] if isinstance(self.detr.backbone, nn.Sequential) else self.detr.backbone
+        if hasattr(backbone, "set_freeze"):
+            backbone.set_freeze(freeze)
+            return True
+        return False
 
     def load_vg_pretrained_for_ag(self, path):
         """

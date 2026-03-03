@@ -85,7 +85,8 @@ def setup(args):
     # - 训练时若启用 SAM3 / LOAD_HEAD_ONLY，避免错误地整模型加载 backbone 权重
     # - eval_only 必须保留用户传入的 MODEL.WEIGHTS（如 model_final.pth），否则会退化为“未加载checkpoint评测”
     if (not args.eval_only) and (
-        cfg.MODEL.SAM3.ENABLED or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS)
+        ((cfg.MODEL.SAM3.ENABLED) and (not cfg.MODEL.DETR.LOAD_FULL_WEIGHTS))
+        or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS)
     ):
         cfg.MODEL.WEIGHTS = ""
     register_datasets(cfg)

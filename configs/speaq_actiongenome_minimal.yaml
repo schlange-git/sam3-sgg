@@ -35,8 +35,9 @@ MODEL:
     FEATURE_DIM: 256
     # 通道重复倍数（1表示不重复）
     CHANNEL_REPEAT: 1
-    # 是否冻结SAM3参数（False时参与反向传播做微调）
-    FREEZE: False
+    # 是否冻结SAM3参数（False时参与反向传播做微调）。
+    # 通过脚本环境变量 SAM3_UNFREEZE_ITER 实现前N iter冻结再解冻：>0 时前 N iter 冻结，之后自动解冻继续训练到 MAX_ITER。
+    FREEZE: True
     # SAM3运行的设备（通常与MODEL.DEVICE相同）
     DEVICE: "cuda"
     # 如果使用预计算的特征图，设置特征图目录
@@ -81,10 +82,10 @@ DATASETS:
 SOLVER:
   IMS_PER_BATCH: 4
   # 以 epoch 为主导：每个 epoch 遍历全部帧，训练总长度由 MAX_EPOCH 决定
-  MAX_EPOCH: 1
+  MAX_EPOCH: 0
   BASE_LR: 0.0001
-  STEPS: (105000, 135000)
-  MAX_ITER: 150000
+  STEPS: (28000, 36000)
+  MAX_ITER: 40000
   WARMUP_FACTOR: 0.001
   WARMUP_ITERS: 2000
   WEIGHT_DECAY: 0.0001
