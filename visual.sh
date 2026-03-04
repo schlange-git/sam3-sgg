@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# ActionGenome 可视化独立脚本（可选先跑评测）
+# ActionGenome 可视化独立脚本（可选可视化后跑评测）
 # 用法:
 #   ./visual.sh [/path/to/checkpoint.pth] [NUM_IMAGES] [DATASET_NAME] [RUN_EVAL] [NUM_GPUS]
 #   - NUM_IMAGES: 可视化的最大图片数（默认: 1000，-1 表示全部）
 #   - DATASET_NAME: Detectron2 数据集名称（默认: AG_val）
-#   - RUN_EVAL: 1/true/yes 时先对 AG_val 做 eval-only 再可视化（默认: 0）
+#   - RUN_EVAL: 1/true/yes 时在可视化后对 AG_val 做 eval-only（默认: 0）
 #   - NUM_GPUS: 评测时使用的 GPU 数（默认: 1，可设 2 双卡）
 #
 # 说明:
@@ -57,7 +57,7 @@ echo "Checkpoint      : ${CHECKPOINT}"
 echo "Config          : ${CONFIG}"
 echo "Dataset         : ${DATASET_NAME}"
 echo "Num images      : ${NUM_IMAGES}"
-echo "Run eval first  : ${RUN_EVAL_VAL}"
+echo "Run eval after vis: ${RUN_EVAL_VAL}"
 echo "Num GPUs (eval) : ${NUM_GPUS}"
 echo "Output (visual) : ${VIS_DIR}"
 echo "=============================================="
@@ -67,8 +67,27 @@ AG_ANNOTATIONS="${AG_ANNOTATIONS:-dataset/annotations}"
 AG_FRAMES="${AG_FRAMES:-dataset/frames}"
 AG_VIDEOS="${AG_VIDEOS:-dataset/videos}"
 PORT="${PORT:-29500}"
+REL_SCORE_THRESH="${REL_SCORE_THRESH:-0.05}"
+BOX_SCORE_THRESH="${BOX_SCORE_THRESH:-0.0}"
+FORCE_KEEP_PERSON="${FORCE_KEEP_PERSON:-1}"
 
-# 可选：先跑评测（eval-only），结果写到 <CKPT_DIR>/eval_AG_val
+python "${VIS_SCRIPT}" \
+  --config-file "${CONFIG}" \
+  --model-weights "${CHECKPOINT}" \
+  --output-dir "${VIS_DIR}" \
+  --dataset-name "${DATASET_NAME}" \
+  --num-images "${NUM_IMAGES}" \
+  --rel-score-thresh "${REL_SCORE_THRESH}" \
+  --box-score-thresh "${BOX_SCORE_THRESH}" \
+  --force-keep-person "${FORCE_KEEP_PERSON}" \
+  DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
+  DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
+  DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
+  ${OPTS:-}
+
+echo "可视化完成，结果保存在: ${VIS_DIR}"
+
+# 可选：可视化后再跑评测（eval-only），结果写到 <CKPT_DIR>/eval_AG_val
 if [[ "${RUN_EVAL_VAL}" == "1" ]]; then
   VAL_EVAL_DIR="${CKPT_DIR}/eval_AG_val"
   mkdir -p "${VAL_EVAL_DIR}"
@@ -86,16 +105,3 @@ if [[ "${RUN_EVAL_VAL}" == "1" ]]; then
     ${OPTS:-}
   echo "[评测] 完成: ${VAL_EVAL_DIR}"
 fi
-
-python "${VIS_SCRIPT}" \
-  --config-file "${CONFIG}" \
-  --model-weights "${CHECKPOINT}" \
-  --output-dir "${VIS_DIR}" \
-  --dataset-name "${DATASET_NAME}" \
-  --num-images "${NUM_IMAGES}" \
-  DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
-  DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
-  DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
-  ${OPTS:-}
-
-echo "可视化完成，结果保存在: ${VIS_DIR}"

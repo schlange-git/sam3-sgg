@@ -10,6 +10,7 @@ import sys
 
 import numpy as np
 import torch
+from detectron2.layers import batched_nms
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
@@ -88,6 +89,10 @@ def main():
     parser.add_argument("--num-images", type=int, default=-1, help="-1 = all images")
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--rel-score-thresh", type=float, default=0.2)
+    parser.add_argument("--box-score-thresh", type=float, default=0.0)
+    parser.add_argument("--force-keep-person", type=int, default=1, help="1=always keep top-scoring person box if exists")
+    parser.add_argument("--classwise-nms-iou", type=float, default=0.4)
+    parser.add_argument("--debug-person-scores", type=int, default=0, help="1=print person score stats")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -119,21 +124,64 @@ def main():
                 scores = instances.scores.cpu().numpy() if hasattr(instances, "scores") else None
                 relations, rel_scores = _extract_relations(output_per_image)
 
-                box_thresh = args.rel_score_thresh
+                # Class-wise NMS before visualization to suppress same-label duplicates.
+                if scores is not None and len(scores) > 0:
+                    nms_keep = batched_nms(
+                        instances.pred_boxes.tensor,
+                        instances.scores,
+                        instances.pred_classes,
+                        float(args.classwise_nms_iou),
+                    ).cpu().numpy()
+                    if len(nms_keep) < len(scores):
+                        keep_set = {int(i) for i in nms_keep.tolist()}
+                        remap = {int(old): int(new) for new, old in enumerate(nms_keep.tolist())}
+                        boxes = boxes[nms_keep]
+                        labels = labels[nms_keep]
+                        scores = scores[nms_keep]
+                        if relations is not None and relations.shape[0] > 0:
+                            new_rels, new_scores = [], []
+                            for ri, (s, o, p) in enumerate(relations):
+                                s_i, o_i = int(s), int(o)
+                                if s_i in keep_set and o_i in keep_set:
+                                    new_rels.append([remap[s_i], remap[o_i], int(p)])
+                                    if rel_scores is not None and ri < len(rel_scores):
+                                        new_scores.append(float(rel_scores[ri]))
+                            relations = np.array(new_rels, dtype=np.int64) if new_rels else np.zeros((0, 3), dtype=np.int64)
+                            rel_scores = np.array(new_scores, dtype=np.float32) if (rel_scores is not None and len(new_scores) > 0) else None
+
+                box_thresh = args.box_score_thresh
                 if scores is not None:
                     keep = scores >= box_thresh
+                    if args.force_keep_person:
+                        person_class_idx = None
+                        if hasattr(metadata, "thing_classes") and "person" in metadata.thing_classes:
+                            person_class_idx = metadata.thing_classes.index("person")
+                        if person_class_idx is not None:
+                            person_candidates = np.where(labels == person_class_idx)[0]
+                            if person_candidates.size > 0:
+                                best_person_idx = int(person_candidates[np.argmax(scores[person_candidates])])
+                                keep[best_person_idx] = True
+                                if args.debug_person_scores:
+                                    person_scores = scores[person_candidates]
+                                    print(
+                                        f"[VIS_DEBUG] image={os.path.basename(str(input_per_image.get('file_name', 'unknown')))} "
+                                        f"person_scores_min={person_scores.min():.6f} max={person_scores.max():.6f} "
+                                        f"mean={person_scores.mean():.6f} kept_best={scores[best_person_idx]:.6f}"
+                                    )
                     if keep.sum() == 0:
                         keep[int(scores.argmax())] = True
                     boxes = boxes[keep]
                     labels = labels[keep]
                     scores = scores[keep]
                     if relations is not None and relations.shape[0] > 0:
-                        kept_indices = {int(i) for i in np.where(keep)[0]}
+                        kept_raw_indices = np.where(keep)[0]
+                        kept_indices = {int(i) for i in kept_raw_indices}
+                        remap = {int(raw_idx): new_idx for new_idx, raw_idx in enumerate(kept_raw_indices)}
                         new_rels, new_scores = [], []
                         for i, (s, o, p) in enumerate(relations):
                             if int(s) in kept_indices and int(o) in kept_indices:
-                                new_idx_s = list(np.where(keep)[0]).index(int(s))
-                                new_idx_o = list(np.where(keep)[0]).index(int(o))
+                                new_idx_s = remap[int(s)]
+                                new_idx_o = remap[int(o)]
                                 new_rels.append([new_idx_s, new_idx_o, int(p)])
                                 if rel_scores is not None:
                                     new_scores.append(float(rel_scores[i]))

@@ -9,6 +9,7 @@ import json
 from tqdm import tqdm
 from functools import reduce
 import itertools
+from tabulate import tabulate
 
 from abc import ABC, abstractmethod
 
@@ -22,6 +23,7 @@ from detectron2.data import MetadataCatalog
 from detectron2.evaluation.evaluator import DatasetEvaluator
 from detectron2.evaluation import COCOEvaluator
 from detectron2.structures.boxes import pairwise_iou, Boxes
+from detectron2.layers import batched_nms
 from detectron2.utils.registry import Registry
 
 
@@ -124,14 +126,43 @@ class SceneGraphEvaluator(DatasetEvaluator):
             self._evaluators[evaluator].register_container(self._mode,self.cfg,total)
 
     def process(self, inputs, outputs):
+        processed_outputs = []
         # import pdb; pdb.set_trace()
         for idx, input in enumerate(inputs):
             height, width = outputs[idx]['instances'].image_size
             input['instances'] = resize_instance(input['instances'], height, width)
-        
-        self.detection_evaluator.process(inputs, outputs)
 
-        for input, output in zip(inputs, outputs):
+        for output in outputs:
+            instances = output.get("instances", None)
+            if instances is None:
+                processed_outputs.append(output)
+                continue
+            rel_pair_idxs = output.get("rel_pair_idxs", getattr(instances, "_rel_pair_idxs", None))
+            pred_rel_scores = output.get("pred_rel_scores", getattr(instances, "_pred_rel_scores", None))
+            pred_rel_labels = output.get("pred_rel_labels", getattr(instances, "_pred_rel_labels", None))
+            query_index = output.get("query_index", getattr(instances, "_query_index", None))
+            new_instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index = self._apply_classwise_nms(
+                instances.to(self._cpu_device),
+                rel_pair_idxs.to(self._cpu_device) if rel_pair_idxs is not None else None,
+                pred_rel_scores.to(self._cpu_device) if pred_rel_scores is not None else None,
+                pred_rel_labels.to(self._cpu_device) if pred_rel_labels is not None else None,
+                query_index.to(self._cpu_device) if query_index is not None else None,
+                iou_thresh=getattr(self.cfg.TEST.RELATION, "CLASSWISE_NMS_THRESH", 0.4),
+            )
+            processed_outputs.append(
+                {
+                    **output,
+                    "instances": new_instances,
+                    "rel_pair_idxs": rel_pair_idxs,
+                    "pred_rel_scores": pred_rel_scores,
+                    "pred_rel_labels": pred_rel_labels,
+                    "query_index": query_index,
+                }
+            )
+
+        self.detection_evaluator.process(inputs, processed_outputs)
+
+        for input, output in zip(inputs, processed_outputs):
             ground_truth = {}
             prediction = {}
 
@@ -206,7 +237,68 @@ class SceneGraphEvaluator(DatasetEvaluator):
             self._ground_truths.append(ground_truth_cp)
             self._predictions.append(prediction_cp)
         del outputs
+        del processed_outputs
         del inputs 
+
+    def _apply_classwise_nms(
+        self,
+        instances,
+        rel_pair_idxs=None,
+        pred_rel_scores=None,
+        pred_rel_labels=None,
+        query_index=None,
+        iou_thresh=0.4,
+    ):
+        if instances is None or len(instances) == 0:
+            return instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index
+        if (not hasattr(instances, "pred_boxes")) or (not hasattr(instances, "scores")) or (not hasattr(instances, "pred_classes")):
+            return instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index
+
+        boxes = instances.pred_boxes.tensor
+        scores = instances.scores
+        classes = instances.pred_classes
+        keep = batched_nms(boxes, scores, classes, float(iou_thresh))
+        keep = keep.long()
+        if keep.numel() == len(instances):
+            return instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index
+
+        new_instances = Instances(instances.image_size)
+        new_instances.pred_boxes = Boxes(boxes[keep])
+        new_instances.scores = scores[keep]
+        new_instances.pred_classes = classes[keep]
+
+        # remap relation pairs to filtered object indices
+        if rel_pair_idxs is None:
+            return new_instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index
+
+        keep_list = keep.detach().cpu().tolist()
+        remap = {int(old): int(new) for new, old in enumerate(keep_list)}
+        valid_rel_idx = []
+        new_pairs = []
+        for rel_i, pair in enumerate(rel_pair_idxs.detach().cpu().tolist()):
+            s, o = int(pair[0]), int(pair[1])
+            if s in remap and o in remap:
+                valid_rel_idx.append(rel_i)
+                new_pairs.append([remap[s], remap[o]])
+
+        if len(valid_rel_idx) == 0:
+            device = rel_pair_idxs.device
+            empty_long = torch.zeros((0,), dtype=torch.long, device=device)
+            empty_pair = torch.zeros((0, 2), dtype=torch.long, device=device)
+            empty_scores = (
+                torch.zeros((0, pred_rel_scores.shape[1]), dtype=pred_rel_scores.dtype, device=pred_rel_scores.device)
+                if pred_rel_scores is not None and pred_rel_scores.ndim == 2
+                else torch.zeros((0,), dtype=torch.float32, device=device)
+            )
+            return new_instances, empty_pair, empty_scores, empty_long, empty_long
+
+        valid_rel_idx = torch.as_tensor(valid_rel_idx, dtype=torch.long, device=rel_pair_idxs.device)
+        new_rel_pair_idxs = torch.as_tensor(new_pairs, dtype=torch.long, device=rel_pair_idxs.device)
+        new_pred_rel_scores = pred_rel_scores.index_select(0, valid_rel_idx) if pred_rel_scores is not None else pred_rel_scores
+        new_pred_rel_labels = pred_rel_labels.index_select(0, valid_rel_idx) if pred_rel_labels is not None else pred_rel_labels
+        new_query_index = query_index.index_select(0, valid_rel_idx) if query_index is not None else query_index
+
+        return new_instances, new_rel_pair_idxs, new_pred_rel_scores, new_pred_rel_labels, new_query_index
 
     def evaluate(self):
         #First evaluate the detection precisions
@@ -240,6 +332,10 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 torch.save({'groundtruths':ground_truths, 'predictions':predictions}, f)
         self._logger.info("Saving output prediction")
 
+        # 额外输出 bbox recall 表格（IoU=0.50），便于和 AP 对照分析 precision/recall 失衡
+        bbox_recall = self._compute_bbox_recall(ground_truths, predictions, iou_thresh=0.5)
+        result_detector["bbox_recall"] = bbox_recall
+
         result_detector['SG'] = self._evaluate_scenegraphs(ground_truths, predictions)
         
         if self._output_dir:
@@ -249,6 +345,92 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 torch.save(self._evaluators['SGRecall'].result_dict, f)
         
         return result_detector 
+
+    def _compute_bbox_recall(self, ground_truths, predictions, iou_thresh=0.5):
+        thing_classes = list(getattr(self._metadata, "thing_classes", []))
+        num_classes = len(thing_classes)
+        gt_count = np.zeros(num_classes, dtype=np.int64)
+        matched_count = np.zeros(num_classes, dtype=np.int64)
+
+        for gt, pred in zip(ground_truths, predictions):
+            gt_boxes = gt["gt_boxes"].tensor.detach().cpu()
+            gt_labels = gt["labels"].long().detach().cpu()
+            pred_instances = pred.get("instances", None)
+            if pred_instances is None:
+                for cls in gt_labels.tolist():
+                    if 0 <= cls < num_classes:
+                        gt_count[cls] += 1
+                continue
+
+            pred_boxes = pred_instances.pred_boxes.tensor.detach().cpu()
+            pred_labels = pred_instances.pred_classes.long().detach().cpu()
+
+            for cls in range(num_classes):
+                gt_mask = gt_labels == cls
+                pred_mask = pred_labels == cls
+                n_gt = int(gt_mask.sum().item())
+                if n_gt == 0:
+                    continue
+                gt_count[cls] += n_gt
+                if int(pred_mask.sum().item()) == 0:
+                    continue
+
+                cls_gt_boxes = gt_boxes[gt_mask]
+                cls_pred_boxes = pred_boxes[pred_mask]
+                ious = pairwise_iou(Boxes(cls_gt_boxes), Boxes(cls_pred_boxes))
+                # 逐个 GT 做贪心 1-to-1 匹配，统计被命中的 GT 数（Recall）
+                used_pred = set()
+                local_match = 0
+                for gt_i in range(ious.shape[0]):
+                    vals, idxs = torch.sort(ious[gt_i], descending=True)
+                    for v, p_idx in zip(vals.tolist(), idxs.tolist()):
+                        if v < iou_thresh:
+                            break
+                        if p_idx not in used_pred:
+                            used_pred.add(p_idx)
+                            local_match += 1
+                            break
+                matched_count[cls] += local_match
+
+        total_gt = int(gt_count.sum())
+        total_matched = int(matched_count.sum())
+        overall_recall = (float(total_matched) / float(total_gt)) if total_gt > 0 else 0.0
+
+        self._logger.info("Evaluation results for bbox recall (IoU=0.50):")
+        overall_table = [
+            ["Recall", "Matched/GT"],
+            [f"{overall_recall * 100:.3f}", f"{total_matched}/{total_gt}"],
+        ]
+        self._logger.info("\n" + tabulate(overall_table, headers="firstrow", tablefmt="pipe"))
+
+        per_cls_rows = []
+        for cls_idx, cls_name in enumerate(thing_classes):
+            cls_gt = int(gt_count[cls_idx])
+            if cls_gt == 0:
+                cls_recall = float("nan")
+            else:
+                cls_recall = float(matched_count[cls_idx]) / float(cls_gt) * 100.0
+            per_cls_rows.append([cls_name, cls_recall, f"{int(matched_count[cls_idx])}/{cls_gt}"])
+
+        if len(per_cls_rows) > 0:
+            self._logger.info("Per-category bbox Recall@50:")
+            self._logger.info(
+                "\n"
+                + tabulate(
+                    per_cls_rows,
+                    headers=["category", "R50", "Matched/GT"],
+                    tablefmt="pipe",
+                    floatfmt=".3f",
+                )
+            )
+
+        recall_dict = {"Recall@50": overall_recall * 100.0}
+        for cls_idx, cls_name in enumerate(thing_classes):
+            cls_gt = int(gt_count[cls_idx])
+            recall_dict[f"{cls_name}_R50"] = (
+                float(matched_count[cls_idx]) / float(cls_gt) * 100.0 if cls_gt > 0 else float("nan")
+            )
+        return recall_dict
 
     def _evaluate_scenegraphs(self, ground_truths, predictions):
         
@@ -296,7 +478,9 @@ class SceneGraphEvaluator(DatasetEvaluator):
         
         torch.save(self._evaluators['SGRecall'].result_dict, 'temp.pth')
         self._logger.info('Scene Graph Results for mode: {}'.format(self._mode))
-        print(result_str)
+        for line in result_str.rstrip("\n").split("\n"):
+            if line.strip():
+                self._logger.info(line)
         ret = OrderedDict()
         for k, v in self._evaluators['SGMeanRecall'].result_dict[self._mode + '_mean_recall'].items():
             ret['SGMeanRecall@{}'.format(k)] = float(v)

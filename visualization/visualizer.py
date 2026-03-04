@@ -80,6 +80,12 @@ class SceneGraphVisualizer:
         
         # Draw boxes and labels
         colors = plt.cm.get_cmap('tab20', len(self.thing_classes) if self.thing_classes else 20)
+        def _format_score(v):
+            # Avoid visually misleading "0.00" for tiny but non-zero confidences.
+            if v is None:
+                return ""
+            return f"{float(v):.4f}" if float(v) < 0.1 else f"{float(v):.2f}"
+
         for i, (box, label) in enumerate(zip(boxes, labels)):
             x1, y1, x2, y2 = box
             # Clip to image boundaries
@@ -103,7 +109,7 @@ class SceneGraphVisualizer:
                 # Draw label
                 label_text = self.thing_classes[label] if label < len(self.thing_classes) else f"Class {label}"
                 if scores is not None and i < len(scores):
-                    label_text += f" {scores[i]:.2f}"
+                    label_text += f" {_format_score(scores[i])}"
                 
                 ax.text(
                     x1, y1 - 5, label_text,
@@ -113,6 +119,27 @@ class SceneGraphVisualizer:
         
         # Draw relations
         if relations is not None and len(relations) > 0:
+            used_text_positions: List[Tuple[float, float]] = []
+            def _avoid_overlap(x, y):
+                # Small deterministic offsets when relation texts overlap.
+                candidate_offsets = [
+                    (0, 0), (0, -14), (0, 14), (14, 0), (-14, 0),
+                    (14, -14), (-14, -14), (14, 14), (-14, 14),
+                    (28, 0), (-28, 0),
+                ]
+                for dx, dy in candidate_offsets:
+                    cx, cy = x + dx, y + dy
+                    collision = False
+                    for ux, uy in used_text_positions:
+                        if abs(cx - ux) < 38 and abs(cy - uy) < 14:
+                            collision = True
+                            break
+                    if not collision:
+                        used_text_positions.append((cx, cy))
+                        return cx, cy
+                used_text_positions.append((x, y))
+                return x, y
+
             for rel in relations:
                 if len(rel) >= 3:
                     sub_idx, obj_idx, pred_idx = int(rel[0]), int(rel[1]), int(rel[2])
@@ -132,15 +159,16 @@ class SceneGraphVisualizer:
                         
                         # Draw predicate label at midpoint
                         pred_text = self.predicate_classes[pred_idx] if pred_idx < len(self.predicate_classes) else f"Pred {pred_idx}"
-                        if rel_scores is not None and len(rel_scores) > len(relations):
+                        if rel_scores is not None and len(rel_scores) >= len(relations):
                             # Find matching relation score
                             for j, r in enumerate(relations):
                                 if j < len(rel_scores) and r[0] == sub_idx and r[1] == obj_idx:
-                                    pred_text += f" {rel_scores[j]:.2f}"
+                                    pred_text += f" {_format_score(rel_scores[j])}"
                                     break
                         
                         mid_x = (sub_center[0] + obj_center[0]) / 2
                         mid_y = (sub_center[1] + obj_center[1]) / 2
+                        mid_x, mid_y = _avoid_overlap(mid_x, mid_y)
                         ax.text(
                             mid_x, mid_y, pred_text,
                             bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7),
