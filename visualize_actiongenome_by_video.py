@@ -10,7 +10,6 @@ import sys
 
 import numpy as np
 import torch
-from detectron2.layers import batched_nms
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
@@ -62,6 +61,50 @@ def _extract_relations(output):
     return relations, rel_scores_arr
 
 
+def _classwise_min_iou_nms(boxes: np.ndarray, scores: np.ndarray, labels: np.ndarray, thresh: float) -> np.ndarray:
+    """
+    Class-wise NMS using minIoU = inter / min(area_a, area_b).
+    This suppresses near-duplicate detections where one box largely contains another.
+    """
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    keep_all = []
+    for cls in np.unique(labels):
+        cls_idx = np.where(labels == cls)[0]
+        if cls_idx.size == 0:
+            continue
+        order = cls_idx[np.argsort(scores[cls_idx])[::-1]]
+        cls_keep = []
+        while order.size > 0:
+            i = int(order[0])
+            cls_keep.append(i)
+            if order.size == 1:
+                break
+            rest = order[1:]
+
+            xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+            yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+            xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+            yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+            inter_w = np.maximum(0.0, xx2 - xx1)
+            inter_h = np.maximum(0.0, yy2 - yy1)
+            inter = inter_w * inter_h
+
+            area_i = max((boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1]), 1e-6)
+            area_rest = np.maximum((boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1]), 1e-6)
+            min_area = np.minimum(area_i, area_rest)
+            miniou = inter / min_area
+
+            order = rest[miniou <= thresh]
+        keep_all.extend(cls_keep)
+
+    # Keep deterministic order by score desc after suppression.
+    keep_all = np.array(keep_all, dtype=np.int64)
+    keep_all = keep_all[np.argsort(scores[keep_all])[::-1]]
+    return keep_all
+
+
 def build_cfg(args):
     cfg = get_cfg()
     add_dataset_config(cfg)
@@ -90,9 +133,11 @@ def main():
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--rel-score-thresh", type=float, default=0.2)
     parser.add_argument("--box-score-thresh", type=float, default=0.0)
-    parser.add_argument("--force-keep-person", type=int, default=1, help="1=always keep top-scoring person box if exists")
-    parser.add_argument("--classwise-nms-iou", type=float, default=0.4)
+    # force-keep-person 已废弃，保留参数仅为兼容旧命令行
+    parser.add_argument("--force-keep-person", type=int, default=0, help="(deprecated) kept for backward compatibility")
+    parser.add_argument("--classwise-miniou-thresh", type=float, default=0.9)
     parser.add_argument("--debug-person-scores", type=int, default=0, help="1=print person score stats")
+    parser.add_argument("--person-score-scale", type=float, default=1.0, help=">1.0 to boost person scores only (for vis)")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -124,14 +169,15 @@ def main():
                 scores = instances.scores.cpu().numpy() if hasattr(instances, "scores") else None
                 relations, rel_scores = _extract_relations(output_per_image)
 
-                # Class-wise NMS before visualization to suppress same-label duplicates.
+                # Class-wise minIoU-NMS before visualization to suppress same-label duplicates,
+                # including "large box covering small box" cases.
                 if scores is not None and len(scores) > 0:
-                    nms_keep = batched_nms(
-                        instances.pred_boxes.tensor,
-                        instances.scores,
-                        instances.pred_classes,
-                        float(args.classwise_nms_iou),
-                    ).cpu().numpy()
+                    nms_keep = _classwise_min_iou_nms(
+                        boxes=boxes,
+                        scores=scores,
+                        labels=labels,
+                        thresh=float(args.classwise_miniou_thresh),
+                    )
                     if len(nms_keep) < len(scores):
                         keep_set = {int(i) for i in nms_keep.tolist()}
                         remap = {int(old): int(new) for new, old in enumerate(nms_keep.tolist())}
@@ -151,23 +197,20 @@ def main():
 
                 box_thresh = args.box_score_thresh
                 if scores is not None:
+                    # 仅在可视化阶段对 person 类别进行 score 缩放，不影响评测逻辑
+                    if args.person_score_scale != 1.0 and hasattr(metadata, "thing_classes") and "person" in metadata.thing_classes:
+                        person_class_idx = metadata.thing_classes.index("person")
+                        person_mask = labels == person_class_idx
+                        if person_mask.any():
+                            orig = scores[person_mask].copy()
+                            scores[person_mask] = np.clip(scores[person_mask] * args.person_score_scale, 0.0, 1.0)
+                            if args.debug_person_scores:
+                                print(
+                                    f"[VIS_DEBUG] image={os.path.basename(str(input_per_image.get('file_name', 'unknown')))} "
+                                    f"person_scores_before_min={orig.min():.6f} max={orig.max():.6f} "
+                                    f"after_min={scores[person_mask].min():.6f} max={scores[person_mask].max():.6f}"
+                                )
                     keep = scores >= box_thresh
-                    if args.force_keep_person:
-                        person_class_idx = None
-                        if hasattr(metadata, "thing_classes") and "person" in metadata.thing_classes:
-                            person_class_idx = metadata.thing_classes.index("person")
-                        if person_class_idx is not None:
-                            person_candidates = np.where(labels == person_class_idx)[0]
-                            if person_candidates.size > 0:
-                                best_person_idx = int(person_candidates[np.argmax(scores[person_candidates])])
-                                keep[best_person_idx] = True
-                                if args.debug_person_scores:
-                                    person_scores = scores[person_candidates]
-                                    print(
-                                        f"[VIS_DEBUG] image={os.path.basename(str(input_per_image.get('file_name', 'unknown')))} "
-                                        f"person_scores_min={person_scores.min():.6f} max={person_scores.max():.6f} "
-                                        f"mean={person_scores.mean():.6f} kept_best={scores[best_person_idx]:.6f}"
-                                    )
                     if keep.sum() == 0:
                         keep[int(scores.argmax())] = True
                     boxes = boxes[keep]

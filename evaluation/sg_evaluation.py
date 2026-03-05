@@ -23,7 +23,6 @@ from detectron2.data import MetadataCatalog
 from detectron2.evaluation.evaluator import DatasetEvaluator
 from detectron2.evaluation import COCOEvaluator
 from detectron2.structures.boxes import pairwise_iou, Boxes
-from detectron2.layers import batched_nms
 from detectron2.utils.registry import Registry
 
 
@@ -147,7 +146,11 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 pred_rel_scores.to(self._cpu_device) if pred_rel_scores is not None else None,
                 pred_rel_labels.to(self._cpu_device) if pred_rel_labels is not None else None,
                 query_index.to(self._cpu_device) if query_index is not None else None,
-                iou_thresh=getattr(self.cfg.TEST.RELATION, "CLASSWISE_NMS_THRESH", 0.4),
+                iou_thresh=getattr(
+                    self.cfg.TEST.RELATION,
+                    "CLASSWISE_MINIOU_THRESH",
+                    getattr(self.cfg.TEST.RELATION, "CLASSWISE_NMS_THRESH", 0.9),
+                ),
             )
             processed_outputs.append(
                 {
@@ -257,7 +260,7 @@ class SceneGraphEvaluator(DatasetEvaluator):
         boxes = instances.pred_boxes.tensor
         scores = instances.scores
         classes = instances.pred_classes
-        keep = batched_nms(boxes, scores, classes, float(iou_thresh))
+        keep = self._classwise_min_iou_keep_indices(boxes, scores, classes, float(iou_thresh))
         keep = keep.long()
         if keep.numel() == len(instances):
             return instances, rel_pair_idxs, pred_rel_scores, pred_rel_labels, query_index
@@ -299,6 +302,57 @@ class SceneGraphEvaluator(DatasetEvaluator):
         new_query_index = query_index.index_select(0, valid_rel_idx) if query_index is not None else query_index
 
         return new_instances, new_rel_pair_idxs, new_pred_rel_scores, new_pred_rel_labels, new_query_index
+
+    def _classwise_min_iou_keep_indices(self, boxes, scores, classes, thresh):
+        """
+        Class-wise NMS using minIoU = inter / min(area_a, area_b).
+        Better at suppressing nested duplicates (large box almost covering small box).
+        """
+        device = boxes.device
+        if boxes.numel() == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        keep_all = []
+        unique_classes = torch.unique(classes)
+        for cls in unique_classes:
+            cls_idx = torch.where(classes == cls)[0]
+            if cls_idx.numel() == 0:
+                continue
+            cls_scores = scores[cls_idx]
+            order = cls_idx[torch.argsort(cls_scores, descending=True)]
+            cls_keep = []
+            while order.numel() > 0:
+                i = order[0]
+                cls_keep.append(i)
+                if order.numel() == 1:
+                    break
+                rest = order[1:]
+
+                b_i = boxes[i]
+                b_r = boxes[rest]
+
+                xx1 = torch.maximum(b_i[0], b_r[:, 0])
+                yy1 = torch.maximum(b_i[1], b_r[:, 1])
+                xx2 = torch.minimum(b_i[2], b_r[:, 2])
+                yy2 = torch.minimum(b_i[3], b_r[:, 3])
+                inter_w = torch.clamp(xx2 - xx1, min=0.0)
+                inter_h = torch.clamp(yy2 - yy1, min=0.0)
+                inter = inter_w * inter_h
+
+                area_i = torch.clamp((b_i[2] - b_i[0]) * (b_i[3] - b_i[1]), min=1e-6)
+                area_r = torch.clamp((b_r[:, 2] - b_r[:, 0]) * (b_r[:, 3] - b_r[:, 1]), min=1e-6)
+                min_area = torch.minimum(area_i, area_r)
+                miniou = inter / min_area
+
+                keep_mask = miniou <= thresh
+                order = rest[keep_mask]
+            keep_all.extend(cls_keep)
+
+        if len(keep_all) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+        keep = torch.stack(keep_all).long()
+        keep = keep[torch.argsort(scores[keep], descending=True)]
+        return keep
 
     def evaluate(self):
         #First evaluate the detection precisions

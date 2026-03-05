@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # 参数: checkpoint（可选）；NUM_IMAGES；DATASET_NAME；RUN_EVAL；NUM_GPUS（评测用）
-DEFAULT_CKPT="z_outputs/sam3_80000iters_from_pretrained_full_train/model_final.pth"
+DEFAULT_CKPT="z_outputs/sam3_80000iters_from_pretrained_full_train/model_0079999.pth"
 CHECKPOINT="${1:-${CHECKPOINT:-${DEFAULT_CKPT}}}"
 NUM_IMAGES="${2:-${NUM_IMAGES:-1000}}"
 DATASET_NAME="${3:-${DATASET_NAME:-AG_val}}"
@@ -68,8 +68,14 @@ AG_FRAMES="${AG_FRAMES:-dataset/frames}"
 AG_VIDEOS="${AG_VIDEOS:-dataset/videos}"
 PORT="${PORT:-29500}"
 REL_SCORE_THRESH="${REL_SCORE_THRESH:-0.05}"
-BOX_SCORE_THRESH="${BOX_SCORE_THRESH:-0.0}"
-FORCE_KEEP_PERSON="${FORCE_KEEP_PERSON:-1}"
+BOX_SCORE_THRESH="${BOX_SCORE_THRESH:-0.1}"
+CLASSWISE_MINIOU_THRESH="${CLASSWISE_MINIOU_THRESH:-0.6}"
+FORCE_KEEP_PERSON=0
+PERSON_SCORE_BOOST="${PERSON_SCORE_BOOST:-true}"   # 1/true/yes/y -> person 分数放大
+PERSON_SCORE_SCALE="1.0"
+case "$(echo "${PERSON_SCORE_BOOST}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|y) PERSON_SCORE_SCALE="500.0" ;;
+esac
 
 python "${VIS_SCRIPT}" \
   --config-file "${CONFIG}" \
@@ -79,7 +85,9 @@ python "${VIS_SCRIPT}" \
   --num-images "${NUM_IMAGES}" \
   --rel-score-thresh "${REL_SCORE_THRESH}" \
   --box-score-thresh "${BOX_SCORE_THRESH}" \
+  --classwise-miniou-thresh "${CLASSWISE_MINIOU_THRESH}" \
   --force-keep-person "${FORCE_KEEP_PERSON}" \
+  --person-score-scale "${PERSON_SCORE_SCALE}" \
   DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
   DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
   DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
