@@ -6,7 +6,7 @@
 #   - NUM_GPUS  : 评测使用的 GPU 数（默认 2）
 #
 # 说明:
-#   - 本脚本只做 eval-only + 可视化，不再发起训练。
+#   - 本脚本只做 eval-only ，不再发起训练。
 #   - 路径、数据集配置与 run_actiongenome_train_eval.sh 保持一致，方便无缝切换。
 
 set -euo pipefail
@@ -19,7 +19,7 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_150000iters_unfreeze_backbone_reduce_person_weight}"
+OUTPUT_DIR="${1:-z_outputs/sam3_80000iters_from_pretrained_full_train}"
 NUM_GPUS="${2:-2}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
@@ -187,32 +187,3 @@ if [[ "${EVAL_OVERFIT_TRAIN}" == "1" ]]; then
 else
   echo "[EVAL-ONLY] Skip AG_train overfit evaluation (EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN})"
 fi
-
-# -----------------------------
-# 4) 可视化：在 OUTPUT_DIR/vis_<ck_tag> 下按 视频/帧 保存推理结果
-# -----------------------------
-VIS_SCRIPT="visualize_actiongenome_by_video.py"
-if [[ -f "${CHECKPOINT}" && -f "${VIS_SCRIPT}" ]]; then
-  VIS_DIR="${OUTPUT_DIR}/vis_${ck_tag}"
-  mkdir -p "${VIS_DIR}"
-  echo "[EVAL-ONLY] Saving per-video, per-frame visualizations to ${VIS_DIR} ..."
-  python "${VIS_SCRIPT}" \
-    --config-file "${CONFIG}" \
-    --model-weights "${CHECKPOINT}" \
-    --output-dir "${VIS_DIR}" \
-    --dataset-name "AG_val" \
-    --num-images "${VIS_MAX_IMAGES}" \
-    DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
-    DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
-    DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
-    ${OPTS:-}
-  echo "[EVAL-ONLY] Visualization done: ${VIS_DIR}"
-else
-  if [[ ! -f "${VIS_SCRIPT}" ]]; then
-    echo "[EVAL-ONLY] Script ${VIS_SCRIPT} not found, skip visualization."
-  fi
-fi
-
-echo "[EVAL-ONLY] All done. OUTPUT_DIR=${OUTPUT_DIR}"
-
-

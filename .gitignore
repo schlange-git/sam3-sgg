@@ -9,6 +9,7 @@ dist/
 build/
 data/featuremaps
 dataset/
+dataset-full/
 
 # Training outputs
 output*/

@@ -22,7 +22,7 @@ DEFAULT_CKPT="z_outputs/sam3_80000iters_from_pretrained_full_train/model_0079999
 CHECKPOINT="${1:-${CHECKPOINT:-${DEFAULT_CKPT}}}"
 NUM_IMAGES="${2:-${NUM_IMAGES:-1000}}"
 DATASET_NAME="${3:-${DATASET_NAME:-AG_val}}"
-RUN_EVAL="${4:-${RUN_EVAL:-true}}"
+RUN_EVAL="${4:-${RUN_EVAL:-false}}"
 NUM_GPUS="${5:-${NUM_GPUS:-2}}"
 
 # 归一化 RUN_EVAL

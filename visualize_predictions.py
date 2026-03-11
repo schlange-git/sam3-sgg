@@ -131,12 +131,12 @@ def visualize_gt(cfg, output_dir: str, dataset_name: str, num_images: int):
         for input_per_image in batch:
             if count >= num_images:
                 break
-            
+
             # Extract GT boxes and labels
             instances = input_per_image.get("instances")
             if instances is None or not hasattr(instances, "gt_boxes"):
                 continue
-            
+
             # Get original image dimensions
             height = input_per_image.get("height")
             width = input_per_image.get("width")
@@ -150,28 +150,28 @@ def visualize_gt(cfg, output_dir: str, dataset_name: str, num_images: int):
                 else:
                     logger.warning(f"Could not determine image size for count={count}, skipping")
                     continue
-            
+
             # Convert boxes from transformed coordinates back to original image coordinates
             # The boxes in instances are in transformed image space, need to convert back
             # Get transformed image size
             transformed_h, transformed_w = instances.image_size
-            
+
             # Calculate scale factors
             scale_x = width / transformed_w
             scale_y = height / transformed_h
-            
+
             # Scale boxes from transformed space to original space
             boxes_tensor = instances.gt_boxes.tensor.cpu().numpy()
             boxes = boxes_tensor.copy()
             boxes[:, [0, 2]] *= scale_x  # x coordinates
             boxes[:, [1, 3]] *= scale_y  # y coordinates
-            
+
             # Clip boxes to image boundaries
             boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, width)
             boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, height)
-            
+
             labels = instances.gt_classes.cpu().numpy()
-            
+
             # Extract GT relations
             # Relations format in dataset: [subject_idx, object_idx, predicate] (predicate is 0-indexed)
             # From visual_genome.py: relations = np.column_stack((objects, predicates))
@@ -194,7 +194,7 @@ def visualize_gt(cfg, output_dir: str, dataset_name: str, num_images: int):
                     relations = np.zeros((0, 3), dtype=np.int64)
             else:
                 relations = np.zeros((0, 3), dtype=np.int64)
-            
+
             file_name = input_per_image.get("file_name")
             image_id = input_per_image.get("image_id")
             if image_id is None:

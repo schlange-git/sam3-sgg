@@ -176,6 +176,35 @@ class ActionGenomeTrainData:
             return boxes
         return []
 
+    def _get_annotation_size(self, frame_key):
+        """Return annotation coordinate size (w, h) for a frame, if available."""
+        person_item = self.person_anno.get(frame_key, {})
+        if isinstance(person_item, dict):
+            bbox_size = person_item.get("bbox_size")
+            if isinstance(bbox_size, (list, tuple)) and len(bbox_size) == 2:
+                try:
+                    w = float(bbox_size[0])
+                    h = float(bbox_size[1])
+                    if w > 1 and h > 1:
+                        return w, h
+                except Exception:
+                    pass
+        return None
+
+    def _scale_box_to_image(self, box, scale_x, scale_y, width, height):
+        x1, y1, x2, y2 = box
+        x1 *= scale_x
+        x2 *= scale_x
+        y1 *= scale_y
+        y2 *= scale_y
+        x1 = min(max(x1, 0.0), float(width))
+        x2 = min(max(x2, 0.0), float(width))
+        y1 = min(max(y1, 0.0), float(height))
+        y2 = min(max(y2, 0.0), float(height))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return [x1, y1, x2, y2]
+
     def _build_dataset_dicts(self):
         dataset_dicts = []
         image_id = 0
@@ -196,12 +225,25 @@ class ActionGenomeTrainData:
             except Exception:
                 continue
 
+            # AG bbox coordinates are defined in annotation-space (often <= 480px side),
+            # and may differ from the currently extracted frame resolution.
+            anno_size = self._get_annotation_size(frame_key)
+            if anno_size is not None:
+                anno_w, anno_h = anno_size
+                scale_x = float(width) / float(anno_w)
+                scale_y = float(height) / float(anno_h)
+            else:
+                scale_x, scale_y = 1.0, 1.0
+
             annotations = []
             relations = []
 
             # Person instances first; AG relations are mainly person-object.
             person_boxes = self._extract_person_boxes(self.person_anno.get(frame_key, {}))
             for pb in person_boxes:
+                if pb is None:
+                    continue
+                pb = self._scale_box_to_image(pb, scale_x, scale_y, width, height)
                 if pb is None:
                     continue
                 annotations.append(
@@ -216,6 +258,9 @@ class ActionGenomeTrainData:
             objects = self.object_anno.get(frame_key, [])
             for obj in objects:
                 bbox = _parse_bbox_xyxy(obj.get("bbox"))
+                if bbox is None:
+                    continue
+                bbox = self._scale_box_to_image(bbox, scale_x, scale_y, width, height)
                 if bbox is None:
                     continue
                 cls_name = str(obj.get("class", "object"))
