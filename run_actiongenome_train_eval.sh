@@ -28,9 +28,9 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_80000iters_from_pretrained_full_train}"
+OUTPUT_DIR="${1:-z_outputs/sam3_temporal_debug}"
 NUM_GPUS="${2:-2}"
-NUM_VIDEOS_TRAIN="${3:--1}"
+NUM_VIDEOS_TRAIN="${3:-10}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29500}"
@@ -63,23 +63,10 @@ DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-/root/result/sam3_predtrain_detr_detecti
 # 是否将 DETR_HEAD_WEIGHTS 作为 MODEL.WEIGHTS 全量加载（true/1=全量；false/0=仅 HEAD_WEIGHTS+LOAD_HEAD_ONLY）
 # 兼容旧变量 LOAD_FULL_DETR_WEIGHTS；默认 1（完整加载）
 DETR_LOAD_FULL_WEIGHTS="${DETR_LOAD_FULL_WEIGHTS:-${LOAD_FULL_DETR_WEIGHTS:-1}}"
-# SAM3 两阶段训练：>0 时先冻结训练 N iters，再自动解冻继续到配置 MAX_ITER；=0 为单阶段
-SAM3_UNFREEZE_ITER="${SAM3_UNFREEZE_ITER:-80000}"
-# 两阶段可分别设置 batch size（留空=沿用配置文件中的 SOLVER.IMS_PER_BATCH）
-PHASE1_IMS_PER_BATCH="${PHASE1_IMS_PER_BATCH:-18}"
-PHASE2_IMS_PER_BATCH="${PHASE2_IMS_PER_BATCH:-4}"
-# Phase2 独立输出目录（默认不覆盖 Phase1）
-PHASE2_OUTPUT_DIR="${PHASE2_OUTPUT_DIR:-${OUTPUT_DIR}/phase2_unfreeze}"
-# Phase2 独立超参（留空=沿用配置）
-PHASE2_MAX_ITER="${PHASE2_MAX_ITER:-40000}"
-PHASE2_BASE_LR="${PHASE2_BASE_LR:-0.0001}"
-PHASE2_STEPS="${PHASE2_STEPS:-(28000, 36000)}"
-PHASE2_WARMUP_ITERS="${PHASE2_WARMUP_ITERS:-2000}"
-PHASE2_WARMUP_FACTOR="${PHASE2_WARMUP_FACTOR:-0.001}"
 # 是否额外在 overfit 训练集上评测（1/0）
-EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-0}"
+EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-1}"
 # 可视化最大图片数（-1 = 全部）
-VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-1000}"
+VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-100}"
 
 echo "=============================================="
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
@@ -89,15 +76,6 @@ echo "SAM3_CHECKPOINT_PATH=${SAM3_CHECKPOINT_PATH}"
 echo "BACKBONE_WEIGHTS=${BACKBONE_WEIGHTS} (ignored if SAM3.ENABLED=True)"
 echo "DETR_HEAD_WEIGHTS=${DETR_HEAD_WEIGHTS}"
 echo "DETR_LOAD_FULL_WEIGHTS=${DETR_LOAD_FULL_WEIGHTS}"
-echo "SAM3_UNFREEZE_ITER=${SAM3_UNFREEZE_ITER}"
-echo "PHASE1_IMS_PER_BATCH=${PHASE1_IMS_PER_BATCH:-<config>}"
-echo "PHASE2_IMS_PER_BATCH=${PHASE2_IMS_PER_BATCH:-<config>}"
-echo "PHASE2_OUTPUT_DIR=${PHASE2_OUTPUT_DIR}"
-echo "PHASE2_MAX_ITER=${PHASE2_MAX_ITER:-<config>}"
-echo "PHASE2_BASE_LR=${PHASE2_BASE_LR:-<config>}"
-echo "PHASE2_STEPS=${PHASE2_STEPS:-<config>}"
-echo "PHASE2_WARMUP_ITERS=${PHASE2_WARMUP_ITERS:-<config>}"
-echo "PHASE2_WARMUP_FACTOR=${PHASE2_WARMUP_FACTOR:-<config>}"
 echo "EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN}"
 echo "VIS_MAX_IMAGES=${VIS_MAX_IMAGES}"
 echo "=============================================="
@@ -106,24 +84,6 @@ echo "=============================================="
 LOAD_FULL_DETR_VAL="0"
 if [[ "$(echo "${DETR_LOAD_FULL_WEIGHTS}" | tr '[:upper:]' '[:lower:]')" == "true" || "${DETR_LOAD_FULL_WEIGHTS}" == "1" ]]; then
   LOAD_FULL_DETR_VAL="1"
-fi
-
-# 校验两阶段 batch size（若提供则必须为正整数）
-if [[ -n "${PHASE1_IMS_PER_BATCH}" ]] && ! [[ "${PHASE1_IMS_PER_BATCH}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "错误: PHASE1_IMS_PER_BATCH 必须是正整数或留空，当前值=${PHASE1_IMS_PER_BATCH}"
-  exit 1
-fi
-if [[ -n "${PHASE2_IMS_PER_BATCH}" ]] && ! [[ "${PHASE2_IMS_PER_BATCH}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "错误: PHASE2_IMS_PER_BATCH 必须是正整数或留空，当前值=${PHASE2_IMS_PER_BATCH}"
-  exit 1
-fi
-if [[ -n "${PHASE2_MAX_ITER}" ]] && ! [[ "${PHASE2_MAX_ITER}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "错误: PHASE2_MAX_ITER 必须是正整数或留空，当前值=${PHASE2_MAX_ITER}"
-  exit 1
-fi
-if [[ -n "${PHASE2_WARMUP_ITERS}" ]] && ! [[ "${PHASE2_WARMUP_ITERS}" =~ ^[0-9]+$ ]]; then
-  echo "错误: PHASE2_WARMUP_ITERS 必须是非负整数或留空，当前值=${PHASE2_WARMUP_ITERS}"
-  exit 1
 fi
 
 # 确定 MODEL.WEIGHTS 初值：全量加载时用 DETR_HEAD_WEIGHTS，否则用 BACKBONE_WEIGHTS
@@ -267,82 +227,14 @@ run_train_phase() {
 }
 
 # -----------------------------
-# 1) 训练（带内存监控）
+# 1) 训练（单阶段，带内存监控）
 # -----------------------------
 FINAL_OUTPUT_DIR="${OUTPUT_DIR}"
-if [[ "${SAM3_UNFREEZE_ITER}" -gt 0 ]]; then
-  # 两阶段训练
-  CONFIG_MAX_ITER=$(grep -E "^\s*MAX_ITER:" "${CONFIG}" 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*//' | tr -d '\r' || echo "150000")
-  echo "[两阶段训练] Phase 1: FREEZE=True, MAX_ITER=${SAM3_UNFREEZE_ITER}, IMS_PER_BATCH=${PHASE1_IMS_PER_BATCH:-<config>}"
-  PHASE1_EXTRA=(SOLVER.MAX_ITER "${SAM3_UNFREEZE_ITER}" MODEL.SAM3.FREEZE "True")
-  if [[ -n "${PHASE1_IMS_PER_BATCH}" ]]; then
-    PHASE1_EXTRA+=(SOLVER.IMS_PER_BATCH "${PHASE1_IMS_PER_BATCH}")
-  fi
-  if run_train_phase "${RESUME_ARGS[@]}" "${PHASE1_EXTRA[@]}"; then
-    :
-  else
-    echo "Phase 1 训练异常退出"
-    exit 1
-  fi
-  # 重检测最新 checkpoint 并启动 Phase 2
-  LATEST_CKPT=""
-  if [[ -d "${OUTPUT_DIR}" ]]; then
-    shopt -s nullglob
-    CKPT_CANDIDATES=("${OUTPUT_DIR}"/*.pth)
-    shopt -u nullglob
-    if (( ${#CKPT_CANDIDATES[@]} > 0 )); then
-      IFS=$'\n' SORTED_CKPTS=($(ls -1t "${CKPT_CANDIDATES[@]}"))
-      unset IFS
-      LATEST_CKPT="${SORTED_CKPTS[0]}"
-    fi
-  fi
-  if [[ -z "${LATEST_CKPT}" ]]; then
-    echo "Phase 1 完成但未找到 checkpoint，跳过 Phase 2"
-    exit 1
-  fi
-  PHASE2_EFFECTIVE_MAX_ITER="${PHASE2_MAX_ITER:-${CONFIG_MAX_ITER}}"
-  echo "[两阶段训练] Phase 2: load weights from ${LATEST_CKPT}, FREEZE=False, OUTPUT_DIR=${PHASE2_OUTPUT_DIR}, MAX_ITER=${PHASE2_EFFECTIVE_MAX_ITER}, IMS_PER_BATCH=${PHASE2_IMS_PER_BATCH:-<config>} (no --resume)"
-  PHASE2_EXTRA=(
-    OUTPUT_DIR "${PHASE2_OUTPUT_DIR}"
-    MODEL.WEIGHTS "${LATEST_CKPT}"
-    MODEL.SAM3.FREEZE "False"
-    SOLVER.MAX_ITER "${PHASE2_EFFECTIVE_MAX_ITER}"
-  )
-  if [[ -n "${PHASE2_IMS_PER_BATCH}" ]]; then
-    PHASE2_EXTRA+=(SOLVER.IMS_PER_BATCH "${PHASE2_IMS_PER_BATCH}")
-  fi
-  if [[ -n "${PHASE2_BASE_LR}" ]]; then
-    PHASE2_EXTRA+=(SOLVER.BASE_LR "${PHASE2_BASE_LR}")
-  fi
-  if [[ -n "${PHASE2_STEPS}" ]]; then
-    PHASE2_EXTRA+=(SOLVER.STEPS "${PHASE2_STEPS}")
-  fi
-  if [[ -n "${PHASE2_WARMUP_ITERS}" ]]; then
-    PHASE2_EXTRA+=(SOLVER.WARMUP_ITERS "${PHASE2_WARMUP_ITERS}")
-  fi
-  if [[ -n "${PHASE2_WARMUP_FACTOR}" ]]; then
-    PHASE2_EXTRA+=(SOLVER.WARMUP_FACTOR "${PHASE2_WARMUP_FACTOR}")
-  fi
-  # 解冻后参数组会变化，不能继续恢复 Phase 1 的 optimizer/scheduler 状态
-  # 这里仅加载模型权重，不使用 --resume，避免 "different number of parameter groups"
-  if run_train_phase "${PHASE2_EXTRA[@]}"; then
-    FINAL_OUTPUT_DIR="${PHASE2_OUTPUT_DIR}"
-    if [[ -f "${FINAL_OUTPUT_DIR}/model_final.pth" ]]; then
-      cp -f "${FINAL_OUTPUT_DIR}/model_final.pth" "${FINAL_OUTPUT_DIR}/model_unfreeze_final.pth"
-    fi
-    :
-  else
-    echo "Phase 2 训练异常退出"
-    exit 1
-  fi
+if run_train_phase "${RESUME_ARGS[@]}"; then
+  :
 else
-  # 单阶段
-  if run_train_phase "${RESUME_ARGS[@]}"; then
-    :
-  else
-    echo "训练进程异常退出"
-    exit 1
-  fi
+  echo "训练进程异常退出"
+  exit 1
 fi
 
 echo "Training finished. Output: ${FINAL_OUTPUT_DIR}"

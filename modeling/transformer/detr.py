@@ -1,7 +1,6 @@
 """
 DETR model and criterion classes.
 """
-from multiprocessing import Condition
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -14,6 +13,7 @@ import copy
 import numpy as np
 from detectron2.utils.registry import Registry
 import math 
+from ..temporal.object_memory import ObjectMemoryBank
 
 DETR_REGISTRY = Registry("DETR_REGISTRY")
 
@@ -61,6 +61,29 @@ class TemporalAggregator(nn.Module):
         h_expand = h_new.expand(x_proj.shape[0], -1, -1, -1)
         # Return temporally enhanced feature with unchanged shape.
         return gate * h_expand + (1.0 - gate) * x_proj
+
+
+class TemporalQueryInjector(nn.Module):
+    """Inject memory queries into the first K object query slots."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.memory_proj = nn.Linear(d_model, d_model)
+        self.memory_type_embed = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.memory_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, base_queries_qbd: torch.Tensor, memory_queries_bmd: torch.Tensor) -> torch.Tensor:
+        if memory_queries_bmd is None:
+            return base_queries_qbd
+        q = base_queries_qbd.clone()
+        q_len = q.shape[0]
+        m_len = memory_queries_bmd.shape[1]
+        k = min(q_len, m_len)
+        if k <= 0:
+            return q
+        memory_q = memory_queries_bmd[:, :k, :].transpose(0, 1)  # [k, B, D]
+        q[:k] = q[:k] + self.memory_scale * self.memory_proj(memory_q) + self.memory_type_embed
+        return q
 
 
 @DETR_REGISTRY.register()
@@ -139,12 +162,24 @@ class IterativeRelationDETR(DETR):
         self.multiply_query = cfg.MODEL.DETR.MULTIPLY_QUERY
         self.temporal_enabled = bool(getattr(cfg.MODEL.TEMPORAL, "ENABLED", False))
         self.temporal_eval = bool(getattr(cfg.MODEL.TEMPORAL, "EVAL_ENABLED", False))
+        self.temporal_mode = str(getattr(cfg.MODEL.TEMPORAL, "MODE", "feature_ema")).lower()
         self.temporal_agg = None
-        if self.temporal_enabled:
+        self.query_injector = None
+        self.object_memory_bank = None
+        self._memory_states = {}
+        if self.temporal_enabled and self.temporal_mode == "feature_ema":
             alpha_init = float(getattr(cfg.MODEL.TEMPORAL, "ALPHA_INIT", 0.7))
             self.temporal_agg = TemporalAggregator(
                 hidden_dim=transformer.d_model, alpha_init=alpha_init
             )
+        if self.temporal_enabled and self.temporal_mode == "object_query_memory_v1":
+            self.query_injector = TemporalQueryInjector(transformer.d_model)
+            self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
+
+    def reset_temporal_memory(self):
+        self._memory_states = {}
+        if self.temporal_agg is not None:
+            self.temporal_agg.reset()
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -170,7 +205,43 @@ class IterativeRelationDETR(DETR):
         if self.temporal_agg is not None and (self.training or self.temporal_eval):
             video_ids = getattr(samples, "video_ids", None)
             src = self.temporal_agg(src, video_ids)
-        output = self.transformer(self.input_proj(src), mask, self.query_embed.weight, self.object_query_embed.weight, self.relation_query_embed.weight, pos[-1])
+
+        bs = src.shape[0]
+        subject_embed = self.query_embed.weight
+        object_embed = self.object_query_embed.weight
+        relation_embed = self.relation_query_embed.weight
+
+        # Object-query memory mode: inject memory into subject/object query embeddings.
+        if (
+            self.query_injector is not None
+            and self.object_memory_bank is not None
+            and (self.training or self.temporal_eval)
+        ):
+            video_ids = getattr(samples, "video_ids", None)
+            if video_ids is None:
+                video_ids = [None] * bs
+            memory_batch = []
+            for i in range(bs):
+                vid = str(video_ids[i]) if video_ids[i] is not None else "__novid__"
+                state = self._memory_states.get(vid)
+                if state is None:
+                    state = self.object_memory_bank.init_empty(src.device)
+                memory_batch.append(self.object_memory_bank.get_memory_queries(state))
+            memory_batch = torch.stack(memory_batch, dim=0)  # [B, M, D]
+
+            subject_bqd = subject_embed.unsqueeze(1).repeat(1, bs, 1)
+            object_bqd = object_embed.unsqueeze(1).repeat(1, bs, 1)
+            subject_embed = self.query_injector(subject_bqd, memory_batch)
+            object_embed = self.query_injector(object_bqd, memory_batch)
+
+        output = self.transformer(
+            self.input_proj(src),
+            mask,
+            subject_embed,
+            object_embed,
+            relation_embed,
+            pos[-1],
+        )
 
         if self.only_predicate_multiply:
             output['relation_subject_logits'] = output['relation_subject_logits'].repeat_interleave(self.multiply_query,2)
@@ -186,11 +257,34 @@ class IterativeRelationDETR(DETR):
         out['relation_object_logits'] = output['relation_object_logits'][-1]
         out['relation_subject_boxes'] = output['relation_subject_coords'][-1]
         out['relation_object_boxes'] = output['relation_object_coords'][-1]
+        out['hs_subject_last'] = output.get('hs_subject_last')
+        out['hs_object_last'] = output.get('hs_object_last')
+        out['hs_relation_last'] = output.get('hs_relation_last')
 
         if self.aux_loss:
             out['aux_outputs_r'] = self._set_aux_loss(output['relation_logits'], output['relation_coords'])
             out['aux_outputs_r_sub'] = self._set_aux_loss(output['relation_subject_logits'], output['relation_subject_coords'])
             out['aux_outputs_r_obj'] = self._set_aux_loss(output['relation_object_logits'], output['relation_object_coords'])
+
+        # Update memory after each step using current frame predictions.
+        if (
+            self.object_memory_bank is not None
+            and (self.training or self.temporal_eval)
+            and out.get('hs_subject_last') is not None
+        ):
+            video_ids = getattr(samples, "video_ids", None)
+            if video_ids is None:
+                video_ids = [None] * bs
+            for i in range(bs):
+                vid = str(video_ids[i]) if video_ids[i] is not None else "__novid__"
+                state = self._memory_states.get(vid)
+                if state is None:
+                    state = self.object_memory_bank.init_empty(src.device)
+                hs_obj = torch.cat([out['hs_subject_last'][i], out['hs_object_last'][i]], dim=0)
+                pred_logits = torch.cat([out['relation_subject_logits'][i], out['relation_object_logits'][i]], dim=0)
+                pred_boxes = torch.cat([out['relation_subject_boxes'][i], out['relation_object_boxes'][i]], dim=0)
+                state = self.object_memory_bank.update(state, hs_obj, pred_logits, pred_boxes)
+                self._memory_states[vid] = state
         return out
 
     @torch.jit.unused

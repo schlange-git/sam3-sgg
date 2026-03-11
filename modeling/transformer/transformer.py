@@ -125,9 +125,18 @@ class IterativeRelationTransformer(nn.Module):
         mask = mask.flatten(1)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
 
-        subject_query_embed = subject_embed.unsqueeze(1).repeat(1, bs, 1)
-        object_query_embed = object_embed.unsqueeze(1).repeat(1, bs, 1)
-        relation_query_embed = relation_embed.unsqueeze(1).repeat(1, bs, 1)
+        if subject_embed.dim() == 2:
+            subject_query_embed = subject_embed.unsqueeze(1).repeat(1, bs, 1)
+        else:
+            subject_query_embed = subject_embed
+        if object_embed.dim() == 2:
+            object_query_embed = object_embed.unsqueeze(1).repeat(1, bs, 1)
+        else:
+            object_query_embed = object_embed
+        if relation_embed.dim() == 2:
+            relation_query_embed = relation_embed.unsqueeze(1).repeat(1, bs, 1)
+        else:
+            relation_query_embed = relation_embed
 
         # Condition on subject
         tgt_sub = torch.zeros_like(subject_query_embed)
@@ -150,7 +159,15 @@ class IterativeRelationTransformer(nn.Module):
             'relation_subject_logits': relation_subject_class.transpose(1, 2),
             'relation_object_logits': relation_object_class.transpose(1, 2),
             'relation_subject_coords': relation_subject_coords.transpose(1, 2),
-            'relation_object_coords': relation_object_coords.transpose(1, 2)
+            'relation_object_coords': relation_object_coords.transpose(1, 2),
+            # [num_layers, bs, num_queries, hidden_dim]
+            'hs_subject': hs_subject.transpose(1, 2),
+            'hs_object': hs_object.transpose(1, 2),
+            'hs_relation': hs_relation.transpose(1, 2),
+            # [bs, num_queries, hidden_dim]
+            'hs_subject_last': hs_subject[-1].transpose(0, 1),
+            'hs_object_last': hs_object[-1].transpose(0, 1),
+            'hs_relation_last': hs_relation[-1].transpose(0, 1),
         }
 
         return output
