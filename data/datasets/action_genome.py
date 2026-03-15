@@ -2,6 +2,7 @@ import os
 import json
 import pickle
 import random
+import logging
 from collections import defaultdict
 
 import numpy as np
@@ -50,16 +51,19 @@ class ActionGenomeTrainData:
     def __init__(self, cfg, split="train"):
         self.cfg = cfg
         self.split = split
+        self.logger = logging.getLogger(__name__)
         self.ann_dir = cfg.DATASETS.ACTION_GENOME.ANNOTATIONS
         self.frames_root = cfg.DATASETS.ACTION_GENOME.FRAMES
         self.num_videos_train = cfg.DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN
         self.num_videos_val = cfg.DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL
         self.val_set_randomized = cfg.DATASETS.ACTION_GENOME.VAL_SET_RANDOMIZED
         self.seed = cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED
+        self.broken_images_list = cfg.DATASETS.ACTION_GENOME.BROKEN_IMAGES_LIST
 
         self.object_anno, self.person_anno, self.frame_list = self._load_annotations()
         self.video_to_frames = self._group_frames_by_video(self.frame_list)
         self.split_videos = self._build_video_split()
+        self.broken_image_paths = self._load_broken_image_paths()
 
         self.class_names, self.predicate_names = self._collect_vocab()
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
@@ -88,6 +92,36 @@ class ActionGenomeTrainData:
             video, frame_name = frame_key.split("/", 1)
             video_to_frames[video].append(frame_name)
         return video_to_frames
+
+    def _load_broken_image_paths(self):
+        if not self.broken_images_list:
+            return set()
+        list_path = self.broken_images_list
+        if not os.path.isabs(list_path):
+            list_path = os.path.abspath(list_path)
+        if not os.path.isfile(list_path):
+            self.logger.info(
+                "[ActionGenome:%s] broken image list not found, skip explicit filtering: %s",
+                self.split,
+                list_path,
+            )
+            return set()
+
+        broken_paths = set()
+        with open(list_path, "r", encoding="utf-8") as f:
+            for line in f:
+                path = line.strip()
+                if not path:
+                    continue
+                broken_paths.add(os.path.abspath(path))
+
+        self.logger.info(
+            "[ActionGenome:%s] loaded %d broken image paths from %s",
+            self.split,
+            len(broken_paths),
+            list_path,
+        )
+        return broken_paths
 
     def _build_video_split(self):
         videos = sorted(self.video_to_frames.keys())
@@ -208,6 +242,7 @@ class ActionGenomeTrainData:
     def _build_dataset_dicts(self):
         dataset_dicts = []
         image_id = 0
+        skipped_broken = 0
         for frame_key in self.frame_list:
             if "/" not in frame_key:
                 continue
@@ -217,6 +252,10 @@ class ActionGenomeTrainData:
 
             frame_path = self._get_frame_path(video, frame_name)
             if frame_path is None:
+                continue
+            frame_path = os.path.abspath(frame_path)
+            if frame_path in self.broken_image_paths:
+                skipped_broken += 1
                 continue
 
             try:
@@ -298,6 +337,12 @@ class ActionGenomeTrainData:
             }
             dataset_dicts.append(record)
             image_id += 1
+        if skipped_broken > 0:
+            self.logger.info(
+                "[ActionGenome:%s] skipped %d frames from broken image list",
+                self.split,
+                skipped_broken,
+            )
         return dataset_dicts
 
     def register_dataset(self):

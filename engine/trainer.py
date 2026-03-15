@@ -684,6 +684,37 @@ class JointTransformerTrainer(DefaultTrainer):
                 loss_dict = self.model(data)
         else:
             loss_dict = self.model(data)
+
+        # 记录时序 query 使用数量（仅在启用 temporal memory 时生效）
+        try:
+            base_model = self.model
+            # DDP 包装时取出真实模型
+            if hasattr(base_model, "module"):
+                base_model = base_model.module
+            detr_module = getattr(base_model, "detr", None)
+            temporal_used_queries = None
+            if (
+                detr_module is not None
+                and getattr(detr_module, "object_memory_bank", None) is not None
+                and hasattr(detr_module, "_memory_states")
+                and isinstance(detr_module._memory_states, dict)
+            ):
+                used = 0
+                for state in detr_module._memory_states.values():
+                    if hasattr(state, "valid_mask") and state.valid_mask is not None:
+                        used += int(state.valid_mask.sum().item())
+                temporal_used_queries = float(used)
+
+            if temporal_used_queries is not None:
+                # 写入 EventStorage，方便 tensorboard / metrics.json 统计
+                storage = get_event_storage()
+                storage.put_scalar("temporal/used_queries", temporal_used_queries)
+                # 直接打印到终端（仅主进程），保证在 log.txt 中可见
+                if comm.is_main_process():
+                    print(f"[temporal] used_queries={int(temporal_used_queries)}", flush=True)
+        except Exception:
+            # 任何异常都不应影响正常训练，仅跳过该统计
+            pass
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         forward_time = time.perf_counter() - forward_start
         

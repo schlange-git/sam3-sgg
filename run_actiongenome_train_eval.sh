@@ -28,9 +28,9 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_temporal_debug}"
+OUTPUT_DIR="${1:-z_outputs/sam3_temporal_60000iters_bs16}"
 NUM_GPUS="${2:-2}"
-NUM_VIDEOS_TRAIN="${3:-10}"
+NUM_VIDEOS_TRAIN="${3:--1}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29500}"
@@ -64,9 +64,13 @@ DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-/root/result/sam3_predtrain_detr_detecti
 # 兼容旧变量 LOAD_FULL_DETR_WEIGHTS；默认 1（完整加载）
 DETR_LOAD_FULL_WEIGHTS="${DETR_LOAD_FULL_WEIGHTS:-${LOAD_FULL_DETR_WEIGHTS:-1}}"
 # 是否额外在 overfit 训练集上评测（1/0）
-EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-1}"
+EVAL_OVERFIT_TRAIN="${EVAL_OVERFIT_TRAIN:-0}"
+# 是否运行正常验证集 AG_val 评测（1=运行，0=跳过，只跑过拟合训练集评测）
+RUN_VAL_EVAL="${RUN_VAL_EVAL:-1}"
 # 可视化最大图片数（-1 = 全部）
-VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-100}"
+VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-1000}"
+# 可视化框分数阈值（默认 0.2，与常见检测可视化阈值一致）
+VIS_BOX_SCORE_THRESH="${VIS_BOX_SCORE_THRESH:-0.2}"
 
 echo "=============================================="
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
@@ -77,6 +81,7 @@ echo "BACKBONE_WEIGHTS=${BACKBONE_WEIGHTS} (ignored if SAM3.ENABLED=True)"
 echo "DETR_HEAD_WEIGHTS=${DETR_HEAD_WEIGHTS}"
 echo "DETR_LOAD_FULL_WEIGHTS=${DETR_LOAD_FULL_WEIGHTS}"
 echo "EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN}"
+echo "RUN_VAL_EVAL=${RUN_VAL_EVAL}"
 echo "VIS_MAX_IMAGES=${VIS_MAX_IMAGES}"
 echo "=============================================="
 
@@ -103,6 +108,15 @@ TRAIN_OPTS=(
   MODEL.WEIGHTS "${INITIAL_WEIGHTS}"
   MODEL.SAM3.CHECKPOINT_PATH "${SAM3_CHECKPOINT_PATH}"
 )
+
+# 若用户显式关闭正常验证集评测，则在训练阶段也关闭 Detectron2 自带的 val 评测
+# （通过将 TEST.EVAL_PERIOD 设为 0 实现）
+if [[ "${RUN_VAL_EVAL}" == "0" ]]; then
+  echo "RUN_VAL_EVAL=0: Disable in-training validation evaluation (set TEST.EVAL_PERIOD=0)."
+  TRAIN_OPTS+=(
+    TEST.EVAL_PERIOD "0"
+  )
+fi
 
 # 如果设置了 DETR_HEAD_WEIGHTS，则启用 DETR head 预训练加载
 if [[ -n "${DETR_HEAD_WEIGHTS}" && "${DETR_HEAD_WEIGHTS}" != "none" && "${DETR_HEAD_WEIGHTS}" != "" ]]; then
@@ -250,37 +264,42 @@ else
   echo "Waiting 10s for memory release before evaluation ..."
   sleep 10
 
-  VAL_EVAL_DIR="${FINAL_OUTPUT_DIR}/eval_AG_val"
-  mkdir -p "${VAL_EVAL_DIR}"
-  echo "Running evaluation on AG_val (with memory monitor) ..."
-  python train_iterative_model.py \
-    --eval-only \
-    --num-gpus "${NUM_GPUS}" \
-    --config-file "${CONFIG}" \
-    --dist-url "tcp://127.0.0.1:${PORT}" \
-    OUTPUT_DIR "${VAL_EVAL_DIR}" \
-    DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
-    DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
-    DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
-    MODEL.WEIGHTS "${CHECKPOINT}" \
-    ${OPTS:-} &
-  EVAL_PID=$!
+  # 2.1 正常验证集 AG_val（可通过 RUN_VAL_EVAL 开关关闭）
+  if [[ "${RUN_VAL_EVAL}" == "1" ]]; then
+    VAL_EVAL_DIR="${FINAL_OUTPUT_DIR}/eval_AG_val"
+    mkdir -p "${VAL_EVAL_DIR}"
+    echo "Running evaluation on AG_val (with memory monitor) ..."
+    python train_iterative_model.py \
+      --eval-only \
+      --num-gpus "${NUM_GPUS}" \
+      --config-file "${CONFIG}" \
+      --dist-url "tcp://127.0.0.1:${PORT}" \
+      OUTPUT_DIR "${VAL_EVAL_DIR}" \
+      DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
+      DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
+      DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
+      MODEL.WEIGHTS "${CHECKPOINT}" \
+      ${OPTS:-} &
+    EVAL_PID=$!
 
-  monitor_memory "${EVAL_PID}" &
-  MONITOR_PID=$!
+    monitor_memory "${EVAL_PID}" &
+    MONITOR_PID=$!
 
-  wait "${EVAL_PID}"
-  EVAL_EXIT_CODE=$?
-  kill "${MONITOR_PID}" 2>/dev/null || true
-  wait "${MONITOR_PID}" 2>/dev/null || true
+    wait "${EVAL_PID}"
+    EVAL_EXIT_CODE=$?
+    kill "${MONITOR_PID}" 2>/dev/null || true
+    wait "${MONITOR_PID}" 2>/dev/null || true
 
-  if [ "${EVAL_EXIT_CODE}" -ne 0 ]; then
-    echo "Evaluation failed with exit code: ${EVAL_EXIT_CODE}"
-    exit "${EVAL_EXIT_CODE}"
+    if [ "${EVAL_EXIT_CODE}" -ne 0 ]; then
+      echo "Evaluation failed with exit code: ${EVAL_EXIT_CODE}"
+      exit "${EVAL_EXIT_CODE}"
+    fi
+    echo "Evaluation on AG_val done. Output: ${VAL_EVAL_DIR}"
+  else
+    echo "Skip AG_val evaluation (RUN_VAL_EVAL=${RUN_VAL_EVAL})"
   fi
-  echo "Evaluation on AG_val done. Output: ${VAL_EVAL_DIR}"
 
-  # 可选：在 overfit 训练集上再评测一次，验证是否真的学到训练样本
+  # 2.2 可选：在 overfit 训练集上再评测一次，验证是否真的学到训练样本
   if [[ "${EVAL_OVERFIT_TRAIN}" == "1" && "${NUM_VIDEOS_TRAIN}" -gt 0 ]]; then
     TRAIN_EVAL_DIR="${FINAL_OUTPUT_DIR}/eval_AG_train_overfit"
     mkdir -p "${TRAIN_EVAL_DIR}"
@@ -295,6 +314,7 @@ else
       DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
       DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
       DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
+      DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN "${NUM_VIDEOS_TRAIN}" \
       MODEL.WEIGHTS "${CHECKPOINT}" \
       ${OPTS:-} &
     EVAL_TRAIN_PID=$!
@@ -322,19 +342,40 @@ fi
 # -----------------------------
 VIS_SCRIPT="visualize_actiongenome_by_video.py"
 if [[ -f "${CHECKPOINT}" && -f "${VIS_SCRIPT}" ]]; then
-  VIS_DIR="${FINAL_OUTPUT_DIR}/vis"
-  echo "Saving per-video, per-frame visualizations to ${VIS_DIR} ..."
+  # 3.1 验证集 AG_val 可视化
+  VIS_DIR_VAL="${FINAL_OUTPUT_DIR}/vis_AG_val"
+  echo "Saving per-video, per-frame visualizations on AG_val to ${VIS_DIR_VAL} ..."
   python "${VIS_SCRIPT}" \
     --config-file "${CONFIG}" \
     --model-weights "${CHECKPOINT}" \
-    --output-dir "${VIS_DIR}" \
+    --output-dir "${VIS_DIR_VAL}" \
     --dataset-name "AG_val" \
     --num-images "${VIS_MAX_IMAGES}" \
+    --box-score-thresh "${VIS_BOX_SCORE_THRESH}" \
     DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
     DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
     DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
     ${OPTS:-}
-  echo "Visualization done: ${VIS_DIR}"
+  echo "Visualization on AG_val done: ${VIS_DIR_VAL}"
+
+  # 3.2 若开启 overfit 训练集评测，则强制对训练子集 AG_train 做单独可视化
+  if [[ "${EVAL_OVERFIT_TRAIN}" == "1" && "${NUM_VIDEOS_TRAIN}" -gt 0 ]]; then
+    VIS_DIR_TRAIN="${FINAL_OUTPUT_DIR}/vis_AG_train_overfit"
+    echo "Saving per-video, per-frame visualizations on AG_train overfit subset to ${VIS_DIR_TRAIN} ..."
+    python "${VIS_SCRIPT}" \
+      --config-file "${CONFIG}" \
+      --model-weights "${CHECKPOINT}" \
+      --output-dir "${VIS_DIR_TRAIN}" \
+      --dataset-name "AG_train" \
+      --num-images "${VIS_MAX_IMAGES}" \
+      --box-score-thresh "${VIS_BOX_SCORE_THRESH}" \
+      DATASETS.ACTION_GENOME.ANNOTATIONS "${AG_ANNOTATIONS}" \
+      DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}" \
+      DATASETS.ACTION_GENOME.VIDEOS "${AG_VIDEOS}" \
+      DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN "${NUM_VIDEOS_TRAIN}" \
+      ${OPTS:-}
+    echo "Visualization on AG_train overfit subset done: ${VIS_DIR_TRAIN}"
+  fi
 else
   if [[ ! -f "${VIS_SCRIPT}" ]]; then
     echo "Script ${VIS_SCRIPT} not found, skip visualization."

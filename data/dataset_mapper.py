@@ -112,6 +112,9 @@ class DetrDatasetMapper:
         self.data_type = cfg.DATASETS.TYPE
 
 
+    # 全局计数：记录图像读取失败的次数（包括截断/损坏等）
+    _read_error_count = 0
+
     def __call__(self, dataset_dict):
         """
         Args:
@@ -120,7 +123,21 @@ class DetrDatasetMapper:
             dict: a format that builtin models in detectron2 accept
         """
         dataset_dict = copy.deepcopy(dataset_dict)
-        image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        try:
+            image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        except OSError as e:
+            # 记录并用“占位黑图”替代损坏图像，避免训练整体崩溃
+            DetrDatasetMapper._read_error_count += 1
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"[DetrDatasetMapper] Failed to read image #{DetrDatasetMapper._read_error_count}: "
+                f"{dataset_dict.get('file_name', 'unknown')} ({e}). "
+                f"Using zero-image placeholder instead."
+            )
+            # 尽量保留原始标注的宽高信息；若缺失则退回到 1008x1008
+            h = int(dataset_dict.get("height", 1008))
+            w = int(dataset_dict.get("width", 1008))
+            image = np.zeros((h, w, 3), dtype="uint8")
         h, w, _ = image.shape
         if w != dataset_dict['width'] or h != dataset_dict['height']:
             dataset_dict['width'] = w
