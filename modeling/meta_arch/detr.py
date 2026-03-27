@@ -29,6 +29,45 @@ from detectron2.layers import batched_nms
 __all__ = ["Detr"]
 
 
+def validate_obj_split_config(cfg, num_classes: int):
+    obj_cfg = cfg.MODEL.OBJ_SPLIT
+    if not bool(getattr(obj_cfg, "ENABLED", False)):
+        return
+
+    regular = [int(x) for x in list(getattr(obj_cfg, "REGULAR_CLASSES", []))]
+    small = [int(x) for x in list(getattr(obj_cfg, "SMALL_SHARED_CLASSES", []))]
+    fine_groups = [[int(x) for x in list(g)] for g in list(getattr(obj_cfg, "FINE_GROUPS", []))]
+    fine_names = [str(x) for x in list(getattr(obj_cfg, "FINE_GROUP_NAMES", []))]
+    fine_use_upsample = [bool(x) for x in list(getattr(obj_cfg, "FINE_GROUPS_USE_UPSAMPLE", []))]
+
+    if len(fine_names) not in (0, len(fine_groups)):
+        raise ValueError(
+            f"MODEL.OBJ_SPLIT.FINE_GROUP_NAMES length {len(fine_names)} must be 0 or equal to FINE_GROUPS length {len(fine_groups)}"
+        )
+    if len(fine_use_upsample) not in (0, len(fine_groups)):
+        raise ValueError(
+            f"MODEL.OBJ_SPLIT.FINE_GROUPS_USE_UPSAMPLE length {len(fine_use_upsample)} must be 0 or equal to FINE_GROUPS length {len(fine_groups)}"
+        )
+
+    all_sets = [("REGULAR_CLASSES", regular), ("SMALL_SHARED_CLASSES", small)]
+    all_sets.extend([(f"FINE_GROUPS[{i}]", g) for i, g in enumerate(fine_groups)])
+
+    owner = {}
+    for set_name, ids in all_sets:
+        for cls_id in ids:
+            if cls_id < 0 or cls_id >= int(num_classes):
+                raise ValueError(f"{set_name} contains invalid class id {cls_id}, valid range is [0, {num_classes - 1}]")
+            if cls_id in owner:
+                raise ValueError(f"class id {cls_id} appears in both {owner[cls_id]} and {set_name}; split sets must be disjoint")
+            owner[cls_id] = set_name
+
+    missing = [c for c in range(int(num_classes)) if c not in owner]
+    if missing:
+        raise ValueError(
+            f"OBJ_SPLIT requires full foreground coverage. Missing class ids: {missing[:20]}{' ...' if len(missing) > 20 else ''}"
+        )
+
+
 @META_ARCH_REGISTRY.register()
 class Detr(nn.Module):
     """
@@ -41,6 +80,7 @@ class Detr(nn.Module):
         self.device = torch.device(cfg.MODEL.DEVICE)
         self.num_classes = cfg.MODEL.DETR.NUM_CLASSES
         self.num_relation_classes = cfg.MODEL.DETR.NUM_RELATION_CLASSES
+        validate_obj_split_config(cfg, self.num_classes)
         self.mask_on = cfg.MODEL.MASK_ON
         self.use_gt_box = cfg.MODEL.ROI_SCENEGRAPH_HEAD.USE_GT_BOX
         self.use_gt_label = cfg.MODEL.ROI_SCENEGRAPH_HEAD.USE_GT_OBJECT_LABEL
@@ -112,6 +152,10 @@ class Detr(nn.Module):
         matcher = build_matcher(cfg.MODEL.DETR.MATCHER, cost_class=cost_class, cost_bbox=l1_weight, cost_giou=giou_weight, topk=matcher_topk, cfg=cfg, statistics=statistics)
         weight_dict = {"loss_ce": cost_class, "loss_bbox": l1_weight, 'loss_ce_subject': cost_class, 'loss_ce_object': cost_class, 'loss_bbox_subject': l1_weight, 'loss_bbox_object': l1_weight, 'loss_giou_subject': giou_weight, 'loss_giou_object': giou_weight, 'loss_relation': 1, 'loss_bbox_relation': l1_weight, 'loss_giou_relation':giou_weight, 'loss_nms':nms_weight, 'loss_selection_subject': cost_selection, 'loss_selection_object': cost_selection}
         weight_dict["loss_giou"] = giou_weight
+        if cfg.MODEL.OBJ_SPLIT.ENABLED:
+            weight_dict["loss_reg_aux"] = float(cfg.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_REG)
+            weight_dict["loss_small_aux"] = float(cfg.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_SMALL)
+            weight_dict["loss_fine_aux"] = float(cfg.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_FINE)
         if deep_supervision:
             aux_weight_dict = {}
             for i in range(max(dec_layers, obj_dec_layers) - 1):
@@ -122,7 +166,7 @@ class Detr(nn.Module):
 
         if self.mask_on:
             losses += ["masks"]
-        self.criterion = build_criterion(cfg.MODEL.DETR.CRITERION, self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight, losses=losses, use_gt_box=self.use_gt_box, use_gt_label=self.use_gt_label, num_relation_classes=self.num_relation_classes, intersection_iou_threshold=cfg.MODEL.DETR.INTERSECTION_IOU_THRESHOLD, intersection_iou_lambda=cfg.MODEL.DETR.INTERSECTION_IOU_LAMBDA, intersection_loss=cfg.MODEL.DETR.INTERSECTION_LOSS, rel_eos_coef=no_rel_weight, statistics=statistics, reweight_relations=cfg.MODEL.DETR.REWEIGHT_RELATIONS, reweight_rel_eos_coef=cfg.MODEL.DETR.REWEIGHT_REL_EOS_COEF, neg_rel_fraction=cfg.MODEL.DETR.NEGATIVE_RELATION_FRACTION, max_rel_pairs=cfg.MODEL.DETR.MAX_RELATION_PAIRS, use_reweight_log=cfg.MODEL.DETR.REWEIGHT_USE_LOG, focal_alpha=cfg.MODEL.DETR.FOCAL_ALPHA, create_bg_pairs=create_bg_pairs, oversample_param=cfg.MODEL.DETR.OVERSAMPLE_PARAM, undersample_param=cfg.MODEL.DETR.UNDERSAMPLE_PARAM, person_class_weight=cfg.MODEL.DETR.PERSON_CLASS_WEIGHT, \
+        self.criterion = build_criterion(cfg.MODEL.DETR.CRITERION, self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight, losses=losses, use_gt_box=self.use_gt_box, use_gt_label=self.use_gt_label, num_relation_classes=self.num_relation_classes, intersection_iou_threshold=cfg.MODEL.DETR.INTERSECTION_IOU_THRESHOLD, intersection_iou_lambda=cfg.MODEL.DETR.INTERSECTION_IOU_LAMBDA, intersection_loss=cfg.MODEL.DETR.INTERSECTION_LOSS, rel_eos_coef=no_rel_weight, statistics=statistics, reweight_relations=cfg.MODEL.DETR.REWEIGHT_RELATIONS, reweight_rel_eos_coef=cfg.MODEL.DETR.REWEIGHT_REL_EOS_COEF, neg_rel_fraction=cfg.MODEL.DETR.NEGATIVE_RELATION_FRACTION, max_rel_pairs=cfg.MODEL.DETR.MAX_RELATION_PAIRS, use_reweight_log=cfg.MODEL.DETR.REWEIGHT_USE_LOG, focal_alpha=cfg.MODEL.DETR.FOCAL_ALPHA, create_bg_pairs=create_bg_pairs, oversample_param=cfg.MODEL.DETR.OVERSAMPLE_PARAM, undersample_param=cfg.MODEL.DETR.UNDERSAMPLE_PARAM, person_class_weight=cfg.MODEL.DETR.PERSON_CLASS_WEIGHT, obj_split_enabled=cfg.MODEL.OBJ_SPLIT.ENABLED, obj_split_regular_classes=list(cfg.MODEL.OBJ_SPLIT.REGULAR_CLASSES), obj_split_small_classes=list(cfg.MODEL.OBJ_SPLIT.SMALL_SHARED_CLASSES), obj_split_fine_groups=[list(g) for g in list(cfg.MODEL.OBJ_SPLIT.FINE_GROUPS)], obj_split_fine_names=list(cfg.MODEL.OBJ_SPLIT.FINE_GROUP_NAMES), \
             one2many_scheme =cfg.MODEL.DETR.ONE2MANY_SCHEME, match_independent = cfg.MODEL.DETR.MATCH_INDEPENDENT)
         self.criterion.to(self.device)
 
@@ -209,7 +253,7 @@ class Detr(nn.Module):
             torch.nn.init.constant_(self.detr.relation_class_embed.bias, 0)
         if hasattr(self.detr, "transformer"):
             t = self.detr.transformer
-            if hasattr(t, "object_embed") and not load_class_head:
+            if hasattr(t, "object_embed") and (t.object_embed is not None) and not load_class_head:
                 torch.nn.init.normal_(t.object_embed.weight, std=0.01)
                 torch.nn.init.constant_(t.object_embed.bias, 0)
             if hasattr(t, "relation_embed"):
@@ -290,7 +334,7 @@ class Detr(nn.Module):
         # 按 AG 类别数重建并初始化两个头
         if hasattr(self.detr, "transformer"):
             t = self.detr.transformer
-            if hasattr(t, "object_embed"):
+            if hasattr(t, "object_embed") and (t.object_embed is not None):
                 torch.nn.init.normal_(t.object_embed.weight, std=0.01)
                 torch.nn.init.constant_(t.object_embed.bias, 0)
             if hasattr(t, "relation_embed"):
@@ -349,6 +393,8 @@ class Detr(nn.Module):
                     "pred_rel_scores": results_per_image._pred_rel_scores,
                     "pred_rel_labels": results_per_image._pred_rel_labels,
                     "query_index": results_per_image._query_index,
+                    "obj_split_sub_head_source": getattr(results_per_image, "_obj_split_sub_head_source", None),
+                    "obj_split_obj_head_source": getattr(results_per_image, "_obj_split_obj_head_source", None),
                 })
             return processed_results
 
@@ -494,6 +540,8 @@ class IterativeRelationDetr(Detr):
                     "pred_rel_scores": results_per_image._pred_rel_scores,
                     "pred_rel_labels": results_per_image._pred_rel_labels,
                     "query_index": results_per_image._query_index,
+                    "obj_split_sub_head_source": getattr(results_per_image, "_obj_split_sub_head_source", None),
+                    "obj_split_obj_head_source": getattr(results_per_image, "_obj_split_obj_head_source", None),
                 })
             self._debug_rel_out_count = debug_count
             return processed_results
@@ -521,6 +569,14 @@ class IterativeRelationDetr(Detr):
             B, _ = scores_s.size()
             
             scores_s, labels_s, scores_o, labels_o = map(lambda u: u.unsqueeze(-1).repeat(1,1,M).reshape(B, -1), (scores_s, labels_s, scores_o, labels_o))
+            src_head_s = output.get('obj_split_subject_head_source_idx', None)
+            src_head_o = output.get('obj_split_object_head_source_idx', None)
+            if src_head_s is not None and src_head_o is not None:
+                src_head_s = src_head_s.unsqueeze(-1).repeat(1, 1, M).reshape(B, -1)
+                src_head_o = src_head_o.unsqueeze(-1).repeat(1, 1, M).reshape(B, -1)
+            else:
+                src_head_s = torch.full_like(labels_s, -1)
+                src_head_o = torch.full_like(labels_o, -1)
 
             scores_r, labels_r = map(lambda u: u.reshape(B, -1), logits_r[:,:,:-1].topk(M,-1))
             # Use dynamic number of relation classes (+bg) instead of hard-coded 51
@@ -535,12 +591,14 @@ class IterativeRelationDetr(Detr):
             scores_s, labels_s = F.softmax(output['aux_outputs_r_sub'][self.test_index]['pred_logits'], -1)[:, :, :-1].max(-1)
             scores_o, labels_o = F.softmax(output['aux_outputs_r_obj'][self.test_index]['pred_logits'], -1)[:, :, :-1].max(-1)
             scores_r, labels_r = logits_r[:, :, :-1].max(-1)
+            src_head_s = torch.full_like(labels_s, -1)
+            src_head_o = torch.full_like(labels_o, -1)
             
             box_s = output['aux_outputs_r_sub'][self.test_index]['pred_boxes']
             box_o = output['aux_outputs_r_obj'][self.test_index]['pred_boxes']
 
-        for i, (scores_per_image_s, labels_per_image_s, box_per_image_s, scores_per_image_o, labels_per_image_o, box_per_image_o, scores_per_image_r, labels_per_image_r, logits_per_image_r, image_size) in enumerate(zip(
-            scores_s, labels_s, box_s, scores_o, labels_o, box_o, scores_r, labels_r, logits_r, image_sizes
+        for i, (scores_per_image_s, labels_per_image_s, box_per_image_s, scores_per_image_o, labels_per_image_o, box_per_image_o, scores_per_image_r, labels_per_image_r, logits_per_image_r, src_per_image_s, src_per_image_o, image_size) in enumerate(zip(
+            scores_s, labels_s, box_s, scores_o, labels_o, box_o, scores_r, labels_r, logits_r, src_head_s, src_head_o, image_sizes
         )):
             if self.pnms:
                 subject_boxes = Boxes(box_cxcywh_to_xyxy(box_per_image_s))
@@ -592,6 +650,8 @@ class IterativeRelationDetr(Detr):
                 rel_pair_idx = rel_pair_idx[sorting_idx]
                 rel_class_prob = logits_per_image_r[sorting_idx]
                 rel_labels = labels_per_image_r[sorting_idx]
+                rel_source_sub = src_per_image_s[sorting_idx]
+                rel_source_obj = src_per_image_o[sorting_idx]
 
                 triplets = torch.cat((rel_pair_idx, rel_labels.unsqueeze(-1)), -1)
                 unique_triplets = {}
@@ -612,6 +672,8 @@ class IterativeRelationDetr(Detr):
                 result._pred_rel_scores = rel_class_prob[keep_triplet == 1] # (#rel, #rel_class)
                 result._pred_rel_labels = rel_labels[keep_triplet == 1] # (#rel, )
                 result._query_index = sorting_idx[keep_triplet == 1]
+                result._obj_split_sub_head_source = rel_source_sub[keep_triplet == 1]
+                result._obj_split_obj_head_source = rel_source_obj[keep_triplet == 1]
                 results.append(result)
         return results
 

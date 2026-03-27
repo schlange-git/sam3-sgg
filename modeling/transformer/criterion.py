@@ -230,6 +230,20 @@ class IterativeRelationCriterionBase(nn.Module):
         self.reweight_rel = kwargs['reweight_relations']
         self.use_reweight_log = kwargs['use_reweight_log']
         self.person_class_weight = kwargs.get('person_class_weight', 1.0)
+        self.obj_split_enabled = bool(kwargs.get('obj_split_enabled', False))
+        self.obj_split_regular_classes = [int(x) for x in kwargs.get('obj_split_regular_classes', [])]
+        self.obj_split_small_classes = [int(x) for x in kwargs.get('obj_split_small_classes', [])]
+        self.obj_split_fine_groups = [[int(x) for x in g] for g in kwargs.get('obj_split_fine_groups', [])]
+        fine_names = [str(x) for x in kwargs.get('obj_split_fine_names', [])]
+        self.obj_split_fine_names = fine_names if len(fine_names) == len(self.obj_split_fine_groups) else [
+            f"group_{i}" for i in range(len(self.obj_split_fine_groups))
+        ]
+
+        self._obj_split_reg_local = {c: i for i, c in enumerate(self.obj_split_regular_classes)}
+        self._obj_split_small_local = {c: i for i, c in enumerate(self.obj_split_small_classes)}
+        self._obj_split_fine_local = []
+        for group in self.obj_split_fine_groups:
+            self._obj_split_fine_local.append({c: i for i, c in enumerate(group)})
 
         empty_weight_obj = torch.ones(self.num_classes + 1)
         empty_weight_obj[-1] = self.eos_coef
@@ -467,6 +481,82 @@ class IterativeRelationCriterionBase(nn.Module):
         losses.update(self.get_relation_loss(relation_outputs, relation_targets, combined_indices['relation'], num_relation_boxes, **kwargs))
         return losses
 
+    def _compute_obj_split_aux_for_role(self, raw_split_logits, targets, indices):
+        # raw_split_logits: dict(branch_name -> [B, Q, K])
+        if raw_split_logits is None:
+            return None
+        if len(indices) == 0:
+            return None
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() == 0:
+            return None
+        target_classes = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).long()
+        src_b, src_q = idx
+        device = target_classes.device
+        losses = {}
+
+        def _branch_ce(branch_key, local_map):
+            if branch_key not in raw_split_logits:
+                return None
+            logits = raw_split_logits[branch_key]
+            if logits.numel() == 0:
+                return (logits * 0.0).sum()
+            local_ids = []
+            keep = []
+            for i, cls_id in enumerate(target_classes.tolist()):
+                if cls_id in local_map:
+                    keep.append(i)
+                    local_ids.append(local_map[cls_id])
+            if len(keep) == 0:
+                return (logits * 0.0).sum()
+            keep_t = torch.as_tensor(keep, dtype=torch.long, device=device)
+            local_t = torch.as_tensor(local_ids, dtype=torch.long, device=device)
+            pred = logits[src_b[keep_t], src_q[keep_t]]
+            return F.cross_entropy(pred, local_t)
+
+        reg = _branch_ce("regular", self._obj_split_reg_local)
+        if reg is not None:
+            losses["loss_reg_aux"] = reg
+
+        small = _branch_ce("small", self._obj_split_small_local)
+        if small is not None:
+            losses["loss_small_aux"] = small
+
+        fine_vals = []
+        for gidx, local_map in enumerate(self._obj_split_fine_local):
+            branch_key = f"fine:{self.obj_split_fine_names[gidx]}"
+            if branch_key not in raw_split_logits:
+                continue
+            fine_i = _branch_ce(branch_key, local_map)
+            if fine_i is not None:
+                fine_vals.append(fine_i)
+        if len(fine_vals) > 0:
+            losses["loss_fine_aux"] = torch.stack(fine_vals).mean()
+
+        return losses
+
+    def get_obj_split_aux_losses(self, outputs, entity_targets, combined_indices):
+        if (not self.obj_split_enabled):
+            return {}
+        raw_sub = outputs.get("raw_split_logits_subject", None)
+        raw_obj = outputs.get("raw_split_logits_object", None)
+        if raw_sub is None or raw_obj is None:
+            return {}
+        sub_losses = self._compute_obj_split_aux_for_role(raw_sub, entity_targets, combined_indices['subject'])
+        obj_losses = self._compute_obj_split_aux_for_role(raw_obj, entity_targets, combined_indices['object'])
+        if sub_losses is None and obj_losses is None:
+            return {}
+        losses = {}
+        for key in ("loss_reg_aux", "loss_small_aux", "loss_fine_aux"):
+            vals = []
+            if sub_losses is not None and key in sub_losses:
+                vals.append(sub_losses[key])
+            if obj_losses is not None and key in obj_losses:
+                vals.append(obj_losses[key])
+            if len(vals) > 0:
+                losses[key] = torch.stack(vals).mean()
+        return losses
+
     def forward(self, outputs, targets):
         """ This performs the loss computation.
         Parameters:
@@ -486,6 +576,7 @@ class IterativeRelationCriterionBase(nn.Module):
         entity_targets = [{'boxes': x['combined_boxes'], 'labels': x['combined_labels']} for x in targets]
         relation_targets = [{'boxes': x['relation_boxes'], 'labels': x['relation_labels']} for x in targets]
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices))
+        losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
         if 'aux_outputs_r' in outputs:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],
@@ -496,6 +587,11 @@ class IterativeRelationCriterionBase(nn.Module):
                 l_dict = self.get_relation_losses(relation_aux_outputs, entity_targets, relation_targets, aux_combined_indices, **kwargs)
                 l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                 losses.update(l_dict)
+            if 'aux_outputs_obj_split' in outputs:
+                for i, aux_obj in enumerate(outputs['aux_outputs_obj_split']):
+                    aux_split_losses = self.get_obj_split_aux_losses(aux_obj, entity_targets, combined_indices)
+                    aux_split_losses = {k + f'_{i}': v for k, v in aux_split_losses.items()}
+                    losses.update(aux_split_losses)
         return losses
 
 
@@ -587,6 +683,7 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
         relation_targets = [{'boxes': x['relation_boxes'], 'labels': x['relation_labels']} for x in augmented_targets]
         kwargs = {'aux_loss' : False}
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices, **kwargs))
+        losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
         if 'aux_outputs_r' in outputs:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],
@@ -603,6 +700,11 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
                 l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                 # TODO: check if there is no problem here
                 losses.update(l_dict)
+            if 'aux_outputs_obj_split' in outputs:
+                for i, aux_obj in enumerate(outputs['aux_outputs_obj_split']):
+                    aux_split_losses = self.get_obj_split_aux_losses(aux_obj, entity_targets, combined_indices)
+                    aux_split_losses = {k + f'_{i}': v for k, v in aux_split_losses.items()}
+                    losses.update(aux_split_losses)
 
         return losses
 

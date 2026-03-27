@@ -1,5 +1,5 @@
 import copy
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +59,114 @@ class Transformer(nn.Module):
                           pos=pos_embed, query_pos=query_embed)
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
 
+
+class SplitObjectClassifier(nn.Module):
+    """
+    Split object classifier that assembles branch logits into unified full-class logits.
+    """
+
+    def __init__(self, d_model: int, num_classes: int, cfg):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        obj_cfg = cfg.MODEL.OBJ_SPLIT
+        self.use_temp_scaling = bool(getattr(obj_cfg, "USE_TEMP_SCALING", False))
+        self.small_use_upsample = bool(getattr(obj_cfg, "SMALL_SHARED_USE_UPSAMPLE", False))
+
+        self.regular_classes = [int(x) for x in list(getattr(obj_cfg, "REGULAR_CLASSES", []))]
+        self.small_classes = [int(x) for x in list(getattr(obj_cfg, "SMALL_SHARED_CLASSES", []))]
+        self.fine_groups = [[int(x) for x in list(g)] for g in list(getattr(obj_cfg, "FINE_GROUPS", []))]
+        fine_names = [str(x) for x in list(getattr(obj_cfg, "FINE_GROUP_NAMES", []))]
+        self.fine_group_names = fine_names if len(fine_names) == len(self.fine_groups) else [
+            f"group_{i}" for i in range(len(self.fine_groups))
+        ]
+        self.fine_group_use_upsample = [bool(x) for x in list(getattr(obj_cfg, "FINE_GROUPS_USE_UPSAMPLE", []))]
+        if len(self.fine_group_use_upsample) != len(self.fine_groups):
+            self.fine_group_use_upsample = [False] * len(self.fine_groups)
+
+        self.regular_head = nn.Linear(d_model, len(self.regular_classes))
+        self.small_shared_head = nn.Linear(d_model, len(self.small_classes))
+        self.bg_head = nn.Linear(d_model, 1)
+        self.fine_head_dict = nn.ModuleDict()
+        for name, group in zip(self.fine_group_names, self.fine_groups):
+            self.fine_head_dict[name] = nn.Linear(d_model, len(group))
+
+        class_to_head = torch.full((self.num_classes,), -1, dtype=torch.long)
+        for c in self.regular_classes:
+            class_to_head[c] = 0
+        for c in self.small_classes:
+            class_to_head[c] = 1
+        for gidx, group in enumerate(self.fine_groups):
+            for c in group:
+                class_to_head[c] = 2 + gidx
+        self.register_buffer("class_to_head", class_to_head)
+
+        self.tau_regular = nn.Parameter(torch.tensor(1.0))
+        self.tau_small = nn.Parameter(torch.tensor(1.0))
+        self.tau_fine = nn.Parameter(torch.ones(len(self.fine_groups)))
+
+        self.reg_local_map = {c: i for i, c in enumerate(self.regular_classes)}
+        self.small_local_map = {c: i for i, c in enumerate(self.small_classes)}
+        self.fine_local_map = {}
+        for name, group in zip(self.fine_group_names, self.fine_groups):
+            self.fine_local_map[name] = {c: i for i, c in enumerate(group)}
+
+    def _apply_temp(self, logits: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        if (not self.use_temp_scaling) or logits.numel() == 0:
+            return logits
+        return logits / tau.clamp_min(1e-4)
+
+    def _upsample_tokens_2x(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, D] -> [N, D, 1, 1] -> 2x bilinear -> [N, D]
+        x2 = x.view(x.shape[0], x.shape[1], 1, 1)
+        x2 = F.interpolate(x2, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x2 = F.adaptive_avg_pool2d(x2, output_size=1).flatten(1)
+        return x2
+
+    def forward(self, hs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # hs: [L, Q, B, D]
+        l, q, b, d = hs.shape
+        x = hs.reshape(-1, d)  # [L*Q*B, D]
+        out_full = x.new_full((x.shape[0], self.num_classes + 1), -1e4)
+        raw_logits = {}
+
+        if len(self.regular_classes) > 0:
+            reg_logits = self._apply_temp(self.regular_head(x), self.tau_regular)
+            out_full[:, self.regular_classes] = reg_logits
+            raw_logits["regular"] = reg_logits
+        else:
+            raw_logits["regular"] = x.new_zeros((x.shape[0], 0))
+
+        if len(self.small_classes) > 0:
+            x_small = self._upsample_tokens_2x(x) if self.small_use_upsample else x
+            small_logits = self._apply_temp(self.small_shared_head(x_small), self.tau_small)
+            out_full[:, self.small_classes] = small_logits
+            raw_logits["small"] = small_logits
+        else:
+            raw_logits["small"] = x.new_zeros((x.shape[0], 0))
+
+        for gidx, (name, classes) in enumerate(zip(self.fine_group_names, self.fine_groups)):
+            x_fine = self._upsample_tokens_2x(x) if self.fine_group_use_upsample[gidx] else x
+            fine_logits = self._apply_temp(self.fine_head_dict[name](x_fine), self.tau_fine[gidx])
+            out_full[:, classes] = fine_logits
+            raw_logits[f"fine:{name}"] = fine_logits
+
+        bg_logit = self.bg_head(x).squeeze(-1)
+        out_full[:, self.num_classes] = bg_logit
+
+        fg_pred_cls = out_full[:, :-1].argmax(-1)
+        head_source = self.class_to_head[fg_pred_cls]
+
+        out_full = out_full.view(l, q, b, self.num_classes + 1)
+        head_source = head_source.view(l, q, b)
+        for k in list(raw_logits.keys()):
+            raw_logits[k] = raw_logits[k].view(l, q, b, -1)
+
+        return {
+            "full_logits": out_full,
+            "head_source_idx": head_source,
+            "raw_split_logits": raw_logits,
+        }
+
 @TRANSFORMER_REGISTRY.register()
 class IterativeRelationTransformer(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
@@ -82,7 +190,17 @@ class IterativeRelationTransformer(nn.Module):
 
         self.d_model = d_model
         self.nhead = nhead
-        self.object_embed = nn.Linear(d_model, kwargs['num_classes'] + 1)
+        self.obj_split_enabled = bool(getattr(getattr(getattr(cfg, "MODEL", None), "OBJ_SPLIT", None), "ENABLED", False))
+        if self.obj_split_enabled:
+            self.object_embed = None
+            self.split_object_classifier = SplitObjectClassifier(
+                d_model=d_model,
+                num_classes=kwargs['num_classes'],
+                cfg=cfg,
+            )
+        else:
+            self.object_embed = nn.Linear(d_model, kwargs['num_classes'] + 1)
+            self.split_object_classifier = None
         self.object_bbox_coords = MLP(d_model, d_model, 4, 3)
 
         self.relation_embed = nn.Linear(d_model, kwargs['num_relation_classes'] + 1)
@@ -146,9 +264,15 @@ class IterativeRelationTransformer(nn.Module):
 
         hs_subject, hs_object, hs_relation = self.decoder(tgt_sub, tgt_obj, tgt_rel, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, subject_pos=subject_query_embed, object_pos=object_query_embed, relation_pos=relation_query_embed)
-        relation_subject_class = self.object_embed(hs_subject)
+        if self.obj_split_enabled:
+            subject_cls_outputs = self.split_object_classifier(hs_subject)
+            object_cls_outputs = self.split_object_classifier(hs_object)
+            relation_subject_class = subject_cls_outputs["full_logits"]
+            relation_object_class = object_cls_outputs["full_logits"]
+        else:
+            relation_subject_class = self.object_embed(hs_subject)
+            relation_object_class = self.object_embed(hs_object)
         relation_subject_coords = self.object_bbox_coords(hs_subject).sigmoid()
-        relation_object_class = self.object_embed(hs_object)
         relation_object_coords = self.object_bbox_coords(hs_object).sigmoid()
         relation_class = self.relation_embed(hs_relation)
         relation_coords = self.object_bbox_coords(hs_relation).sigmoid()
@@ -169,6 +293,15 @@ class IterativeRelationTransformer(nn.Module):
             'hs_object_last': hs_object[-1].transpose(0, 1),
             'hs_relation_last': hs_relation[-1].transpose(0, 1),
         }
+        if self.obj_split_enabled:
+            output['obj_split_subject_head_source_idx'] = subject_cls_outputs['head_source_idx'].transpose(1, 2)
+            output['obj_split_object_head_source_idx'] = object_cls_outputs['head_source_idx'].transpose(1, 2)
+            output['raw_split_logits_subject'] = {
+                k: v.transpose(1, 2) for k, v in subject_cls_outputs['raw_split_logits'].items()
+            }
+            output['raw_split_logits_object'] = {
+                k: v.transpose(1, 2) for k, v in object_cls_outputs['raw_split_logits'].items()
+            }
 
         return output
 

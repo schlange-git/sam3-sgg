@@ -257,6 +257,18 @@ class IterativeRelationDETR(DETR):
         out['relation_object_logits'] = output['relation_object_logits'][-1]
         out['relation_subject_boxes'] = output['relation_subject_coords'][-1]
         out['relation_object_boxes'] = output['relation_object_coords'][-1]
+        if 'obj_split_subject_head_source_idx' in output:
+            out['obj_split_subject_head_source_idx'] = output['obj_split_subject_head_source_idx'][-1]
+        if 'obj_split_object_head_source_idx' in output:
+            out['obj_split_object_head_source_idx'] = output['obj_split_object_head_source_idx'][-1]
+        if 'raw_split_logits_subject' in output:
+            out['raw_split_logits_subject'] = {
+                k: v[-1] for k, v in output['raw_split_logits_subject'].items()
+            }
+        if 'raw_split_logits_object' in output:
+            out['raw_split_logits_object'] = {
+                k: v[-1] for k, v in output['raw_split_logits_object'].items()
+            }
         out['hs_subject_last'] = output.get('hs_subject_last')
         out['hs_object_last'] = output.get('hs_object_last')
         out['hs_relation_last'] = output.get('hs_relation_last')
@@ -265,6 +277,15 @@ class IterativeRelationDETR(DETR):
             out['aux_outputs_r'] = self._set_aux_loss(output['relation_logits'], output['relation_coords'])
             out['aux_outputs_r_sub'] = self._set_aux_loss(output['relation_subject_logits'], output['relation_subject_coords'])
             out['aux_outputs_r_obj'] = self._set_aux_loss(output['relation_object_logits'], output['relation_object_coords'])
+            if 'raw_split_logits_subject' in output and 'raw_split_logits_object' in output:
+                aux_outputs_obj_split = []
+                num_aux = len(out['aux_outputs_r_sub'])
+                for i in range(num_aux):
+                    aux_outputs_obj_split.append({
+                        'raw_split_logits_subject': {k: v[i] for k, v in output['raw_split_logits_subject'].items()},
+                        'raw_split_logits_object': {k: v[i] for k, v in output['raw_split_logits_object'].items()},
+                    })
+                out['aux_outputs_obj_split'] = aux_outputs_obj_split
 
         # Update memory after each step using current frame predictions.
         if (

@@ -24,8 +24,21 @@ MODEL:
     NO_OBJECT_WEIGHT: 0.1
     PERSON_CLASS_WEIGHT: 1.0
     NO_REL_WEIGHT: 0.1
+  OBJ_SPLIT:
+    ENABLED: False
+    # 以下集合需要互斥并完整覆盖 [0, NUM_CLASSES-1]，仅在 ENABLED=True 时生效
+    REGULAR_CLASSES: []
+    SMALL_SHARED_CLASSES: []
+    FINE_GROUPS: []
+    FINE_GROUP_NAMES: []
+    FINE_GROUPS_USE_UPSAMPLE: []
+    SMALL_SHARED_USE_UPSAMPLE: False
+    USE_TEMP_SCALING: False
+    AUX_LOSS_WEIGHT_REG: 0.0
+    AUX_LOSS_WEIGHT_SMALL: 0.0
+    AUX_LOSS_WEIGHT_FINE: 0.0
   SAM3:
-    ENABLED: True
+    ENABLED: False
     USE_PRECOMPUTED: False
     # SAM3 权重：放 sam3/weights/sam3.pt，或设为本项（相对项目根/绝对路径）。缺失时会尝试 HuggingFace 下载。
     CHECKPOINT_PATH: "sam3/weights/sam3.pt"
@@ -53,8 +66,8 @@ MODEL:
     # 多尺度融合策略：last(不融合) / sum(相加融合) / concat(拼接融合)
     MULTISCALE_MERGE: "sum"
   TEMPORAL:
-    ENABLED: True
-    EVAL_ENABLED: True
+    ENABLED: False
+    EVAL_ENABLED: False
     MODE: "object_query_memory_v1"
     NUM_MEMORY_SLOTS: 32
     MEMORY_TOPK: 16
@@ -88,12 +101,12 @@ DATASETS:
     VAL_SET_RANDOMIZED: False
 
 SOLVER:
-  IMS_PER_BATCH: 16
+  IMS_PER_BATCH: 8
   # 以 epoch 为主导：每个 epoch 遍历全部帧，训练总长度由 MAX_EPOCH 决定
   MAX_EPOCH: 0
   BASE_LR: 0.0001
-  STEPS: (42000, 54000)
-  MAX_ITER: 80000
+  STEPS: (112000, 144000)
+  MAX_ITER: 160000
   WARMUP_FACTOR: 0.001
   WARMUP_ITERS: 3000
   WEIGHT_DECAY: 0.0001
@@ -126,7 +139,7 @@ INPUT:
   FORMAT: "RGB"
 
 TEST:
-  EVAL_PERIOD: 5000
+  EVAL_PERIOD: 20000
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False
   NUM_WORKERS: 8

@@ -28,8 +28,8 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_temporal_60000iters_bs16}"
-NUM_GPUS="${2:-2}"
+OUTPUT_DIR="${1:-z_outputs/sam3_res101_from_pretrained_160000iters_bs8}"
+NUM_GPUS="${2:-1}"
 NUM_VIDEOS_TRAIN="${3:--1}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
@@ -58,7 +58,7 @@ SAM3_CHECKPOINT_PATH="${SAM3_CHECKPOINT_PATH:-sam3.pt}"
 BACKBONE_WEIGHTS="${BACKBONE_WEIGHTS:-detectron2://ImageNetPretrained/MSRA/R-101.pkl}"
 # DETR_HEAD_WEIGHTS: VG 上训好的 DETR 权重（包含 transformer + 检测头 + 关系头）
 # 设置为空字符串则只使用 backbone，不加载 DETR head 预训练
-DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-/root/result/sam3_predtrain_detr_detection_from_vg_100Kx12bs/model_0099999.pth}"
+DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-z_outputs/res101_det_pretrain_freezw_100000iter_bs12/model_0199999.pth}"
 # DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-vg_objectdetector_pretrained.pth}"
 # 是否将 DETR_HEAD_WEIGHTS 作为 MODEL.WEIGHTS 全量加载（true/1=全量；false/0=仅 HEAD_WEIGHTS+LOAD_HEAD_ONLY）
 # 兼容旧变量 LOAD_FULL_DETR_WEIGHTS；默认 1（完整加载）
@@ -71,6 +71,8 @@ RUN_VAL_EVAL="${RUN_VAL_EVAL:-1}"
 VIS_MAX_IMAGES="${VIS_MAX_IMAGES:-1000}"
 # 可视化框分数阈值（默认 0.2，与常见检测可视化阈值一致）
 VIS_BOX_SCORE_THRESH="${VIS_BOX_SCORE_THRESH:-0.2}"
+# 是否在运行前清理本项目历史 python 进程（1=清理，0=不清理）
+KILL_STALE_PYTHON="${KILL_STALE_PYTHON:-0}"
 
 echo "=============================================="
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
@@ -83,6 +85,7 @@ echo "DETR_LOAD_FULL_WEIGHTS=${DETR_LOAD_FULL_WEIGHTS}"
 echo "EVAL_OVERFIT_TRAIN=${EVAL_OVERFIT_TRAIN}"
 echo "RUN_VAL_EVAL=${RUN_VAL_EVAL}"
 echo "VIS_MAX_IMAGES=${VIS_MAX_IMAGES}"
+echo "KILL_STALE_PYTHON=${KILL_STALE_PYTHON}"
 echo "=============================================="
 
 # 解析 DETR_LOAD_FULL_WEIGHTS（兼容 true/false/True/False 及 1/0）
@@ -203,6 +206,89 @@ monitor_memory() {
     echo "[内存监控] 训练进程已结束，停止监控"
 }
 
+# 启动前清理 CUDA 缓存（释放 torch/cuda 的缓存显存）
+# 注意：如果显存被其他进程占用，这里无法强制回收；只能清理当前进程/框架缓存。
+clear_cuda_cache() {
+  echo "[CUDA] Clearing torch CUDA cache ..."
+  # 记录一次显存占用（可选）
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
+  fi
+
+  # 清理 torch 缓存
+  python - <<'PY' || true
+import torch
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    # 用于释放 IPC 共享内存句柄
+    if hasattr(torch.cuda, "ipc_collect"):
+        torch.cuda.ipc_collect()
+    # 同步一下，降低“刚清完马上用仍看起来占用”的概率
+    if hasattr(torch.cuda, "synchronize"):
+        torch.cuda.synchronize()
+PY
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
+  fi
+}
+
+# 可选：清理本项目残留 python 进程（训练/评测/可视化）
+# 仅匹配当前项目路径 + 关键脚本名，避免误杀其它任务。
+cleanup_stale_python_processes() {
+  if [[ "${KILL_STALE_PYTHON}" != "1" ]]; then
+    return 0
+  fi
+
+  echo "[PROC] Cleaning stale project python processes ..."
+  local current_pid="$$"
+  local targets=(
+    "train_iterative_model.py"
+    "visualize_actiongenome_by_video.py"
+  )
+
+  for target in "${targets[@]}"; do
+    # 清理目标脚本对应的残留进程（匹配相对路径命令行，避免依赖 SCRIPT_DIR 字符串）
+    # 额外要求包含 configs/ 或 z_outputs/，降低误杀风险。
+    mapfile -t pids < <(ps -eo pid=,args= | awk -v t="${target}" -v cfg="${CONFIG}" '
+      index($0, t) > 0
+      && index($0, "configs/") > 0
+      && (index($0, cfg) > 0 || index($0, "z_outputs/") > 0)
+      {print $1}
+    ')
+    for pid in "${pids[@]:-}"; do
+      # 跳过当前 shell 进程，避免误杀自己
+      if [[ -z "${pid}" || "${pid}" == "${current_pid}" ]]; then
+        continue
+      fi
+      if kill -0 "${pid}" 2>/dev/null; then
+        echo "[PROC] Stopping stale PID ${pid} (${target})"
+        kill -TERM "${pid}" 2>/dev/null || true
+      fi
+    done
+  done
+
+  # 给进程一点退出时间，再做一次强杀兜底
+  sleep 2
+  for target in "${targets[@]}"; do
+    mapfile -t pids < <(ps -eo pid=,args= | awk -v t="${target}" -v cfg="${CONFIG}" '
+      index($0, t) > 0
+      && index($0, "configs/") > 0
+      && (index($0, cfg) > 0 || index($0, "z_outputs/") > 0)
+      {print $1}
+    ')
+    for pid in "${pids[@]:-}"; do
+      if [[ -z "${pid}" || "${pid}" == "${current_pid}" ]]; then
+        continue
+      fi
+      if kill -0 "${pid}" 2>/dev/null; then
+        echo "[PROC] Force killing PID ${pid} (${target})"
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
+    done
+  done
+}
+
 # -----------------------------
 # 训练阶段封装：复用内存监控
 # run_train_phase <resume_args...> <extra_opts...>
@@ -244,6 +330,8 @@ run_train_phase() {
 # 1) 训练（单阶段，带内存监控）
 # -----------------------------
 FINAL_OUTPUT_DIR="${OUTPUT_DIR}"
+cleanup_stale_python_processes || true
+clear_cuda_cache || true
 if run_train_phase "${RESUME_ARGS[@]}"; then
   :
 else
@@ -266,6 +354,7 @@ else
 
   # 2.1 正常验证集 AG_val（可通过 RUN_VAL_EVAL 开关关闭）
   if [[ "${RUN_VAL_EVAL}" == "1" ]]; then
+    clear_cuda_cache || true
     VAL_EVAL_DIR="${FINAL_OUTPUT_DIR}/eval_AG_val"
     mkdir -p "${VAL_EVAL_DIR}"
     echo "Running evaluation on AG_val (with memory monitor) ..."

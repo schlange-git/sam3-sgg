@@ -183,6 +183,8 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 pred_rel_scores = output.get("pred_rel_scores", getattr(output["instances"], "_pred_rel_scores", None))
                 pred_rel_labels = output.get("pred_rel_labels", getattr(output["instances"], "_pred_rel_labels", None))
                 query_index = output.get("query_index", getattr(output["instances"], "_query_index", None))
+                obj_split_sub_head_source = output.get("obj_split_sub_head_source", getattr(output["instances"], "_obj_split_sub_head_source", None))
+                obj_split_obj_head_source = output.get("obj_split_obj_head_source", getattr(output["instances"], "_obj_split_obj_head_source", None))
                 if rel_pair_idxs is None:
                     rel_pair_idxs = torch.zeros((0, 2), dtype=torch.int64)
                 if pred_rel_scores is None:
@@ -191,10 +193,16 @@ class SceneGraphEvaluator(DatasetEvaluator):
                     pred_rel_labels = torch.zeros((0,), dtype=torch.int64)
                 if query_index is None:
                     query_index = torch.zeros((0,), dtype=torch.int64)
+                if obj_split_sub_head_source is None:
+                    obj_split_sub_head_source = torch.full((query_index.shape[0],), -1, dtype=torch.int64)
+                if obj_split_obj_head_source is None:
+                    obj_split_obj_head_source = torch.full((query_index.shape[0],), -1, dtype=torch.int64)
                 prediction['rel_pair_idxs'] = rel_pair_idxs.to(self._cpu_device)
                 prediction['pred_rel_scores'] = pred_rel_scores.to(self._cpu_device)
                 prediction['pred_rel_labels'] = pred_rel_labels.to(self._cpu_device)
                 prediction['query_index'] = query_index.to(self._cpu_device)
+                prediction['obj_split_sub_head_source'] = obj_split_sub_head_source.to(self._cpu_device)
+                prediction['obj_split_obj_head_source'] = obj_split_obj_head_source.to(self._cpu_device)
                 if self._debug_eval and self._debug_count < self._debug_limit:
                     self._logger.info(
                         "[SPEAQ_DEBUG_EVAL] image_id=%s gt_rel=%d gt_boxes=%d "
@@ -371,7 +379,7 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 return {}
         else:
             predictions = self._predictions
-            groundtruths = self._ground_truths
+            ground_truths = self._ground_truths
 
         self._logger.info("Predictions Gathered")
 
@@ -389,6 +397,7 @@ class SceneGraphEvaluator(DatasetEvaluator):
         # 额外输出 bbox recall 表格（IoU=0.50），便于和 AP 对照分析 precision/recall 失衡
         bbox_recall = self._compute_bbox_recall(ground_truths, predictions, iou_thresh=0.5)
         result_detector["bbox_recall"] = bbox_recall
+        result_detector["obj_split_triplet_head_source"] = self._summarize_obj_split_head_source(predictions)
 
         result_detector['SG'] = self._evaluate_scenegraphs(ground_truths, predictions)
         
@@ -399,6 +408,39 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 torch.save(self._evaluators['SGRecall'].result_dict, f)
         
         return result_detector 
+
+    def _summarize_obj_split_head_source(self, predictions):
+        """
+        Summarize triplets by subject/object head source.
+        head source code:
+          0=regular, 1=small, 2+=fine group index
+         -1=unknown/disabled
+        """
+        summary = {
+            "subject_head_source_count": {},
+            "object_head_source_count": {},
+            "pair_head_source_count": {},
+        }
+        sub_count = defaultdict(int)
+        obj_count = defaultdict(int)
+        pair_count = defaultdict(int)
+        for pred in predictions:
+            s = pred.get("obj_split_sub_head_source", None)
+            o = pred.get("obj_split_obj_head_source", None)
+            if s is None or o is None:
+                continue
+            s = s.detach().cpu().numpy().tolist()
+            o = o.detach().cpu().numpy().tolist()
+            for ss in s:
+                sub_count[int(ss)] += 1
+            for oo in o:
+                obj_count[int(oo)] += 1
+            for ss, oo in zip(s, o):
+                pair_count[f"{int(ss)}->{int(oo)}"] += 1
+        summary["subject_head_source_count"] = dict(sorted(sub_count.items(), key=lambda kv: kv[0]))
+        summary["object_head_source_count"] = dict(sorted(obj_count.items(), key=lambda kv: kv[0]))
+        summary["pair_head_source_count"] = dict(sorted(pair_count.items(), key=lambda kv: kv[0]))
+        return summary
 
     def _compute_bbox_recall(self, ground_truths, predictions, iou_thresh=0.5):
         thing_classes = list(getattr(self._metadata, "thing_classes", []))

@@ -137,6 +137,26 @@ def add_dataset_config(cfg):
   # 当使用 ACTION GENOME 且从 VG 预训练加载时：只加载除分类头/关系头外的权重，然后按 AG 类别数重建并初始化两个头
   _C.MODEL.DETR.VG_PRETRAINED_FOR_AG = False
 
+  # Object classification split heads (regular/small/fine/bg)
+  _C.MODEL.OBJ_SPLIT = CN()
+  _C.MODEL.OBJ_SPLIT.ENABLED = False
+  _C.MODEL.OBJ_SPLIT.REGULAR_CLASSES = []
+  _C.MODEL.OBJ_SPLIT.SMALL_SHARED_CLASSES = []
+  # Fine groups as list-of-lists, e.g. [[1,2],[7,8,9]]
+  _C.MODEL.OBJ_SPLIT.FINE_GROUPS = []
+  # Optional names for fine groups; if empty, auto names are used.
+  _C.MODEL.OBJ_SPLIT.FINE_GROUP_NAMES = []
+  # Per fine-group upsample switches (same length as FINE_GROUPS)
+  _C.MODEL.OBJ_SPLIT.FINE_GROUPS_USE_UPSAMPLE = []
+  # Enable 2x upsample on small-shared branch.
+  _C.MODEL.OBJ_SPLIT.SMALL_SHARED_USE_UPSAMPLE = False
+  # Temperature scaling before assembling full logits.
+  _C.MODEL.OBJ_SPLIT.USE_TEMP_SCALING = False
+  # Auxiliary loss weights for split heads.
+  _C.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_REG = 0.0
+  _C.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_SMALL = 0.0
+  _C.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_FINE = 0.0
+
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10
   _C.MODEL.DETR.NUM_RELATION_QUERIES = 10
