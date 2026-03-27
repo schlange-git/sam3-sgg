@@ -18,12 +18,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # 参数: checkpoint（可选）；NUM_IMAGES；DATASET_NAME；RUN_EVAL；NUM_GPUS（评测用）
-DEFAULT_CKPT="z_outputs/sam3_80000iters_from_pretrained_full_train/model_0079999.pth"
+DEFAULT_CKPT="z_outputs/res101_from_pretrained_160000iters_bs8/model_0159999.pth"
 CHECKPOINT="${1:-${CHECKPOINT:-${DEFAULT_CKPT}}}"
 NUM_IMAGES="${2:-${NUM_IMAGES:-1000}}"
 DATASET_NAME="${3:-${DATASET_NAME:-AG_val}}"
 RUN_EVAL="${4:-${RUN_EVAL:-false}}"
-NUM_GPUS="${5:-${NUM_GPUS:-2}}"
+NUM_GPUS="${5:-${NUM_GPUS:-1}}"
 
 # 归一化 RUN_EVAL
 RUN_EVAL_VAL="0"

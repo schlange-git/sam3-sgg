@@ -167,6 +167,8 @@ class IterativeRelationDETR(DETR):
         self.query_injector = None
         self.object_memory_bank = None
         self._memory_states = {}
+        self.person_score_scale = float(getattr(cfg.MODEL.DETR, "PERSON_SCORE_SCALE", 1.0))
+        self.person_class_index = int(getattr(cfg.MODEL.DETR, "PERSON_CLASS_INDEX", 0))
         if self.temporal_enabled and self.temporal_mode == "feature_ema":
             alpha_init = float(getattr(cfg.MODEL.TEMPORAL, "ALPHA_INIT", 0.7))
             self.temporal_agg = TemporalAggregator(
@@ -242,6 +244,18 @@ class IterativeRelationDETR(DETR):
             relation_embed,
             pos[-1],
         )
+
+        # Score-time prior for person class on relation entity logits:
+        # logit_person <- logit_person + log(PERSON_SCORE_SCALE)
+        if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8:
+            log_scale = math.log(self.person_score_scale)
+            for key in ("relation_subject_logits", "relation_object_logits"):
+                logits = output.get(key)
+                if logits is None:
+                    continue
+                if logits.shape[-1] <= self.person_class_index:
+                    continue
+                logits[..., self.person_class_index] = logits[..., self.person_class_index] + log_scale
 
         if self.only_predicate_multiply:
             output['relation_subject_logits'] = output['relation_subject_logits'].repeat_interleave(self.multiply_query,2)

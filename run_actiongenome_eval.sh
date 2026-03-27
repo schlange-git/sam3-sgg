@@ -19,7 +19,7 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_80000iters_from_pretrained_full_train}"
+OUTPUT_DIR="${1:-z_outputs/res101_from_pretrained_160000iters_bs8}"
 NUM_GPUS="${2:-2}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
