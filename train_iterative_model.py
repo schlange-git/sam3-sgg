@@ -135,6 +135,16 @@ def setup(args):
 def main(args):
     cfg = setup(args)
     cleanup_cuda("Before building model")
+    if cfg.MODEL.SAM3.ENABLED and cfg.MODEL.SAM3.CHECKPOINT_PATH:
+        ckpt_path = cfg.MODEL.SAM3.CHECKPOINT_PATH
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ckpt_path)
+        if os.path.isfile(ckpt_path):
+            ckpt_size_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
+            print(f"[SAM3] Backbone loading from {ckpt_path} ({ckpt_size_mb:.0f} MB). "
+                  f"May take 20~60s on first build...")
+        else:
+            print(f"[SAM3] Backbone checkpoint not found at {ckpt_path}, will try HuggingFace download.")
     if args.eval_only:
         model = JointTransformerTrainer.build_model(cfg)
         # from thop import profile

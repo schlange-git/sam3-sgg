@@ -14,6 +14,7 @@ import numpy as np
 from detectron2.utils.registry import Registry
 import math 
 from ..temporal.object_memory import ObjectMemoryBank
+from .roi_refine import ROIRefineHead
 
 DETR_REGISTRY = Registry("DETR_REGISTRY")
 
@@ -169,6 +170,23 @@ class IterativeRelationDETR(DETR):
         self._memory_states = {}
         self.person_score_scale = float(getattr(cfg.MODEL.DETR, "PERSON_SCORE_SCALE", 1.0))
         self.person_class_index = int(getattr(cfg.MODEL.DETR, "PERSON_CLASS_INDEX", 0))
+        roi_refine_cfg = cfg.MODEL.ROI_REFINE
+        self.roi_refine_enabled = bool(roi_refine_cfg.ENABLED)
+        self.roi_refine_stride = int(roi_refine_cfg.STRIDE)
+        self.roi_refine_loss_enabled = bool(roi_refine_cfg.LOSS_ENABLED)
+        self.roi_refine_head = None
+        self.sam3_image_size = int(getattr(cfg.MODEL.SAM3, "IMAGE_SIZE", 1008))
+        if self.roi_refine_enabled:
+            assert self.roi_refine_stride > 0, "MODEL.ROI_REFINE.STRIDE must be positive."
+            self.roi_refine_head = ROIRefineHead(
+                hidden_dim=transformer.d_model,
+                pool_size=int(roi_refine_cfg.POOL_SIZE),
+                stride=self.roi_refine_stride,
+                small_area_thresh=float(roi_refine_cfg.SMALL_AREA_THRESH),
+                detach_boxes=bool(roi_refine_cfg.DETACH_BOXES),
+                use_gate=bool(roi_refine_cfg.USE_GATE),
+                apply_to=str(roi_refine_cfg.APPLY_TO),
+            )
         if self.temporal_enabled and self.temporal_mode == "feature_ema":
             alpha_init = float(getattr(cfg.MODEL.TEMPORAL, "ALPHA_INIT", 0.7))
             self.temporal_agg = TemporalAggregator(
@@ -177,6 +195,17 @@ class IterativeRelationDETR(DETR):
         if self.temporal_enabled and self.temporal_mode == "object_query_memory_v1":
             self.query_injector = TemporalQueryInjector(transformer.d_model)
             self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
+
+    def _classify_object_embeddings(self, embeddings):
+        assert embeddings.dim() == 3, f"Expected [B,Q,D] embeddings, got {tuple(embeddings.shape)}."
+        if getattr(self.transformer, "obj_split_enabled", False):
+            classifier = getattr(self.transformer, "split_object_classifier", None)
+            assert classifier is not None, "OBJ_SPLIT enabled but split_object_classifier is missing."
+            logits_qbd = classifier(embeddings.transpose(0, 1).unsqueeze(0))["full_logits"][0]
+            return logits_qbd.transpose(0, 1)
+        object_embed = getattr(self.transformer, "object_embed", None)
+        assert object_embed is not None, "Transformer object_embed is missing for ROI refinement."
+        return object_embed(embeddings)
 
     def reset_temporal_memory(self):
         self._memory_states = {}
@@ -257,11 +286,75 @@ class IterativeRelationDETR(DETR):
                     continue
                 logits[..., self.person_class_index] = logits[..., self.person_class_index] + log_scale
 
+        if self.roi_refine_enabled:
+            assert self.roi_refine_head is not None, "ROI_REFINE enabled but roi_refine_head was not built."
+            assert isinstance(self.backbone, nn.Sequential) and len(self.backbone) > 0, (
+                "ROI_REFINE requires Joiner-style backbone with SAM3 as self.backbone[0]."
+            )
+            backbone_module = self.backbone[0]
+            assert hasattr(backbone_module, "get_last_aux_features"), (
+                "ROI_REFINE requires SAM3 backbone exposing get_last_aux_features()."
+            )
+            aux_features = backbone_module.get_last_aux_features()
+            assert isinstance(aux_features, dict), "ROI_REFINE aux_features must be a dict keyed by stride."
+            assert self.roi_refine_stride in aux_features, (
+                f"ROI_REFINE requires native stride{self.roi_refine_stride} feature. "
+                f"Available strides: {sorted(aux_features.keys())}."
+            )
+            roi_nested = aux_features[self.roi_refine_stride]
+            roi_feature, _ = roi_nested.decompose()
+            assert roi_feature.shape[0] == bs, (
+                f"ROI_REFINE feature batch {roi_feature.shape[0]} does not match DETR batch {bs}."
+            )
+            # SAM3 always resizes input to IMAGE_SIZE x IMAGE_SIZE internally,
+            # so the feature map spatial size is always IMAGE_SIZE / stride.
+            image_h = self.sam3_image_size
+            image_w = self.sam3_image_size
+            assert image_h % self.roi_refine_stride == 0 and image_w % self.roi_refine_stride == 0, (
+                f"ROI_REFINE SAM3 IMAGE_SIZE={image_h} must be divisible by stride {self.roi_refine_stride}."
+            )
+            expected_feat_size = image_h // self.roi_refine_stride
+            assert roi_feature.shape[-2] == expected_feat_size and roi_feature.shape[-1] == expected_feat_size, (
+                f"ROI_REFINE feature shape {tuple(roi_feature.shape[-2:])} does not match "
+                f"SAM3 image {image_h} / stride {self.roi_refine_stride} = {expected_feat_size}."
+            )
+            print(f"[ROI_REFINE_DEBUG] DETR received stride{self.roi_refine_stride} feature: "
+                  f"shape={tuple(roi_feature.shape)}, "
+                  f"mean={roi_feature.mean().item():.6f}, std={roi_feature.std().item():.6f}, "
+                  f"expected_size={expected_feat_size}")
+            sub_emb = output["hs_subject_last"]
+            obj_emb = output["hs_object_last"]
+            sub_boxes = output["relation_subject_coords"][-1]
+            obj_boxes = output["relation_object_coords"][-1]
+            sub_refined, sub_mask = self.roi_refine_head(
+                sub_emb, sub_boxes, roi_feature, image_h, image_w
+            )
+            obj_refined, obj_mask = self.roi_refine_head(
+                obj_emb, obj_boxes, roi_feature, image_h, image_w
+            )
+            sub_roi_logits = self._classify_object_embeddings(sub_refined)
+            obj_roi_logits = self._classify_object_embeddings(obj_refined)
+            if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8:
+                log_scale = math.log(self.person_score_scale)
+                if sub_roi_logits.shape[-1] > self.person_class_index:
+                    sub_roi_logits[..., self.person_class_index] = sub_roi_logits[..., self.person_class_index] + log_scale
+                if obj_roi_logits.shape[-1] > self.person_class_index:
+                    obj_roi_logits[..., self.person_class_index] = obj_roi_logits[..., self.person_class_index] + log_scale
+            output["relation_subject_logits_roi"] = sub_roi_logits
+            output["relation_object_logits_roi"] = obj_roi_logits
+            output["roi_subject_mask"] = sub_mask
+            output["roi_object_mask"] = obj_mask
+
         if self.only_predicate_multiply:
             output['relation_subject_logits'] = output['relation_subject_logits'].repeat_interleave(self.multiply_query,2)
             output['relation_object_logits'] = output['relation_object_logits'].repeat_interleave(self.multiply_query,2)
             output['relation_subject_coords'] = output['relation_subject_coords'].repeat_interleave(self.multiply_query,2)
             output['relation_object_coords'] = output['relation_object_coords'].repeat_interleave(self.multiply_query,2)
+            if "relation_subject_logits_roi" in output:
+                output['relation_subject_logits_roi'] = output['relation_subject_logits_roi'].repeat_interleave(self.multiply_query,1)
+                output['relation_object_logits_roi'] = output['relation_object_logits_roi'].repeat_interleave(self.multiply_query,1)
+                output['roi_subject_mask'] = output['roi_subject_mask'].repeat_interleave(self.multiply_query,1)
+                output['roi_object_mask'] = output['roi_object_mask'].repeat_interleave(self.multiply_query,1)
 
         out = dict()
 
@@ -271,6 +364,17 @@ class IterativeRelationDETR(DETR):
         out['relation_object_logits'] = output['relation_object_logits'][-1]
         out['relation_subject_boxes'] = output['relation_subject_coords'][-1]
         out['relation_object_boxes'] = output['relation_object_coords'][-1]
+        if self.roi_refine_enabled:
+            assert "relation_subject_logits_roi" in output and "relation_object_logits_roi" in output, (
+                "ROI_REFINE enabled but refined logits were not produced."
+            )
+            out['relation_subject_logits_roi'] = output['relation_subject_logits_roi']
+            out['relation_object_logits_roi'] = output['relation_object_logits_roi']
+            out['roi_subject_mask'] = output['roi_subject_mask']
+            out['roi_object_mask'] = output['roi_object_mask']
+            if not self.training:
+                out['relation_subject_logits'] = out['relation_subject_logits_roi']
+                out['relation_object_logits'] = out['relation_object_logits_roi']
         if 'obj_split_subject_head_source_idx' in output:
             out['obj_split_subject_head_source_idx'] = output['obj_split_subject_head_source_idx'][-1]
         if 'obj_split_object_head_source_idx' in output:

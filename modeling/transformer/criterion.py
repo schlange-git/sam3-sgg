@@ -234,6 +234,9 @@ class IterativeRelationCriterionBase(nn.Module):
         self.obj_split_regular_classes = [int(x) for x in kwargs.get('obj_split_regular_classes', [])]
         self.obj_split_small_classes = [int(x) for x in kwargs.get('obj_split_small_classes', [])]
         self.obj_split_fine_groups = [[int(x) for x in g] for g in kwargs.get('obj_split_fine_groups', [])]
+        self.roi_refine_enabled = bool(kwargs.get('roi_refine_enabled', False))
+        self.roi_refine_loss_enabled = bool(kwargs.get('roi_refine_loss_enabled', False))
+        self.roi_refine_small_area_thresh = float(kwargs.get('roi_refine_small_area_thresh', 0.02))
         fine_names = [str(x) for x in kwargs.get('obj_split_fine_names', [])]
         self.obj_split_fine_names = fine_names if len(fine_names) == len(self.obj_split_fine_groups) else [
             f"group_{i}" for i in range(len(self.obj_split_fine_groups))
@@ -557,6 +560,53 @@ class IterativeRelationCriterionBase(nn.Module):
                 losses[key] = torch.stack(vals).mean()
         return losses
 
+    def _compute_roi_refine_cls_loss_for_role(self, logits, targets, indices):
+        zero = logits.sum() * 0.0
+        assert logits.dim() == 3, f"ROI refined logits must be [B,Q,C], got {tuple(logits.shape)}."
+        device = logits.device
+        vals = []
+        for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+            if src_idx.numel() == 0:
+                continue
+            src_idx = src_idx.to(device)
+            tgt_idx = tgt_idx.to(device)
+            target_boxes = targets[batch_idx]["boxes"][tgt_idx].to(device)
+            target_labels = targets[batch_idx]["labels"][tgt_idx].long().to(device)
+            target_area = target_boxes[:, 2].clamp(min=0) * target_boxes[:, 3].clamp(min=0)
+            small_mask = target_area < self.roi_refine_small_area_thresh
+            if not small_mask.any():
+                continue
+            vals.append(F.cross_entropy(logits[batch_idx, src_idx[small_mask]], target_labels[small_mask]))
+        if len(vals) == 0:
+            return zero
+        return torch.stack(vals).mean()
+
+    def get_roi_refine_losses(self, outputs, entity_targets, combined_indices):
+        if not (self.roi_refine_enabled and self.roi_refine_loss_enabled):
+            return {}
+        required = (
+            "relation_subject_logits_roi",
+            "relation_object_logits_roi",
+            "roi_subject_mask",
+            "roi_object_mask",
+        )
+        for key in required:
+            assert key in outputs, f"ROI_REFINE loss enabled but {key} is missing from model outputs."
+        assert outputs["roi_subject_mask"].shape[:2] == outputs["relation_subject_logits_roi"].shape[:2], (
+            "roi_subject_mask shape must match relation_subject_logits_roi [B,Q]."
+        )
+        assert outputs["roi_object_mask"].shape[:2] == outputs["relation_object_logits_roi"].shape[:2], (
+            "roi_object_mask shape must match relation_object_logits_roi [B,Q]."
+        )
+        return {
+            "loss_roi_subject_cls": self._compute_roi_refine_cls_loss_for_role(
+                outputs["relation_subject_logits_roi"], entity_targets, combined_indices["subject"]
+            ),
+            "loss_roi_object_cls": self._compute_roi_refine_cls_loss_for_role(
+                outputs["relation_object_logits_roi"], entity_targets, combined_indices["object"]
+            ),
+        }
+
     def forward(self, outputs, targets):
         """ This performs the loss computation.
         Parameters:
@@ -577,6 +627,7 @@ class IterativeRelationCriterionBase(nn.Module):
         relation_targets = [{'boxes': x['relation_boxes'], 'labels': x['relation_labels']} for x in targets]
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices))
         losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
+        losses.update(self.get_roi_refine_losses(outputs, entity_targets, combined_indices))
         if 'aux_outputs_r' in outputs:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],
@@ -684,6 +735,7 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
         kwargs = {'aux_loss' : False}
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices, **kwargs))
         losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
+        losses.update(self.get_roi_refine_losses(outputs, entity_targets, combined_indices))
         if 'aux_outputs_r' in outputs:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],

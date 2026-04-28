@@ -72,12 +72,8 @@ class PeriodicCheckpointerWithEval(HookBase):
         comm.synchronize()
 
     def after_train(self):
-        final_results = self._do_final_test()
-        if comm.is_main_process():
-            # logger = logging.getLogger("detectron2")
-            # logger.info("Evaluation results for final test set in csv format:")
-            # logger.info(final_results)
-            print(final_results)
-        # func is likely a closure that holds reference to the trainer
-        # therefore we clean it to avoid circular reference in the end
+        if self.eval._period > 0:
+            final_results = self._do_final_test()
+            if comm.is_main_process():
+                print(final_results)
         del self.eval._func

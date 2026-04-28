@@ -36,6 +36,9 @@ class Sam3MaskedBackbone(nn.Module):
         self.featuremap_dir = cfg.MODEL.SAM3.FEATUREMAP_DIR
         self.feature_stride = 16
         self.target_stride = getattr(cfg.MODEL.SAM3, "TARGET_STRIDE", 0)
+        roi_refine_cfg = getattr(cfg.MODEL, "ROI_REFINE", None)
+        self.roi_refine_enabled = bool(getattr(roi_refine_cfg, "ENABLED", False)) if roi_refine_cfg is not None else False
+        self.roi_refine_stride = int(getattr(roi_refine_cfg, "STRIDE", 14)) if roi_refine_cfg is not None else 14
         self.use_fpn = getattr(cfg.MODEL.SAM3, "USE_FPN", False)
         self.fpn_strides = getattr(cfg.MODEL.SAM3, "FPN_STRIDES", [4, 8, 16, 32])
         # Prefer native SAM3 multi-scale outputs when available.
@@ -56,6 +59,11 @@ class Sam3MaskedBackbone(nn.Module):
                 raise FileNotFoundError(
                     f"SAM3 precomputed feature directory does not exist: {self.featuremap_dir}. "
                     f"Please run precomputation first or set MODEL.SAM3.USE_PRECOMPUTED=False"
+                )
+            if self.roi_refine_enabled:
+                raise AssertionError(
+                    "MODEL.ROI_REFINE.ENABLED=True requires live SAM3 native backbone_fpn outputs; "
+                    "precomputed single-scale features cannot prove native stride14."
                 )
 
         # Ensure sam3 is importable from repo local path
@@ -148,19 +156,34 @@ class Sam3MaskedBackbone(nn.Module):
                 )
                 time.sleep(delay)
             try:
+                load_device = "cpu"
+                load_mem_extra = ""
+                if torch.cuda.is_available() and world_size <= 1:
+                    load_device = self.sam3_device
+                    load_mem_extra = " (GPU direct load)"
                 logging.getLogger("detectron2").info(
-                    "Loading SAM3 image backbone (rank %s/%s, on CPU first to save memory)...", rank, world_size
+                    "Loading SAM3 image backbone (rank %s/%s, device=%s%s, file=%s)...",
+                    rank, world_size, load_device, load_mem_extra,
+                    checkpoint_path or "HuggingFace",
                 )
+                load_t0 = time.time()
                 self.sam3_model = build_sam3_image_model(
-                    device="cpu",
+                    device=load_device,
                     checkpoint_path=checkpoint_path,
                     load_from_HF=(checkpoint_path is None),
                     bpe_path=bpe_path,
                 )
-                gc.collect()
-                if torch.cuda.is_available():
+                load_elapsed = time.time() - load_t0
+                logging.getLogger("detectron2").info(
+                    "SAM3 image backbone loaded on %s in %.1fs.", load_device, load_elapsed
+                )
+                if load_device == "cpu" and torch.cuda.is_available():
+                    gc.collect()
                     torch.cuda.empty_cache()
-                self.sam3_model = self.sam3_model.to(self.sam3_device)
+                    self.sam3_model = self.sam3_model.to(self.sam3_device)
+                    logging.getLogger("detectron2").info(
+                        "SAM3 image backbone moved to %s.", self.sam3_device
+                    )
                 if self.freeze:
                     self.sam3_model.eval()
                 else:
@@ -207,10 +230,14 @@ class Sam3MaskedBackbone(nn.Module):
 
         # exposed for Joiner
         self.num_channels = self.feature_dim
+        self._last_aux_features: Dict[int, NestedTensor] = {}
         if self.use_fpn:
             self.feature_strides = self.fpn_strides
         else:
             self.feature_strides = [self.feature_stride]
+
+    def get_last_aux_features(self) -> Dict[int, NestedTensor]:
+        return self._last_aux_features
 
     def _initialize_fpn_layers(self) -> None:
         """Initialize FPN layers based on actual feature_stride"""
@@ -419,9 +446,68 @@ class Sam3MaskedBackbone(nn.Module):
             stride = max(1, int(round(float(image_h) / float(proj_feat.shape[2]))))
             features.append(proj_feat)
             strides.append(stride)
-        if len(features) <= 1:
+        if len(features) == 0:
             return None
         return sorted(zip(strides, features), key=lambda x: x[0])
+
+    def _build_mask_for_stride(
+        self, feat: torch.Tensor, stride: int, images: ImageList
+    ) -> torch.Tensor:
+        n, _, h, w = feat.shape
+        mask = torch.ones((n, h, w), dtype=torch.bool, device=feat.device)
+        for img_idx, (img_h, img_w) in enumerate(images.image_sizes):
+            valid_h = int(math.ceil(float(img_h) / float(stride)))
+            valid_w = int(math.ceil(float(img_w) / float(stride)))
+            assert valid_h <= h and valid_w <= w, (
+                f"Aux feature stride{stride} mask exceeds feature shape: "
+                f"valid=({valid_h},{valid_w}), feature=({h},{w}), image=({img_h},{img_w})"
+            )
+            mask[img_idx, :valid_h, :valid_w] = 0
+        return mask
+
+    def _cache_roi_refine_aux_features(
+        self, backbone_out: Dict[str, torch.Tensor], image_h: int, image_w: int, images: ImageList
+    ) -> None:
+        self._last_aux_features = {}
+        if not self.roi_refine_enabled:
+            return
+        assert self.roi_refine_stride > 0, "MODEL.ROI_REFINE.STRIDE must be positive."
+        ordered_native = self._extract_native_multiscale(backbone_out, image_h)
+        assert ordered_native is not None, (
+            "MODEL.ROI_REFINE.ENABLED=True requires SAM3 backbone_fpn native multi-scale outputs. "
+            "No native multi-scale feature list was returned."
+        )
+        native = {int(stride): feat for stride, feat in ordered_native}
+        assert self.roi_refine_stride in native, (
+            f"Required native SAM3 stride{self.roi_refine_stride} feature not found. "
+            f"Available native strides: {sorted(native.keys())}. "
+            "Refusing to synthesize ROI_REFINE feature by resize/FPN."
+        )
+        feat = native[self.roi_refine_stride]
+        assert feat.dim() == 4, f"Expected 4D ROI_REFINE feature, got {tuple(feat.shape)}."
+        assert int(feat.shape[1]) == self.feature_dim, (
+            f"ROI_REFINE stride{self.roi_refine_stride} feature channel dim must be "
+            f"{self.feature_dim}, got {int(feat.shape[1])}."
+        )
+        actual_stride_h = float(image_h) / float(feat.shape[-2])
+        actual_stride_w = float(image_w) / float(feat.shape[-1])
+        assert abs(actual_stride_h - self.roi_refine_stride) < 1e-6, (
+            f"ROI_REFINE feature height is not native stride{self.roi_refine_stride}: "
+            f"image_h={image_h}, feature_h={feat.shape[-2]}, stride={actual_stride_h}."
+        )
+        assert abs(actual_stride_w - self.roi_refine_stride) < 1e-6, (
+            f"ROI_REFINE feature width is not native stride{self.roi_refine_stride}: "
+            f"image_w={image_w}, feature_w={feat.shape[-1]}, stride={actual_stride_w}."
+        )
+        print(f"[ROI_REFINE_DEBUG] Backbone cached stride{self.roi_refine_stride} feature: "
+              f"shape={tuple(feat.shape)}, "
+              f"mean={feat.mean().item():.6f}, std={feat.std().item():.6f}, "
+              f"min={feat.min().item():.6f}, max={feat.max().item():.6f}, "
+              f"dtype={feat.dtype}, device={feat.device}")
+        mask = self._build_mask_for_stride(feat, self.roi_refine_stride, images)
+        self._last_aux_features = {
+            self.roi_refine_stride: NestedTensor(feat, mask)
+        }
 
     def _build_nested_from_multiscale(
         self, ordered_feats: List[Tuple[int, torch.Tensor]], images: ImageList
@@ -498,6 +584,10 @@ class Sam3MaskedBackbone(nn.Module):
 
         with torch.set_grad_enabled(not self.freeze):
             backbone_out = self.sam3_model.backbone.forward_image(image_batch)
+
+        self._cache_roi_refine_aux_features(
+            backbone_out, image_batch.shape[2], image_batch.shape[3], images
+        )
 
         if self.use_fpn and self.use_backbone_fpn:
             ordered_native = self._extract_native_multiscale(backbone_out, image_batch.shape[2])
