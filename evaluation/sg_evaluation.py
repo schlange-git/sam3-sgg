@@ -63,7 +63,7 @@ class SceneGraphEvaluator(DatasetEvaluator):
                 Options: ('SGRecall', 'SGNoGraphConstraintRecall', 'SGZeroShotRecall', 'SGPairAccuracy', 'SGMeanRecall')
         """
 
-        SGMETRICS = ('SGRecall', 'SGNoGraphConstraintRecall', 'SGZeroShotRecall', 'SGPairAccuracy', 'SGMeanRecall','query_count_per_rel_class','rel_class_info_per_query','recall_per_class')
+        SGMETRICS = ('SGRecall', 'SGNoGraphConstraintRecall', 'SGZeroShotRecall', 'SGPairAccuracy', 'SGMeanRecall','query_count_per_rel_class','rel_class_info_per_query','recall_per_class','SGErrorAnalysis')
 
         self._mode = self._mode_from_config(cfg)
         self._distributed = distributed
@@ -397,7 +397,9 @@ class SceneGraphEvaluator(DatasetEvaluator):
         # 额外输出 bbox recall 表格（IoU=0.50），便于和 AP 对照分析 precision/recall 失衡
         bbox_recall = self._compute_bbox_recall(ground_truths, predictions, iou_thresh=0.5)
         result_detector["bbox_recall"] = bbox_recall
-        result_detector["obj_split_triplet_head_source"] = self._summarize_obj_split_head_source(predictions)
+        # 检测错误分析（逐类别）
+        det_error_analysis = self._compute_detection_error_analysis(ground_truths, predictions, iou_thresh=0.5)
+        result_detector["det_error_analysis"] = det_error_analysis
 
         result_detector['SG'] = self._evaluate_scenegraphs(ground_truths, predictions)
         
@@ -528,6 +530,165 @@ class SceneGraphEvaluator(DatasetEvaluator):
             )
         return recall_dict
 
+    def _compute_detection_error_analysis(self, ground_truths, predictions, iou_thresh=0.5):
+        """
+        For each GT object box, classify the detection failure reason.
+        Error types:
+          1. loc_miss:      no predicted box with IoU >= iou_thresh
+          2. cls_wrong:     has box IoU >= iou_thresh but all wrong class
+          3. low_score:     correct class & IoU but not matched in greedy 1-to-1 (top-N effect / suppressed by higher-score preds)
+          4. success:       correctly matched in greedy 1-to-1
+        Output: per-category table logged to logger.
+        """
+        thing_classes = list(getattr(self._metadata, "thing_classes", []))
+        num_classes = len(thing_classes)
+        total_count = np.zeros(num_classes, dtype=np.int64)
+        loc_miss_count = np.zeros(num_classes, dtype=np.int64)
+        cls_wrong_count = np.zeros(num_classes, dtype=np.int64)
+        low_score_count = np.zeros(num_classes, dtype=np.int64)
+        success_count = np.zeros(num_classes, dtype=np.int64)
+
+        for gt, pred in zip(ground_truths, predictions):
+            gt_boxes = gt["gt_boxes"].tensor.detach().cpu()
+            gt_labels = gt["labels"].long().detach().cpu()
+
+            pred_instances = pred.get("instances", None)
+            if pred_instances is None or len(pred_instances) == 0:
+                for cls in gt_labels.tolist():
+                    if 0 <= cls < num_classes:
+                        total_count[cls] += 1
+                        loc_miss_count[cls] += 1
+                continue
+
+            pred_boxes = pred_instances.pred_boxes.tensor.detach().cpu()
+            pred_labels = pred_instances.pred_classes.long().detach().cpu()
+            pred_scores = pred_instances.scores.detach().cpu()
+
+            # For greedy 1-to-1 matching: sort preds by score descending
+            score_order = torch.argsort(pred_scores, descending=True)
+            sorted_pred_boxes = pred_boxes[score_order]
+            sorted_pred_labels = pred_labels[score_order]
+            used_pred = set()
+
+            for gt_i in range(len(gt_boxes)):
+                gt_cls = int(gt_labels[gt_i])
+                if gt_cls < 0 or gt_cls >= num_classes:
+                    continue
+
+                total_count[gt_cls] += 1
+                gt_box = gt_boxes[gt_i:gt_i+1]  # (1, 4)
+
+                # Step 1: find all pred boxes with IoU >= threshold
+                ious = pairwise_iou(Boxes(gt_box), Boxes(pred_boxes))[0]  # (N_pred,)
+                box_match = ious >= iou_thresh
+
+                if not box_match.any():
+                    loc_miss_count[gt_cls] += 1
+                    continue
+
+                # Step 2: among box-matched preds, check if any has correct class
+                box_match_indices = torch.where(box_match)[0]
+                cls_of_box_matched = pred_labels[box_match_indices]
+                cls_correct = cls_of_box_matched == gt_cls
+
+                if not cls_correct.any():
+                    cls_wrong_count[gt_cls] += 1
+                    continue
+
+                # Step 3: correct class & box exists. Check if it is matched in greedy 1-to-1.
+                # We do the same greedy matching as _compute_bbox_recall.
+                matched = False
+                vals, idxs = torch.sort(ious, descending=True)
+                for v, p_idx in zip(vals.tolist(), idxs.tolist()):
+                    if v < iou_thresh:
+                        break
+                    if p_idx not in used_pred:
+                        used_pred.add(p_idx)
+                        matched = True
+                        break
+
+                if matched:
+                    success_count[gt_cls] += 1
+                else:
+                    low_score_count[gt_cls] += 1
+
+        # Log the results
+        self._logger.info("")
+        self._logger.info("=" * 120)
+        self._logger.info("Detection Error Analysis (IoU={})".format(iou_thresh))
+        self._logger.info("=" * 120)
+        self._logger.info("Error types:")
+        self._logger.info("  1. loc_miss:     no predicted box with IoU >= {}".format(iou_thresh))
+        self._logger.info("  2. cls_wrong:    box matched but class predicted wrong")
+        self._logger.info("  3. low_score:    correct class & IoU but not in greedy 1-to-1 match (suppressed)")
+        self._logger.info("  4. success:      correctly matched in greedy 1-to-1")
+
+        headers = ["category", "total_gt", "loc_miss", "cls_wrong", "low_score", "success", "recall"]
+        rows = []
+        for cls_idx, cls_name in enumerate(thing_classes):
+            t = int(total_count[cls_idx])
+            if t == 0:
+                continue
+            lm = int(loc_miss_count[cls_idx])
+            cw = int(cls_wrong_count[cls_idx])
+            ls = int(low_score_count[cls_idx])
+            sc = int(success_count[cls_idx])
+            recall = float(sc) / float(t) * 100.0
+            pct_lm = float(lm) / float(t) * 100.0
+            pct_cw = float(cw) / float(t) * 100.0
+            pct_ls = float(ls) / float(t) * 100.0
+            rows.append((
+                cls_name, t, lm,
+                f"{lm} ({pct_lm:.1f}%)",
+                f"{cw} ({pct_cw:.1f}%)",
+                f"{ls} ({pct_ls:.1f}%)",
+                f"{sc} ({recall:.1f}%)",
+                f"{recall:.2f}%",
+            ))
+
+        # 按 loc_miss 数量降序排序
+        rows.sort(key=lambda r: r[2], reverse=True)
+
+        # 构建显示行（只保留显示用的字段，去掉排序用的原始 lm）
+        display_rows = [r[:2] + r[3:] for r in rows]
+
+        t_total = int(total_count.sum())
+        lm_total = int(loc_miss_count.sum())
+        cw_total = int(cls_wrong_count.sum())
+        ls_total = int(low_score_count.sum())
+        sc_total = int(success_count.sum())
+        total_recall = float(sc_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_lm_t = float(lm_total) / float(t_total) * 100.0
+        pct_cw_t = float(cw_total) / float(t_total) * 100.0
+        pct_ls_t = float(ls_total) / float(t_total) * 100.0
+        display_rows.append([
+            'TOTAL', t_total,
+            f"{lm_total} ({pct_lm_t:.1f}%)",
+            f"{cw_total} ({pct_cw_t:.1f}%)",
+            f"{ls_total} ({pct_ls_t:.1f}%)",
+            f"{sc_total} ({total_recall:.1f}%)",
+            f"{total_recall:.2f}%",
+        ])
+
+        self._logger.info("\n" + tabulate(display_rows, headers=headers, tablefmt="pipe"))
+        self._logger.info("=" * 120)
+
+        result_dict = {"det_Recall@50": total_recall}
+        for cls_idx, cls_name in enumerate(thing_classes):
+            t = int(total_count[cls_idx])
+            if t == 0:
+                continue
+            lm = int(loc_miss_count[cls_idx])
+            cw = int(cls_wrong_count[cls_idx])
+            ls = int(low_score_count[cls_idx])
+            sc = int(success_count[cls_idx])
+            result_dict[f"{cls_name}_loc_miss"] = int(loc_miss_count[cls_idx])
+            result_dict[f"{cls_name}_cls_wrong"] = int(cls_wrong_count[cls_idx])
+            result_dict[f"{cls_name}_low_score"] = int(low_score_count[cls_idx])
+            result_dict[f"{cls_name}_success"] = int(success_count[cls_idx])
+            result_dict[f"{cls_name}_total"] = int(total_count[cls_idx])
+        return result_dict
+
     def _evaluate_scenegraphs(self, ground_truths, predictions):
         
         # result_detector = None
@@ -570,6 +731,8 @@ class SceneGraphEvaluator(DatasetEvaluator):
         if self.cfg.MODEL.ROI_SCENEGRAPH_HEAD.USE_GT_BOX and 'SGPairAccuracy' in self._evaluators:
             result_str += self._evaluators['SGPairAccuracy'].generate_print_string(self._mode)
         result_str += self._evaluators['recall_per_class'].generate_print_string(self._mode,self.cfg,len(ground_truths))
+        if 'SGErrorAnalysis' in self._evaluators:
+            result_str += self._evaluators['SGErrorAnalysis'].generate_print_string(self._mode)
         result_str += '=' * 100 + '\n'
         
         torch.save(self._evaluators['SGRecall'].result_dict, 'temp.pth')
@@ -674,6 +837,8 @@ class SceneGraphEvaluator(DatasetEvaluator):
         if 'SGZeroShotRecall' in self._metrics:
             # Zero shot Recall
             self._evaluators['SGZeroShotRecall'].calculate_recall(global_container, local_container, mode, i)
+        if 'SGErrorAnalysis' in self._metrics:
+            self._evaluators['SGErrorAnalysis'].calculate(self.cfg, global_container, local_container, mode, i)
         return 
         
 
@@ -1225,6 +1390,197 @@ class SGAccumulateRecall(SceneGraphEvaluation):
             self.result_dict[mode + '_accumulate_recall'][k] = float(self.result_dict[mode + '_recall_hit'][k][0]) / float(self.result_dict[mode + '_recall_count'][k][0] + 1e-10)
 
         return 
+
+
+"""
+Error Analysis: categorize each GT triplet into one of four error types.
+"""
+@SCENEGRAPH_METRIC_REGISTRY.register()
+class SGErrorAnalysis(SceneGraphEvaluation):
+    def __init__(self, cfg, result_dict, dataset_name):
+        super(SGErrorAnalysis, self).__init__(result_dict)
+        self.cfg = cfg
+        self.num_rel = cfg.MODEL.ROI_SCENEGRAPH_HEAD.NUM_CLASSES
+        self.iou_thresh = cfg.TEST.RELATION.IOU_THRESHOLD
+        self.rel_name_list = MetadataCatalog.get(dataset_name).predicate_classes
+        self.obj_name_list = MetadataCatalog.get(dataset_name).thing_classes
+
+    def register_container(self, mode, cfg, total):
+        self.result_dict['error_analysis_total'] = np.zeros(self.num_rel, dtype=np.int64)
+        self.result_dict['error_analysis_loc_miss'] = np.zeros(self.num_rel, dtype=np.int64)
+        self.result_dict['error_analysis_cls_wrong'] = np.zeros(self.num_rel, dtype=np.int64)
+        self.result_dict['error_analysis_triplet_fail'] = np.zeros(self.num_rel, dtype=np.int64)
+        self.result_dict['error_analysis_low_score'] = np.zeros(self.num_rel, dtype=np.int64)
+        self.result_dict['error_analysis_success'] = np.zeros(self.num_rel, dtype=np.int64)
+
+    def generate_print_string(self, mode):
+        total = self.result_dict['error_analysis_total']
+        loc_miss = self.result_dict['error_analysis_loc_miss']
+        cls_wrong = self.result_dict['error_analysis_cls_wrong']
+        triplet_fail = self.result_dict['error_analysis_triplet_fail']
+        low_score = self.result_dict['error_analysis_low_score']
+        success = self.result_dict['error_analysis_success']
+
+        result_str = '\n' + '=' * 120 + '\n'
+        result_str += 'Error Analysis of GT triplets (by predicate category)\n'
+        result_str += '=' * 120 + '\n'
+        result_str += 'Error types:\n'
+        result_str += '  1. loc_miss:      no predicted sub/obj box pair with IoU >= {}\n'.format(self.iou_thresh)
+        result_str += '  2. cls_wrong:     box matched but sub/obj class predicted wrong\n'
+        result_str += '  3. triplet_fail:  sub/obj correct but predicate wrong\n'
+        result_str += '  4. low_score:     full triplet correct but score rank below top-100\n'
+        result_str += '  5. success:       correctly recalled in top-100\n'
+        result_str += '-' * 120 + '\n'
+
+        headers = ['predicate', 'total_gt', 'loc_miss', 'cls_wrong', 'triplet_fail', 'low_score', 'success', 'recall@100']
+        rows = []
+        for rel_idx in range(self.num_rel):
+            t = int(total[rel_idx])
+            if t == 0:
+                continue
+            lm = int(loc_miss[rel_idx])
+            cw = int(cls_wrong[rel_idx])
+            tf = int(triplet_fail[rel_idx])
+            ls = int(low_score[rel_idx])
+            sc = int(success[rel_idx])
+            recall = float(sc) / float(t) * 100.0
+            pct_lm = float(lm) / float(t) * 100.0
+            pct_cw = float(cw) / float(t) * 100.0
+            pct_tf = float(tf) / float(t) * 100.0
+            pct_ls = float(ls) / float(t) * 100.0
+            name = self.rel_name_list[rel_idx] if rel_idx < len(self.rel_name_list) else f"rel_{rel_idx}"
+            rows.append((
+                name, t, lm,
+                f"{lm} ({pct_lm:.1f}%)",
+                f"{cw} ({pct_cw:.1f}%)",
+                f"{tf} ({pct_tf:.1f}%)",
+                f"{ls} ({pct_ls:.1f}%)",
+                f"{sc} ({recall:.1f}%)",
+                f"{recall:.2f}%",
+            ))
+
+        # 按 loc_miss 数量降序排序
+        rows.sort(key=lambda r: r[2], reverse=True)
+        display_rows = [r[:2] + r[3:] for r in rows]
+
+        t_total = int(total.sum())
+        lm_total = int(loc_miss.sum())
+        cw_total = int(cls_wrong.sum())
+        tf_total = int(triplet_fail.sum())
+        ls_total = int(low_score.sum())
+        sc_total = int(success.sum())
+        total_recall = float(sc_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_lm_t = float(lm_total) / float(t_total) * 100.0
+        pct_cw_t = float(cw_total) / float(t_total) * 100.0
+        pct_tf_t = float(tf_total) / float(t_total) * 100.0
+        pct_ls_t = float(ls_total) / float(t_total) * 100.0
+        display_rows.append([
+            'TOTAL', t_total,
+            f"{lm_total} ({pct_lm_t:.1f}%)",
+            f"{cw_total} ({pct_cw_t:.1f}%)",
+            f"{tf_total} ({pct_tf_t:.1f}%)",
+            f"{ls_total} ({pct_ls_t:.1f}%)",
+            f"{sc_total} ({total_recall:.1f}%)",
+            f"{total_recall:.2f}%",
+        ])
+
+        result_str += tabulate(display_rows, headers=headers, tablefmt="pipe")
+        result_str += '\n' + '=' * 120 + '\n'
+        return result_str
+
+    def calculate(self, cfg, global_container, local_container, mode, i):
+        """Analyze each GT triplet and classify the error type."""
+        gt_rels = local_container['gt_rels']
+        gt_boxes = local_container['gt_boxes']
+        gt_classes = local_container['gt_classes']
+
+        pred_rel_inds = local_container['pred_rel_inds']
+        rel_scores = local_container['rel_scores']
+        rel_labels = local_container['rel_labels']
+        pred_boxes = local_container['pred_boxes']
+        pred_classes = local_container['pred_classes']
+        obj_scores = local_container['obj_scores']
+
+        if len(gt_rels) == 0:
+            return
+
+        pred_sub_ids = pred_rel_inds[:, 0].astype(np.int64)
+        pred_obj_ids = pred_rel_inds[:, 1].astype(np.int64)
+
+        # Sort predictions by combined score descending
+        pred_score_all = rel_scores[:, :-1].max(1)
+        pred_combined_scores = obj_scores[pred_sub_ids] * pred_score_all * obj_scores[pred_obj_ids]
+        sort_order = np.argsort(-pred_combined_scores)
+
+        iou_thresh = self.iou_thresh
+
+        for gt_idx in range(len(gt_rels)):
+            gt_sub_id, gt_obj_id, gt_pred_label = gt_rels[gt_idx]
+            gt_sub_id, gt_obj_id = int(gt_sub_id), int(gt_obj_id)
+            gt_pred_label = int(gt_pred_label)
+            gt_sub_box = gt_boxes[gt_sub_id:gt_sub_id+1]
+            gt_obj_box = gt_boxes[gt_obj_id:gt_obj_id+1]
+            gt_sub_class = int(gt_classes[gt_sub_id])
+            gt_obj_class = int(gt_classes[gt_obj_id])
+
+            # Box IoU matching for all predictions
+            pred_sub_boxes_all = pred_boxes[pred_sub_ids]
+            pred_obj_boxes_all = pred_boxes[pred_obj_ids]
+
+            sub_iou_all = pairwise_iou(
+                Boxes(torch.from_numpy(gt_sub_box).float()),
+                Boxes(torch.from_numpy(pred_sub_boxes_all).float()),
+            )[0].numpy()
+            obj_iou_all = pairwise_iou(
+                Boxes(torch.from_numpy(gt_obj_box).float()),
+                Boxes(torch.from_numpy(pred_obj_boxes_all).float()),
+            )[0].numpy()
+            box_match_all = (sub_iou_all >= iou_thresh) & (obj_iou_all >= iou_thresh)
+
+            if not box_match_all.any():
+                self.result_dict['error_analysis_loc_miss'][gt_pred_label] += 1
+                self.result_dict['error_analysis_total'][gt_pred_label] += 1
+                continue
+
+            box_match_indices = np.where(box_match_all)[0]
+            matched_pred_sub_classes = pred_classes[pred_sub_ids[box_match_indices]]
+            matched_pred_obj_classes = pred_classes[pred_obj_ids[box_match_indices]]
+            matched_pred_rel_labels = rel_labels[box_match_indices]
+
+            sub_obj_class_ok = (matched_pred_sub_classes == gt_sub_class) & \
+                               (matched_pred_obj_classes == gt_obj_class)
+
+            if not sub_obj_class_ok.any():
+                self.result_dict['error_analysis_cls_wrong'][gt_pred_label] += 1
+                self.result_dict['error_analysis_total'][gt_pred_label] += 1
+                continue
+
+            # Among those with correct sub/obj class, check predicate match
+            triplet_ok_mask = sub_obj_class_ok
+            full_match_global_idx = box_match_indices[triplet_ok_mask]
+            full_match_pred_labels = matched_pred_rel_labels[triplet_ok_mask]
+            pred_match = full_match_pred_labels == gt_pred_label
+
+            if not pred_match.any():
+                self.result_dict['error_analysis_triplet_fail'][gt_pred_label] += 1
+                self.result_dict['error_analysis_total'][gt_pred_label] += 1
+                continue
+
+            # Full match exists: check rank
+            full_match_global_set = set(full_match_global_idx[pred_match].tolist())
+            rank = None
+            for rk, orig_idx in enumerate(sort_order):
+                if orig_idx in full_match_global_set:
+                    rank = rk
+                    break
+
+            if rank is None:
+                self.result_dict['error_analysis_triplet_fail'][gt_pred_label] += 1
+            elif rank >= 100:
+                self.result_dict['error_analysis_low_score'][gt_pred_label] += 1
+            else:
+                self.result_dict['error_analysis_success'][gt_pred_label] += 1
+            self.result_dict['error_analysis_total'][gt_pred_label] += 1
 
 
 def _triplet(relations, classes, boxes, predicate_scores=None, class_scores=None):

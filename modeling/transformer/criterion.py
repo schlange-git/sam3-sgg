@@ -7,6 +7,7 @@ from torch import nn
 
 from .util import box_ops
 from .util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+from .util.box_ops import complete_box_iou, efficient_box_iou
 from .util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
@@ -53,6 +54,19 @@ class SetCriterion(nn.Module):
             # Action Genome object_classes 中 person 位于索引 0。
             empty_weight[0] = self.person_class_weight
         self.register_buffer('empty_weight', empty_weight)
+        # Box regression loss type and corner loss
+        self.box_loss_type = kwargs.get('box_loss_type', 'giou')
+        self.use_corner_loss = kwargs.get('use_corner_loss', False)
+        self.corner_loss_weight = kwargs.get('corner_loss_weight', 1.0)
+
+    def _iou_loss(self, src_boxes_xyxy, target_boxes_xyxy):
+        """Compute IoU-based loss (GIoU / CIoU / EIoU) as 1 - iou_metric."""
+        if self.box_loss_type == 'ciou':
+            return 1 - torch.diag(complete_box_iou(src_boxes_xyxy, target_boxes_xyxy))
+        elif self.box_loss_type == 'eiou':
+            return 1 - torch.diag(efficient_box_iou(src_boxes_xyxy, target_boxes_xyxy))
+        else:  # default: giou
+            return 1 - torch.diag(generalized_box_iou(src_boxes_xyxy, target_boxes_xyxy))
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         """Classification loss (NLL)
@@ -104,10 +118,13 @@ class SetCriterion(nn.Module):
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes if num_boxes > 0 else loss_bbox.sum()
 
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes if num_boxes > 0 else loss_giou.sum()
+        src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes)
+        tgt_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+        losses['loss_giou'] = self._iou_loss(src_xyxy, tgt_xyxy).sum() / num_boxes if num_boxes > 0 else self._iou_loss(src_xyxy, tgt_xyxy).sum()
+
+        if self.use_corner_loss and num_boxes > 0:
+            loss_corner = F.l1_loss(src_xyxy, tgt_xyxy, reduction='none')
+            losses['loss_corner'] = self.corner_loss_weight * loss_corner.sum() / num_boxes
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes, **kwargs):
@@ -237,6 +254,10 @@ class IterativeRelationCriterionBase(nn.Module):
         self.roi_refine_enabled = bool(kwargs.get('roi_refine_enabled', False))
         self.roi_refine_loss_enabled = bool(kwargs.get('roi_refine_loss_enabled', False))
         self.roi_refine_small_area_thresh = float(kwargs.get('roi_refine_small_area_thresh', 0.02))
+        # Box regression loss type and corner loss
+        self.box_loss_type = kwargs.get('box_loss_type', 'giou')
+        self.use_corner_loss = kwargs.get('use_corner_loss', False)
+        self.corner_loss_weight = kwargs.get('corner_loss_weight', 1.0)
         fine_names = [str(x) for x in kwargs.get('obj_split_fine_names', [])]
         self.obj_split_fine_names = fine_names if len(fine_names) == len(self.obj_split_fine_groups) else [
             f"group_{i}" for i in range(len(self.obj_split_fine_groups))
@@ -251,7 +272,6 @@ class IterativeRelationCriterionBase(nn.Module):
         empty_weight_obj = torch.ones(self.num_classes + 1)
         empty_weight_obj[-1] = self.eos_coef
         if self.num_classes > 0:
-            # Action Genome object_classes 中 person 位于索引 0。
             empty_weight_obj[0] = self.person_class_weight
         empty_rel_weight = torch.ones(self.num_rel_classes + 1)
         empty_rel_weight[-1] = kwargs['rel_eos_coef']
@@ -261,10 +281,19 @@ class IterativeRelationCriterionBase(nn.Module):
             else:
                 empty_rel_weight = (self.statistics['fg_rel_count'].sum() / (self.statistics['fg_rel_count'] + 1e-5))
             empty_rel_weight[-1] = kwargs['reweight_rel_eos_coef']
-        print (empty_weight_obj)
-        print (empty_rel_weight)
+        print(empty_weight_obj)
+        print(empty_rel_weight)
         self.register_buffer('empty_weight_obj', empty_weight_obj)
         self.register_buffer('empty_rel_weight', empty_rel_weight)
+
+    def _iou_loss(self, src_boxes_xyxy, target_boxes_xyxy):
+        """Compute IoU-based loss (GIoU / CIoU / EIoU) as 1 - iou_metric."""
+        if self.box_loss_type == 'ciou':
+            return 1 - torch.diag(complete_box_iou(src_boxes_xyxy, target_boxes_xyxy))
+        elif self.box_loss_type == 'eiou':
+            return 1 - torch.diag(efficient_box_iou(src_boxes_xyxy, target_boxes_xyxy))
+        else:  # default: giou
+            return 1 - torch.diag(generalized_box_iou(src_boxes_xyxy, target_boxes_xyxy))
         
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         """Classification loss (NLL)
@@ -321,10 +350,14 @@ class IterativeRelationCriterionBase(nn.Module):
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes if num_boxes > 0 else loss_bbox.sum()
 
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes if num_boxes > 0 else loss_giou.sum()
+        src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes)
+        tgt_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+        iou_loss_val = self._iou_loss(src_xyxy, tgt_xyxy)
+        losses['loss_giou'] = iou_loss_val.sum() / num_boxes if num_boxes > 0 else iou_loss_val.sum()
+
+        if self.use_corner_loss and num_boxes > 0:
+            loss_corner = F.l1_loss(src_xyxy, tgt_xyxy, reduction='none')
+            losses['loss_corner'] = self.corner_loss_weight * loss_corner.sum() / num_boxes
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes, **kwargs):
@@ -422,13 +455,19 @@ class IterativeRelationCriterionBase(nn.Module):
 
             losses['loss_bbox_relation'] = loss_bbox.sum() / num_relation_boxes if num_relation_boxes > 0 else loss_bbox.sum()
 
-            loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-                box_ops.box_cxcywh_to_xyxy(src_boxes),
-                box_ops.box_cxcywh_to_xyxy(target_boxes)))
-            losses['loss_giou_relation'] = loss_giou.sum() / num_relation_boxes if num_relation_boxes > 0 else loss_giou.sum()
+            src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes)
+            tgt_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+            iou_loss_val = self._iou_loss(src_xyxy, tgt_xyxy)
+            losses['loss_giou_relation'] = iou_loss_val.sum() / num_relation_boxes if num_relation_boxes > 0 else iou_loss_val.sum()
+
+            if self.use_corner_loss and num_relation_boxes > 0:
+                loss_corner = F.l1_loss(src_xyxy, tgt_xyxy, reduction='none')
+                losses['loss_corner_relation'] = self.corner_loss_weight * loss_corner.sum() / num_relation_boxes
         else:
             losses['loss_bbox_relation'] = (outputs['relation_boxes'] * 0.0).sum()
             losses['loss_giou_relation'] = (outputs['relation_boxes'] * 0.0).sum()
+            if self.use_corner_loss:
+                losses['loss_corner_relation'] = (outputs['relation_boxes'] * 0.0).sum()
 
         return losses
 
@@ -696,14 +735,20 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
 
             losses['loss_bbox_relation'] = loss_bbox.sum() / num_relation_boxes if num_relation_boxes > 0 else loss_bbox.sum()
 
-            loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-                box_ops.box_cxcywh_to_xyxy(src_boxes),
-                box_ops.box_cxcywh_to_xyxy(target_boxes)))
-            losses['loss_giou_relation'] = loss_giou.sum() / num_relation_boxes if num_relation_boxes > 0 else loss_giou.sum()
+            src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes)
+            tgt_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+            iou_loss_val = self._iou_loss(src_xyxy, tgt_xyxy)
+            losses['loss_giou_relation'] = iou_loss_val.sum() / num_relation_boxes if num_relation_boxes > 0 else iou_loss_val.sum()
+
+            if self.use_corner_loss and num_relation_boxes > 0:
+                loss_corner = F.l1_loss(src_xyxy, tgt_xyxy, reduction='none')
+                losses['loss_corner_relation'] = self.corner_loss_weight * loss_corner.sum() / num_relation_boxes
 
         else:
             losses['loss_bbox_relation'] = (outputs['relation_boxes'] * 0.0).sum()
             losses['loss_giou_relation'] = (outputs['relation_boxes'] * 0.0).sum()
+            if self.use_corner_loss:
+                losses['loss_corner_relation'] = (outputs['relation_boxes'] * 0.0).sum()
         
         return losses
         

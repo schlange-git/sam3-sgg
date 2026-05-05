@@ -187,6 +187,7 @@ class IterativeRelationDETR(DETR):
                 use_gate=bool(roi_refine_cfg.USE_GATE),
                 apply_to=str(roi_refine_cfg.APPLY_TO),
             )
+            self.roi_refine_head.only_roi_cls = bool(roi_refine_cfg.ONLY_ROI_CLS)
         if self.temporal_enabled and self.temporal_mode == "feature_ema":
             alpha_init = float(getattr(cfg.MODEL.TEMPORAL, "ALPHA_INIT", 0.7))
             self.temporal_agg = TemporalAggregator(
@@ -318,10 +319,6 @@ class IterativeRelationDETR(DETR):
                 f"ROI_REFINE feature shape {tuple(roi_feature.shape[-2:])} does not match "
                 f"SAM3 image {image_h} / stride {self.roi_refine_stride} = {expected_feat_size}."
             )
-            print(f"[ROI_REFINE_DEBUG] DETR received stride{self.roi_refine_stride} feature: "
-                  f"shape={tuple(roi_feature.shape)}, "
-                  f"mean={roi_feature.mean().item():.6f}, std={roi_feature.std().item():.6f}, "
-                  f"expected_size={expected_feat_size}")
             sub_emb = output["hs_subject_last"]
             obj_emb = output["hs_object_last"]
             sub_boxes = output["relation_subject_coords"][-1]

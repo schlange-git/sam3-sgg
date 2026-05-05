@@ -499,11 +499,6 @@ class Sam3MaskedBackbone(nn.Module):
             f"ROI_REFINE feature width is not native stride{self.roi_refine_stride}: "
             f"image_w={image_w}, feature_w={feat.shape[-1]}, stride={actual_stride_w}."
         )
-        print(f"[ROI_REFINE_DEBUG] Backbone cached stride{self.roi_refine_stride} feature: "
-              f"shape={tuple(feat.shape)}, "
-              f"mean={feat.mean().item():.6f}, std={feat.std().item():.6f}, "
-              f"min={feat.min().item():.6f}, max={feat.max().item():.6f}, "
-              f"dtype={feat.dtype}, device={feat.device}")
         mask = self._build_mask_for_stride(feat, self.roi_refine_stride, images)
         self._last_aux_features = {
             self.roi_refine_stride: NestedTensor(feat, mask)

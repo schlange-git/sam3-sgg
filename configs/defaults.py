@@ -98,6 +98,11 @@ def add_dataset_config(cfg):
   _C.MODEL.DETR.NAME = 'DETR'
   _C.MODEL.DETR.CRITERION = 'SetCriterion'
   _C.MODEL.DETR.TRANSFORMER = 'Transformer'
+  # Box regression loss type: "giou", "ciou", "eiou"
+  _C.MODEL.DETR.BOX_LOSS_TYPE = "giou"
+  # Corner loss (L1 on xyxy corners) as auxiliary regression loss
+  _C.MODEL.DETR.USE_CORNER_LOSS = False
+  _C.MODEL.DETR.CORNER_LOSS_WEIGHT = 1.0
   _C.MODEL.DETR.MATCHER = 'HungarianMatcher'
   _C.MODEL.DETR.POSITION_EMBEDDING = 'PositionEmbeddingSine'
   _C.MODEL.DETR.NHEADS = 8
@@ -170,6 +175,7 @@ def add_dataset_config(cfg):
   _C.MODEL.ROI_REFINE.LOSS_ENABLED = False
   _C.MODEL.ROI_REFINE.LOSS_WEIGHT = 1.0
   _C.MODEL.ROI_REFINE.APPLY_TO = "small_only"
+  _C.MODEL.ROI_REFINE.ONLY_ROI_CLS = False
 
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10

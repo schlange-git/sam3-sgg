@@ -37,6 +37,7 @@ class ROIRefineHead(nn.Module):
         self.small_area_thresh = float(small_area_thresh)
         self.detach_boxes = bool(detach_boxes)
         self.apply_to = str(apply_to)
+        self.only_roi_cls = False
 
         in_dim = self.hidden_dim * self.pool_size * self.pool_size
         self.roi_proj = nn.Sequential(
@@ -117,8 +118,6 @@ class ROIRefineHead(nn.Module):
 
         rois, keep_mask, flat_indices = self._build_rois(boxes_cxcywh, image_h, image_w)
         if flat_indices.numel() == 0:
-            print(f"[ROI_REFINE_DEBUG] ROIRefineHead: no boxes selected (apply_to={self.apply_to}, "
-                  f"area_thresh={self.small_area_thresh}), returning original embeddings.")
             return embeddings, keep_mask
 
         roi_feat = roi_align(
@@ -129,15 +128,7 @@ class ROIRefineHead(nn.Module):
             sampling_ratio=2,
             aligned=True,
         )
-        roi_emb = self.roi_proj(roi_feat.flatten(1))
-
-        print(f"[ROI_REFINE_DEBUG] ROIRefineHead: stride={self.stride}, "
-              f"feature={tuple(feature.shape)}, "
-              f"num_rois={rois.shape[0]}, "
-              f"roi_feat_pooled={tuple(roi_feat.shape)}, "
-              f"roi_emb={tuple(roi_emb.shape)}, "
-              f"embeddings={tuple(embeddings.shape)}, "
-              f"keep_ratio={keep_mask.float().mean().item():.4f}")
+        roi_emb = self.roi_proj(roi_feat.flatten(1)).contiguous()
 
         flat_embeddings = embeddings.reshape(b * n, c)
         selected_embeddings = flat_embeddings[flat_indices]
@@ -147,5 +138,10 @@ class ROIRefineHead(nn.Module):
             residual = roi_emb
 
         refined_flat = flat_embeddings.clone()
-        refined_flat[flat_indices] = refined_flat[flat_indices] + residual
-        return refined_flat.reshape(b, n, c), keep_mask
+        if self.only_roi_cls:
+            # Replace embedding with roi projection entirely (no original embedding contribution)
+            refined_flat[flat_indices] = residual
+        else:
+            # Default: residual addition
+            refined_flat[flat_indices] = refined_flat[flat_indices] + residual
+        return refined_flat.reshape(b, n, c).contiguous(), keep_mask

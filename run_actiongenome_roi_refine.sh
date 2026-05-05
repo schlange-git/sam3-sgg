@@ -24,9 +24,19 @@ if [[ -n "${OMP_NUM_THREADS:-}" ]] && [[ "${OMP_NUM_THREADS}" == "0" || ! "${OMP
   unset OMP_NUM_THREADS
 fi
 
-OUTPUT_DIR="${1:-z_outputs/sam3_roi_refine}"
-NUM_GPUS="${2:-1}"
-OVERFIT="${3:-1}"
+OUTPUT_DIR="${1:-z_outputs/sam3_roi_eiou_cornerloss_bs8_localdebug}"
+NUM_GPUS="${2:--1}"
+if [[ "${NUM_GPUS}" == "-1" ]]; then
+  if command -v nvidia-smi &>/dev/null; then
+    NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
+  else
+    NUM_GPUS=1
+  fi
+  echo "Auto-detected NUM_GPUS=${NUM_GPUS}"
+fi
+OVERFIT="${3:-0}"
+
+# 后续参数不再通过命令行传入，直接写在 configs/speaq_ag_roi.yaml 中
 
 CONFIG="configs/speaq_ag_roi.yaml"
 PORT="${PORT:-29500}"
@@ -168,17 +178,34 @@ monitor_memory() {
 }
 
 # -----------------------------
+# 训练前清理：清空 GPU 缓存（仅测试时释放残留进程的内存）
+# -----------------------------
+echo "Cleaning up residual python processes to free CUDA memory..."
+PIDS_TO_KILL=$(pgrep -f "train_iterative_model" 2>/dev/null || true)
+if [[ -n "${PIDS_TO_KILL}" ]]; then
+  echo "Killing existing train_iterative_model processes: ${PIDS_TO_KILL}"
+  kill -9 ${PIDS_TO_KILL} 2>/dev/null || true
+  sleep 2
+fi
+
+# -----------------------------
 # 训练
 # -----------------------------
 echo "Starting training..."
-python train_iterative_model.py \
+# 激活 conda 环境并运行（使用 bash -i -c 确保输出正常显示）
+conda_activate_and_run() {
+  source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
+  conda activate speaq 2>/dev/null || true
+  python train_iterative_model.py \
   "${RESUME_ARGS[@]}" \
   --num-gpus "${NUM_GPUS}" \
   --config-file "${CONFIG}" \
   --dist-url "tcp://127.0.0.1:${PORT}" \
   "${TRAIN_OPTS[@]}" \
   "${OVERFIT_OPTS[@]}" \
-  ${OPTS:-} &
+  ${OPTS:-}
+}
+conda_activate_and_run &
 PID=$!
 monitor_memory "${PID}" &
 MON_PID=$!

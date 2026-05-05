@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from .util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou, box_iou
+from .util.box_ops import complete_box_iou, efficient_box_iou
 
 from detectron2.utils.registry import Registry
 from torchvision.ops.boxes import box_area
@@ -17,6 +18,23 @@ alphabet_to_frequecy = [7, 43, 33, 27, 29, 16, 15, 9, 31, 30, 21, 39, 25, 22, 44
 
 
 import copy
+
+# Global iou cost function (config via module-level string)
+_box_loss_type = "giou"
+
+def set_box_loss_type(loss_type: str):
+    global _box_loss_type
+    assert loss_type in ("giou", "ciou", "eiou"), f"Unsupported box_loss_type: {loss_type}"
+    _box_loss_type = loss_type
+
+def _giou_cost(boxes1, boxes2):
+    """Compute -iou_metric as cost for Hungarian matching. boxes in xyxy format."""
+    if _box_loss_type == 'ciou':
+        return -complete_box_iou(boxes1, boxes2)
+    elif _box_loss_type == 'eiou':
+        return -efficient_box_iou(boxes1, boxes2)
+    else:
+        return -generalized_box_iou(boxes1, boxes2)
 
 MATCHER_REGISTRY = Registry("MATCHER_REGISTRY")
 
@@ -78,7 +96,7 @@ class HungarianMatcher(nn.Module):
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
         # Compute the giou cost betwen boxes
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        cost_giou = _giou_cost(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
@@ -151,7 +169,7 @@ class IterativeHungarianMatcher(nn.Module):
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
         # Compute the giou cost betwen boxes
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        cost_giou = _giou_cost(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
@@ -216,9 +234,9 @@ class IterativeHungarianMatcher(nn.Module):
         cost_subject_bbox = torch.cdist(out_sub_bbox, tgt_sub_boxes, p=1)
         cost_object_bbox = torch.cdist(out_obj_bbox, tgt_obj_boxes, p=1)
         
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_boxes))
-        cost_subject_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_sub_bbox), box_cxcywh_to_xyxy(tgt_sub_boxes))
-        cost_object_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_obj_bbox), box_cxcywh_to_xyxy(tgt_obj_boxes))
+        cost_giou = _giou_cost(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_boxes))
+        cost_subject_giou = _giou_cost(box_cxcywh_to_xyxy(out_sub_bbox), box_cxcywh_to_xyxy(tgt_sub_boxes))
+        cost_object_giou = _giou_cost(box_cxcywh_to_xyxy(out_obj_bbox), box_cxcywh_to_xyxy(tgt_obj_boxes))
 
         C = self.cost_bbox * (cost_bbox + cost_subject_bbox + cost_object_bbox) + self.cost_class * (cost_class + cost_subject_class + cost_object_class) + self.cost_giou * (cost_giou + cost_subject_giou + cost_object_giou)
         
@@ -233,9 +251,9 @@ class IterativeHungarianMatcher(nn.Module):
                 aux_cost_subject_bbox = torch.cdist(aux_out_sub_bbox[aux_idx], tgt_sub_boxes, p=1)
                 aux_cost_object_bbox = torch.cdist(aux_out_obj_bbox[aux_idx], tgt_obj_boxes, p=1)
 
-                aux_cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_boxes))
-                aux_cost_subject_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_sub_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_sub_boxes))
-                aux_cost_object_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_obj_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_obj_boxes))
+                aux_cost_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_boxes))
+                aux_cost_subject_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_sub_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_sub_boxes))
+                aux_cost_object_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_obj_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_obj_boxes))
                 aux_C = self.cost_bbox * (aux_cost_bbox + aux_cost_subject_bbox + aux_cost_object_bbox) + self.cost_class * (aux_cost_class + aux_cost_subject_class + aux_cost_object_class) + self.cost_giou * (aux_cost_giou + aux_cost_subject_giou + aux_cost_object_giou)
 
                 C = C + aux_C
@@ -400,7 +418,7 @@ class SpeaQHungarianMatcher(nn.Module):
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
         # Compute the giou cost betwen boxes
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        cost_giou = _giou_cost(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
@@ -562,10 +580,10 @@ class SpeaQHungarianMatcher(nn.Module):
         
         cost_object_bbox = torch.cdist(out_obj_bbox, tgt_obj_boxes, p=1)
         
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_boxes))
-        cost_subject_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_sub_bbox), box_cxcywh_to_xyxy(tgt_sub_boxes))
+        cost_giou = _giou_cost(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_boxes))
+        cost_subject_giou = _giou_cost(box_cxcywh_to_xyxy(out_sub_bbox), box_cxcywh_to_xyxy(tgt_sub_boxes))
         
-        cost_object_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_obj_bbox), box_cxcywh_to_xyxy(tgt_obj_boxes))
+        cost_object_giou = _giou_cost(box_cxcywh_to_xyxy(out_obj_bbox), box_cxcywh_to_xyxy(tgt_obj_boxes))
 
 
         C = self.cost_bbox * (cost_bbox + cost_subject_bbox + cost_object_bbox) + self.cost_class * (cost_class + cost_subject_class + cost_object_class) + self.cost_giou * (cost_giou + cost_subject_giou + cost_object_giou)
@@ -580,9 +598,9 @@ class SpeaQHungarianMatcher(nn.Module):
                 aux_cost_subject_bbox = torch.cdist(aux_out_sub_bbox[aux_idx], tgt_sub_boxes, p=1)
                 aux_cost_object_bbox = torch.cdist(aux_out_obj_bbox[aux_idx], tgt_obj_boxes, p=1)
 
-                aux_cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_boxes))
-                aux_cost_subject_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_sub_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_sub_boxes))
-                aux_cost_object_giou = -generalized_box_iou(box_cxcywh_to_xyxy(aux_out_obj_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_obj_boxes))
+                aux_cost_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_boxes))
+                aux_cost_subject_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_sub_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_sub_boxes))
+                aux_cost_object_giou = _giou_cost(box_cxcywh_to_xyxy(aux_out_obj_bbox[aux_idx]), box_cxcywh_to_xyxy(tgt_obj_boxes))
 
                 
                 aux_C = self.cost_bbox * (aux_cost_bbox + aux_cost_subject_bbox + aux_cost_object_bbox) + self.cost_class * (aux_cost_class + aux_cost_subject_class + aux_cost_object_class) + self.cost_giou * (aux_cost_giou + aux_cost_subject_giou + aux_cost_object_giou)
@@ -616,6 +634,8 @@ class SpeaQHungarianMatcher(nn.Module):
 
 
 def build_matcher(name, cost_class, cost_bbox, cost_giou, topk=1, cfg=None, **kwargs):
+    if cfg is not None:
+        set_box_loss_type(cfg.MODEL.DETR.BOX_LOSS_TYPE)
     if topk == 1:
         return MATCHER_REGISTRY.get(name)(cost_class=cost_class, cost_bbox=cost_bbox, cost_giou=cost_giou, cfg=cfg, **kwargs)
     else:
