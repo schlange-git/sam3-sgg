@@ -49,6 +49,7 @@ class ObjectMemoryBank(nn.Module):
         self.max_miss = int(getattr(tcfg, "MEMORY_MAX_MISS", 2))
         self.detach_memory = bool(getattr(tcfg, "DETACH_MEMORY", True))
         self.d_model = int(d_model)
+        self.ema_momentum = float(getattr(tcfg, "EMA_MOMENTUM", 0.9))
 
     def init_empty(self, device: torch.device) -> MemoryState:
         return MemoryState(
@@ -62,6 +63,7 @@ class ObjectMemoryBank(nn.Module):
         )
 
     def get_memory_queries(self, state: Optional[MemoryState]) -> Optional[torch.Tensor]:
+        """Return memory queries weighted by confidence scores."""
         if state is None:
             return None
         out = state.queries.new_zeros((self.num_slots, self.d_model))
@@ -71,7 +73,9 @@ class ObjectMemoryBank(nn.Module):
         scores = state.scores[valid_ids]
         order = valid_ids[torch.argsort(scores, descending=True)]
         k = min(self.num_slots, order.numel())
-        out[:k] = state.queries[order[:k]]
+        # Score-weighted: low-confidence memories fade out
+        w = scores / scores.max().clamp(min=1e-6)
+        out[:k] = state.queries[order[:k]] * w[:k].unsqueeze(-1)
         return out
 
     def _select_candidates(self, hs_obj: torch.Tensor, pred_logits: torch.Tensor, pred_boxes: torch.Tensor):
@@ -145,7 +149,15 @@ class ObjectMemoryBank(nn.Module):
                     replace_idx = int(torch.argmin(state.scores - 0.01 * state.ages.float()).item())
                     matched_slot = replace_idx
 
-            state.queries[matched_slot] = q
+            if state.valid_mask[matched_slot]:
+                # EMA update for existing slot: smooth transition
+                state.queries[matched_slot] = (
+                    self.ema_momentum * state.queries[matched_slot] +
+                    (1.0 - self.ema_momentum) * q
+                )
+            else:
+                # New slot: direct assignment
+                state.queries[matched_slot] = q
             state.boxes[matched_slot] = b
             state.scores[matched_slot] = s
             state.labels[matched_slot] = l

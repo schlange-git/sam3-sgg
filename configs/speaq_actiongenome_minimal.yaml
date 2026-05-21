@@ -23,7 +23,6 @@ MODEL:
     REWEIGHT_REL_EOS_COEF: 0.1
     NO_OBJECT_WEIGHT: 0.1
     PERSON_CLASS_WEIGHT: 1.0
-    PERSON_SCORE_SCALE: 200.0
     PERSON_CLASS_INDEX: 0
     NO_REL_WEIGHT: 0.1
   OBJ_SPLIT:
@@ -40,7 +39,7 @@ MODEL:
     AUX_LOSS_WEIGHT_SMALL: 0.0
     AUX_LOSS_WEIGHT_FINE: 0.0
   SAM3:
-    ENABLED: False
+    ENABLED: True
     USE_PRECOMPUTED: False
     # SAM3 权重：放 sam3/weights/sam3.pt，或设为本项（相对项目根/绝对路径）。缺失时会尝试 HuggingFace 下载。
     CHECKPOINT_PATH: "sam3/weights/sam3.pt"
@@ -68,8 +67,8 @@ MODEL:
     # 多尺度融合策略：last(不融合) / sum(相加融合) / concat(拼接融合)
     MULTISCALE_MERGE: "sum"
   TEMPORAL:
-    ENABLED: False
-    EVAL_ENABLED: False
+    ENABLED: True
+    EVAL_ENABLED: True
     MODE: "object_query_memory_v1"
     NUM_MEMORY_SLOTS: 32
     MEMORY_TOPK: 16
@@ -77,14 +76,6 @@ MODEL:
     MEMORY_IOU_THRESH: 0.5
     MEMORY_MAX_MISS: 2
     DETACH_MEMORY: True
-
-DATASETS:
-  TYPE: "ACTION GENOME"
-  ACTION_GENOME:
-    FORMAT_VID_WISE: True
-  # 评估时关系类别数需与 relationship_classes.txt 一致（不含 +1 background）
-  ROI_SCENEGRAPH_HEAD:
-    NUM_CLASSES: 26
 
 DATASETS:
   TYPE: "ACTION GENOME"
@@ -98,19 +89,17 @@ DATASETS:
     FILTER_DUPLICATE_RELATIONS: True
     FILTER_NON_OVERLAP: False
     FORMAT_VID_WISE: True
-    NUM_VIDEOS_TRAIN: -1
-    NUM_VIDEOS_VAL: 400
     VAL_SET_RANDOMIZED: False
 
 SOLVER:
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 16
   # 以 epoch 为主导：每个 epoch 遍历全部帧，训练总长度由 MAX_EPOCH 决定
   MAX_EPOCH: 0
   BASE_LR: 0.0001
-  STEPS: (112000, 144000)
+  STEPS: (40000, 120000)
   MAX_ITER: 160000
   WARMUP_FACTOR: 0.001
-  WARMUP_ITERS: 3000
+  WARMUP_ITERS: 5000
   WEIGHT_DECAY: 0.0001
   OPTIMIZER: "ADAMW"
   BACKBONE_MULTIPLIER: 0.05
@@ -141,7 +130,7 @@ INPUT:
   FORMAT: "RGB"
 
 TEST:
-  EVAL_PERIOD: 2000
+  EVAL_PERIOD: 1000
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False
   NUM_WORKERS: 8

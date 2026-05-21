@@ -10,6 +10,7 @@ build/
 data/featuremaps
 dataset/
 dataset-full/
+docs/
 
 # Training outputs
 output*/
@@ -65,3 +66,5 @@ Thumbs.db
 # Temporary files
 *.tmp
 temp.*
+detectron2/
+detectron2/

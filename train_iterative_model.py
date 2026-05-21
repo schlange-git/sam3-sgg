@@ -164,6 +164,39 @@ def main(args):
     backup_source_codes(cfg)
     trainer = JointTransformerTrainer(cfg)
     trainer.resume_or_load(resume=args.resume)
+    # --- DEBUG: Check pretrained weight loading ---
+    ckpt = torch.load(cfg.MODEL.WEIGHTS, map_location="cpu")
+    ckpt_state = ckpt.get("model", ckpt)
+    model_state = trainer.model.state_dict()
+    total_model = len(model_state)
+    total_ckpt = len(ckpt_state)
+    loaded = 0
+    not_loaded = []
+    for k, v in ckpt_state.items():
+        if k in model_state:
+            if model_state[k].shape == v.shape:
+                loaded += 1
+            else:
+                not_loaded.append((k, str(v.shape), str(model_state[k].shape)))
+    missing_in_ckpt = [k for k in model_state if k not in ckpt_state]
+    missing_in_model = [k for k in ckpt_state if k not in model_state]
+    print(f"[WEIGHT] Model params: {total_model}, CKPT params: {total_ckpt}")
+    print(f"[WEIGHT] Loaded (shape match): {loaded}/{total_ckpt}")
+    if not_loaded:
+        print(f"[WEIGHT] Shape mismatch ({len(not_loaded)}):")
+        for k, cs, ms in not_loaded[:8]:
+            print(f"  {k}: ckpt={cs} model={ms}")
+    if missing_in_ckpt:
+        print(f"[WEIGHT] Random init ({len(missing_in_ckpt)} keys)")
+        for k in missing_in_ckpt[:5]:
+            print(f"  {k}")
+    if missing_in_model:
+        print(f"[WEIGHT] Ignored ({len(missing_in_model)} keys)")
+        for k in missing_in_model[:5]:
+            print(f"  {k}")
+    del ckpt, ckpt_state, model_state
+    gc.collect()
+    # --- END DEBUG ---
     return trainer.train()
 
 if __name__ == '__main__':

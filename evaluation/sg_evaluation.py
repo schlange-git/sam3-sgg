@@ -658,9 +658,9 @@ class SceneGraphEvaluator(DatasetEvaluator):
         ls_total = int(low_score_count.sum())
         sc_total = int(success_count.sum())
         total_recall = float(sc_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
-        pct_lm_t = float(lm_total) / float(t_total) * 100.0
-        pct_cw_t = float(cw_total) / float(t_total) * 100.0
-        pct_ls_t = float(ls_total) / float(t_total) * 100.0
+        pct_lm_t = float(lm_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_cw_t = float(cw_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_ls_t = float(ls_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
         display_rows.append([
             'TOTAL', t_total,
             f"{lm_total} ({pct_lm_t:.1f}%)",
@@ -1470,10 +1470,10 @@ class SGErrorAnalysis(SceneGraphEvaluation):
         ls_total = int(low_score.sum())
         sc_total = int(success.sum())
         total_recall = float(sc_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
-        pct_lm_t = float(lm_total) / float(t_total) * 100.0
-        pct_cw_t = float(cw_total) / float(t_total) * 100.0
-        pct_tf_t = float(tf_total) / float(t_total) * 100.0
-        pct_ls_t = float(ls_total) / float(t_total) * 100.0
+        pct_lm_t = float(lm_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_cw_t = float(cw_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_tf_t = float(tf_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
+        pct_ls_t = float(ls_total) / float(t_total) * 100.0 if t_total > 0 else 0.0
         display_rows.append([
             'TOTAL', t_total,
             f"{lm_total} ({pct_lm_t:.1f}%)",

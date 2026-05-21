@@ -183,6 +183,7 @@ class MemoryMonitorHook(HookBase):
         self.logger = logging.getLogger(__name__)
     
     def after_step(self):
+        super().after_step()
         """每次迭代后检查内存"""
         self.check_count += 1
         if self.check_count % self.check_interval == 0:
@@ -269,6 +270,7 @@ class PerformanceMonitorHook(HookBase):
             self.data_start_time = time.perf_counter()
     
     def after_step(self):
+        super().after_step()
         """每次迭代后记录时间"""
         if comm.is_main_process():
             torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -371,6 +373,7 @@ class Sam3UnfreezeHook(HookBase):
         self.logger = logging.getLogger(__name__)
 
     def after_step(self):
+        super().after_step()
         if self._done:
             return
         cur_iter = self.trainer.iter + 1
@@ -636,6 +639,10 @@ class JointTransformerTrainer(DefaultTrainer):
         """
         重写训练步骤，添加详细的性能监控
         """
+        # Inject current iter for gate schedule
+        qi = getattr(self.model.detr, "query_injector", None)
+        if qi is not None:
+            qi._current_iter = self.iter
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         start = time.perf_counter()
         

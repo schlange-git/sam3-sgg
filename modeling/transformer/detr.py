@@ -1,3 +1,4 @@
+import os
 """
 DETR model and criterion classes.
 """
@@ -65,26 +66,53 @@ class TemporalAggregator(nn.Module):
 
 
 class TemporalQueryInjector(nn.Module):
-    """Inject memory queries into the first K object query slots."""
+    """Lightweight cross-attention: all queries attend to memory bank."""
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, max_iter: int = 160000, output_dir: str = "/tmp"):
         super().__init__()
-        self.memory_proj = nn.Linear(d_model, d_model)
-        self.memory_type_embed = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.memory_scale = nn.Parameter(torch.tensor(1.0))
+        self.max_iter = max_iter
+        self._gate_file = os.path.join(output_dir, "gate_log.csv")
+        self._gate_txt = os.path.join(output_dir, "gate_log.txt")
+        with open(self._gate_file, "w") as gf:
+            gf.write("iter,gate,ceiling\n")
+        with open(self._gate_txt, "w") as gf:
+            gf.write("# gate log: iter | gate_score | ceiling\n")
+        self.memory_proj_k = nn.Linear(d_model, d_model)
+        self.memory_proj_v = nn.Linear(d_model, d_model)
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.gate = nn.Parameter(torch.tensor(-6.9))  # init~0.001, +0.05/step, max=0.3
+        self._call_count = 0
+        self.scale = d_model ** -0.5
 
     def forward(self, base_queries_qbd: torch.Tensor, memory_queries_bmd: torch.Tensor) -> torch.Tensor:
         if memory_queries_bmd is None:
             return base_queries_qbd
-        q = base_queries_qbd.clone()
-        q_len = q.shape[0]
-        m_len = memory_queries_bmd.shape[1]
-        k = min(q_len, m_len)
-        if k <= 0:
-            return q
-        memory_q = memory_queries_bmd[:, :k, :].transpose(0, 1)  # [k, B, D]
-        q[:k] = q[:k] + self.memory_scale * self.memory_proj(memory_q) + self.memory_type_embed
-        return q
+        # base_queries_qbd: [Q, B, D], memory_queries_bmd: [B, M, D]
+        Q = self.query_proj(base_queries_qbd)  # [Q, B, D]
+        K = self.memory_proj_k(memory_queries_bmd.transpose(0, 1))  # [M, B, D]
+        V = self.memory_proj_v(memory_queries_bmd.transpose(0, 1))  # [M, B, D]
+
+        # Cross-attention: Q attends to K, output attends to V
+        attn = torch.einsum('qbd,mbd->qbm', Q, K) * self.scale
+        attn = torch.softmax(attn, dim=1)  # [Q, B, M]
+        mem_out = torch.einsum('qbm,mbd->qbd', attn, V)
+        mem_out = self.out_proj(mem_out)
+
+        # Learned gating: blend memory with original
+        gate = torch.sigmoid(self.gate)
+        self._call_count += 1
+        if self.training:
+            it = self._call_count
+            steps = it * 16 // max(self.max_iter, 1)
+            ceiling = min(0.01 + 0.05 * steps, 0.3)
+            # ceiling not applied to gate - learns freely
+            if it % 50 == 0:
+                with open(self._gate_file, "a") as gf:
+                    gf.write(f"{it},{float(gate.mean().item()):.6f},{float(ceiling):.4f}\n")
+                with open(self._gate_txt, "a") as gf:
+                    gf.write(f"iter: {it:6d}  gate_score: {float(gate.mean().item()):.6f}  ceiling: {float(ceiling):.4f}\n")
+        return gate * mem_out + (1.0 - gate) * base_queries_qbd
 
 
 @DETR_REGISTRY.register()
@@ -194,7 +222,7 @@ class IterativeRelationDETR(DETR):
                 hidden_dim=transformer.d_model, alpha_init=alpha_init
             )
         if self.temporal_enabled and self.temporal_mode == "object_query_memory_v1":
-            self.query_injector = TemporalQueryInjector(transformer.d_model)
+            self.query_injector = TemporalQueryInjector(transformer.d_model, max_iter=cfg.SOLVER.MAX_ITER, output_dir=cfg.OUTPUT_DIR)
             self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
 
     def _classify_object_embeddings(self, embeddings):
