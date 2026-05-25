@@ -6,7 +6,7 @@ set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
 
-OUTPUT_DIR="${1:-z_outputs/overfit_temporal_16000iters}"
+OUTPUT_DIR="${1:-z_outputs/xsam_overfit_temporal_16000iters}"
 NUM_GPUS="${2:-1}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
@@ -39,7 +39,7 @@ TRAIN_OPTS=(
     DATASETS.ACTION_GENOME.FRAMES "${AG_FRAMES}"
     DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN "-1"
     DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL "0"
-    DATASETS.TEST "(AG_train,)"
+    DATASETS.TEST "('AG_train',)"
     SOLVER.IMS_PER_BATCH "16"
     DATALOADER.NUM_WORKERS "4"
     SOLVER.MAX_ITER "16000"

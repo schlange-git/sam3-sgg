@@ -36,9 +36,6 @@ class Sam3MaskedBackbone(nn.Module):
         self.featuremap_dir = cfg.MODEL.SAM3.FEATUREMAP_DIR
         self.feature_stride = 16
         self.target_stride = getattr(cfg.MODEL.SAM3, "TARGET_STRIDE", 0)
-        roi_refine_cfg = getattr(cfg.MODEL, "ROI_REFINE", None)
-        self.roi_refine_enabled = bool(getattr(roi_refine_cfg, "ENABLED", False)) if roi_refine_cfg is not None else False
-        self.roi_refine_stride = int(getattr(roi_refine_cfg, "STRIDE", 14)) if roi_refine_cfg is not None else 14
         self.use_fpn = getattr(cfg.MODEL.SAM3, "USE_FPN", False)
         self.fpn_strides = getattr(cfg.MODEL.SAM3, "FPN_STRIDES", [4, 8, 16, 32])
         # Prefer native SAM3 multi-scale outputs when available.
@@ -52,6 +49,8 @@ class Sam3MaskedBackbone(nn.Module):
                 f"Unsupported MODEL.SAM3.MULTISCALE_MERGE={self.multiscale_merge}, "
                 "expected one of: last, sum, concat"
             )
+        self.use_patch_merge = getattr(cfg.MODEL.SAM3, "USE_PATCH_MERGE", False)
+        self._patch_merge_logged = False
 
         # If using precomputed features, verify directory exists
         if self.use_precomputed:
@@ -59,11 +58,6 @@ class Sam3MaskedBackbone(nn.Module):
                 raise FileNotFoundError(
                     f"SAM3 precomputed feature directory does not exist: {self.featuremap_dir}. "
                     f"Please run precomputation first or set MODEL.SAM3.USE_PRECOMPUTED=False"
-                )
-            if self.roi_refine_enabled:
-                raise AssertionError(
-                    "MODEL.ROI_REFINE.ENABLED=True requires live SAM3 native backbone_fpn outputs; "
-                    "precomputed single-scale features cannot prove native stride14."
                 )
 
         # Ensure sam3 is importable from repo local path
@@ -156,34 +150,19 @@ class Sam3MaskedBackbone(nn.Module):
                 )
                 time.sleep(delay)
             try:
-                load_device = "cpu"
-                load_mem_extra = ""
-                if torch.cuda.is_available() and world_size <= 1:
-                    load_device = self.sam3_device
-                    load_mem_extra = " (GPU direct load)"
                 logging.getLogger("detectron2").info(
-                    "Loading SAM3 image backbone (rank %s/%s, device=%s%s, file=%s)...",
-                    rank, world_size, load_device, load_mem_extra,
-                    checkpoint_path or "HuggingFace",
+                    "Loading SAM3 image backbone (rank %s/%s, on CPU first to save memory)...", rank, world_size
                 )
-                load_t0 = time.time()
                 self.sam3_model = build_sam3_image_model(
-                    device=load_device,
+                    device="cpu",
                     checkpoint_path=checkpoint_path,
                     load_from_HF=(checkpoint_path is None),
                     bpe_path=bpe_path,
                 )
-                load_elapsed = time.time() - load_t0
-                logging.getLogger("detectron2").info(
-                    "SAM3 image backbone loaded on %s in %.1fs.", load_device, load_elapsed
-                )
-                if load_device == "cpu" and torch.cuda.is_available():
-                    gc.collect()
+                gc.collect()
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    self.sam3_model = self.sam3_model.to(self.sam3_device)
-                    logging.getLogger("detectron2").info(
-                        "SAM3 image backbone moved to %s.", self.sam3_device
-                    )
+                self.sam3_model = self.sam3_model.to(self.sam3_device)
                 if self.freeze:
                     self.sam3_model.eval()
                 else:
@@ -222,7 +201,9 @@ class Sam3MaskedBackbone(nn.Module):
         self._level_proj_layers = nn.ModuleDict()
         # Optional fusion layer for concat multi-scale merge
         self._merge_proj_layer: Optional[nn.Module] = None
-        
+        # Optional patch-merge projection layer (pixel-unshuffle → 1×1 conv)
+        self._patch_merge_proj: Optional[nn.Module] = None
+
         # FPN layers for multi-scale features (if enabled)
         # Note: FPN layer creation is deferred until forward() when actual feature_stride is known
         self.fpn_layers = None
@@ -230,14 +211,10 @@ class Sam3MaskedBackbone(nn.Module):
 
         # exposed for Joiner
         self.num_channels = self.feature_dim
-        self._last_aux_features: Dict[int, NestedTensor] = {}
         if self.use_fpn:
             self.feature_strides = self.fpn_strides
         else:
             self.feature_strides = [self.feature_stride]
-
-    def get_last_aux_features(self) -> Dict[int, NestedTensor]:
-        return self._last_aux_features
 
     def _initialize_fpn_layers(self) -> None:
         """Initialize FPN layers based on actual feature_stride"""
@@ -345,6 +322,38 @@ class Sam3MaskedBackbone(nn.Module):
         self._merge_proj_layer = layer
         return self._merge_proj_layer
 
+    def _build_patch_merge_proj(self, factor: int) -> nn.Module:
+        """Build and initialize the 1×1 conv that follows pixel_unshuffle.
+
+        After pixel_unshuffle with factor f, the feature has C * f² channels.
+        This conv reduces back to C channels.
+
+        Weight initialization mimics avg_pool behavior: each output channel
+        receives equal contribution (1/f²) from all f² sub-pixel input channels.
+        This ensures training starts identically to avg_pool2d, then gradually
+        learns to exploit sub-pixel structure.
+        """
+        if self._patch_merge_proj is not None:
+            return self._patch_merge_proj
+        in_channels = self.feature_dim * factor * factor
+        layer = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, bias=False)
+        with torch.no_grad():
+            layer.weight.zero_()
+            for c in range(self.feature_dim):
+                for dy in range(factor):
+                    for dx in range(factor):
+                        src_c = c + (dy * factor + dx) * self.feature_dim
+                        layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
+        layer.to(self.device)
+        if self.freeze:
+            layer.eval()
+        else:
+            layer.train()
+        for p in layer.parameters():
+            p.requires_grad_(not self.freeze)
+        self._patch_merge_proj = layer
+        return self._patch_merge_proj
+
     def set_freeze(self, freeze: bool) -> None:
         """
         更新 SAM3 backbone 的冻结状态。
@@ -379,6 +388,13 @@ class Sam3MaskedBackbone(nn.Module):
             else:
                 self._merge_proj_layer.train()
             for p in self._merge_proj_layer.parameters():
+                p.requires_grad_(not freeze)
+        if self._patch_merge_proj is not None:
+            if freeze:
+                self._patch_merge_proj.eval()
+            else:
+                self._patch_merge_proj.train()
+            for p in self._patch_merge_proj.parameters():
                 p.requires_grad_(not freeze)
         if self.fpn_layers is not None:
             for layer in self.fpn_layers.values():
@@ -446,63 +462,9 @@ class Sam3MaskedBackbone(nn.Module):
             stride = max(1, int(round(float(image_h) / float(proj_feat.shape[2]))))
             features.append(proj_feat)
             strides.append(stride)
-        if len(features) == 0:
+        if len(features) <= 1:
             return None
         return sorted(zip(strides, features), key=lambda x: x[0])
-
-    def _build_mask_for_stride(
-        self, feat: torch.Tensor, stride: int, images: ImageList
-    ) -> torch.Tensor:
-        n, _, h, w = feat.shape
-        mask = torch.ones((n, h, w), dtype=torch.bool, device=feat.device)
-        for img_idx, (img_h, img_w) in enumerate(images.image_sizes):
-            valid_h = int(math.ceil(float(img_h) / float(stride)))
-            valid_w = int(math.ceil(float(img_w) / float(stride)))
-            assert valid_h <= h and valid_w <= w, (
-                f"Aux feature stride{stride} mask exceeds feature shape: "
-                f"valid=({valid_h},{valid_w}), feature=({h},{w}), image=({img_h},{img_w})"
-            )
-            mask[img_idx, :valid_h, :valid_w] = 0
-        return mask
-
-    def _cache_roi_refine_aux_features(
-        self, backbone_out: Dict[str, torch.Tensor], image_h: int, image_w: int, images: ImageList
-    ) -> None:
-        self._last_aux_features = {}
-        if not self.roi_refine_enabled:
-            return
-        assert self.roi_refine_stride > 0, "MODEL.ROI_REFINE.STRIDE must be positive."
-        ordered_native = self._extract_native_multiscale(backbone_out, image_h)
-        assert ordered_native is not None, (
-            "MODEL.ROI_REFINE.ENABLED=True requires SAM3 backbone_fpn native multi-scale outputs. "
-            "No native multi-scale feature list was returned."
-        )
-        native = {int(stride): feat for stride, feat in ordered_native}
-        assert self.roi_refine_stride in native, (
-            f"Required native SAM3 stride{self.roi_refine_stride} feature not found. "
-            f"Available native strides: {sorted(native.keys())}. "
-            "Refusing to synthesize ROI_REFINE feature by resize/FPN."
-        )
-        feat = native[self.roi_refine_stride]
-        assert feat.dim() == 4, f"Expected 4D ROI_REFINE feature, got {tuple(feat.shape)}."
-        assert int(feat.shape[1]) == self.feature_dim, (
-            f"ROI_REFINE stride{self.roi_refine_stride} feature channel dim must be "
-            f"{self.feature_dim}, got {int(feat.shape[1])}."
-        )
-        actual_stride_h = float(image_h) / float(feat.shape[-2])
-        actual_stride_w = float(image_w) / float(feat.shape[-1])
-        assert abs(actual_stride_h - self.roi_refine_stride) < 1e-6, (
-            f"ROI_REFINE feature height is not native stride{self.roi_refine_stride}: "
-            f"image_h={image_h}, feature_h={feat.shape[-2]}, stride={actual_stride_h}."
-        )
-        assert abs(actual_stride_w - self.roi_refine_stride) < 1e-6, (
-            f"ROI_REFINE feature width is not native stride{self.roi_refine_stride}: "
-            f"image_w={image_w}, feature_w={feat.shape[-1]}, stride={actual_stride_w}."
-        )
-        mask = self._build_mask_for_stride(feat, self.roi_refine_stride, images)
-        self._last_aux_features = {
-            self.roi_refine_stride: NestedTensor(feat, mask)
-        }
 
     def _build_nested_from_multiscale(
         self, ordered_feats: List[Tuple[int, torch.Tensor]], images: ImageList
@@ -553,6 +515,20 @@ class Sam3MaskedBackbone(nn.Module):
         return {f"fpn_merged_{self.multiscale_merge}": NestedTensor(merged, merged_mask)}
 
     def forward(self, images: ImageList) -> Dict[str, NestedTensor]:
+        if not self._patch_merge_logged and not self.use_precomputed:
+            logger = logging.getLogger("detectron2")
+            method = (
+                f"pixel_unshuffle + 1×1 conv (factor={self.target_stride // max(self.feature_stride, 1)})"
+                if self.use_patch_merge
+                else "avg_pool2d"
+            )
+            logger.info(
+                "[SAM3 PatchMerge] Config check — USE_PATCH_MERGE=%s, TARGET_STRIDE=%d, "
+                "downsample method: %s",
+                self.use_patch_merge, self.target_stride, method,
+            )
+            self._patch_merge_logged = True
+
         if self.use_precomputed:
             # Must use precomputed features - no fallback allowed
             if self.sam3_model is not None:
@@ -580,10 +556,6 @@ class Sam3MaskedBackbone(nn.Module):
         with torch.set_grad_enabled(not self.freeze):
             backbone_out = self.sam3_model.backbone.forward_image(image_batch)
 
-        self._cache_roi_refine_aux_features(
-            backbone_out, image_batch.shape[2], image_batch.shape[3], images
-        )
-
         if self.use_fpn and self.use_backbone_fpn:
             ordered_native = self._extract_native_multiscale(backbone_out, image_batch.shape[2])
             if ordered_native is not None:
@@ -610,13 +582,57 @@ class Sam3MaskedBackbone(nn.Module):
         h_in = image_batch.shape[2]
         h_feat = proj_feat.shape[2]
         self.feature_stride = max(1, int(round(h_in / float(h_feat))))
+        _orig_stride = self.feature_stride  # saved for assertion below
         # Downsample to target stride if requested (helps reduce encoder memory)
         if self.target_stride and self.feature_stride < self.target_stride:
             factor = self.target_stride // self.feature_stride
             if factor > 1:
-                proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
+                is_power_of_two = (factor & (factor - 1)) == 0
+                if self.use_patch_merge and is_power_of_two:
+                    proj_feat = F.pixel_unshuffle(proj_feat, downscale_factor=factor)
+                    self._build_patch_merge_proj(factor)
+                    proj_feat = self._patch_merge_proj(proj_feat)
+                    if not self._patch_merge_logged:
+                        logger = logging.getLogger("detectron2")
+                        logger.info(
+                            "[SAM3 PatchMerge] ENABLED — pixel_unshuffle(factor=%d) + 1x1 conv "
+                            "(%d→%d) replacing avg_pool2d. "
+                            "stride: %d → %d. "
+                            "1x1 conv initialized to mimic avg_pool (equal sub-pixel weights).",
+                            factor, self.feature_dim * factor * factor, self.feature_dim,
+                            self.feature_stride, self.feature_stride * factor,
+                        )
+                        self._patch_merge_logged = True
+                else:
+                    assert False, (
+                        f"[SAM3 PatchMerge] FAILED — factor={factor} is not a power of 2. "
+                        f"USE_PATCH_MERGE=True requires power-of-2 downsample factor. "
+                        f"feature_stride={self.feature_stride}, target_stride={self.target_stride}"
+                    )
                 self.feature_stride = self.feature_stride * factor
-        
+
+        # Assert: if USE_PATCH_MERGE=True, patch merge MUST have been used.
+        # This catches config mistakes (e.g. non-power-of-2 factor) that silently
+        # fall back to avg_pool2d.
+        if self.use_patch_merge and self.target_stride and _orig_stride < self.target_stride:
+            factor = self.target_stride // _orig_stride
+            if factor > 1:
+                assert self._patch_merge_proj is not None, (
+                    f"[SAM3 PatchMerge] ASSERTION FAILED — USE_PATCH_MERGE=True but "
+                    f"_patch_merge_proj was NOT built. "
+                    f"factor={factor} (target_stride={self.target_stride} / orig_stride={_orig_stride}). "
+                    f"is_power_of_two={(factor & (factor - 1)) == 0}. "
+                    "If factor is not a power of 2, set USE_PATCH_MERGE=False or adjust TARGET_STRIDE."
+                )
+
+        # Assert patch merge integrity
+        if self.use_patch_merge and self._patch_merge_proj is not None:
+            assert proj_feat.shape[1] == self.feature_dim, (
+                f"[SAM3 PatchMerge] Output channels mismatch: "
+                f"expected {self.feature_dim}, got {proj_feat.shape[1]}. "
+                "The 1×1 conv projection is NOT reducing channels correctly."
+            )
+
         if self.use_fpn:
             # Initialize FPN layers on first forward (now we know actual feature_stride)
             if not self._fpn_layers_initialized:
@@ -674,9 +690,15 @@ class Sam3MaskedBackbone(nn.Module):
         if self.target_stride and self.feature_stride < self.target_stride:
             factor = self.target_stride // self.feature_stride
             if factor > 1:
-                proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
+                is_power_of_two = (factor & (factor - 1)) == 0
+                if self.use_patch_merge and is_power_of_two:
+                    proj_feat = F.pixel_unshuffle(proj_feat, downscale_factor=factor)
+                    self._build_patch_merge_proj(factor)
+                    proj_feat = self._patch_merge_proj(proj_feat)
+                else:
+                    proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor)
                 self.feature_stride = self.feature_stride * factor
-        
+
         if self.use_fpn:
             # Initialize FPN layers on first forward (now we know actual feature_stride)
             if not self._fpn_layers_initialized:
@@ -727,6 +749,14 @@ class Sam3MaskedBackbone(nn.Module):
             else:
                 self._merge_proj_layer.train()
             for p in self._merge_proj_layer.parameters():
+                p.requires_grad_(not self.freeze)
+
+        if self._patch_merge_proj is not None:
+            if self.freeze:
+                self._patch_merge_proj.eval()
+            else:
+                self._patch_merge_proj.train()
+            for p in self._patch_merge_proj.parameters():
                 p.requires_grad_(not self.freeze)
 
         for layer in self._level_proj_layers.values():

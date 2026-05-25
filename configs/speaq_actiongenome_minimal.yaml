@@ -49,6 +49,8 @@ MODEL:
     FEATURE_DIM: 256
     # 通道重复倍数（1表示不重复）
     CHANNEL_REPEAT: 1
+    # X-SAM pixel-unshuffle patch merge: replace avg_pool2d with space-to-depth + learnable 1x1 conv
+    USE_PATCH_MERGE: True
     # 是否冻结SAM3参数（False时参与反向传播做微调）。
     # 通过脚本环境变量 SAM3_UNFREEZE_ITER 实现前N iter冻结再解冻：>0 时前 N iter 冻结，之后自动解冻继续训练到 MAX_ITER。
     FREEZE: True
