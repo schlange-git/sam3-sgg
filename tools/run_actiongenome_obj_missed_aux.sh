@@ -22,7 +22,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
+cd "${SCRIPT_DIR}"/..
 
 BASE_SCRIPT="${SCRIPT_DIR}/run_actiongenome_train_eval.sh"
 if [[ ! -f "${BASE_SCRIPT}" ]]; then

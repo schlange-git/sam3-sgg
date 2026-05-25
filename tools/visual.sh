@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
+cd "${SCRIPT_DIR}"/..
 
 # 参数: checkpoint（可选）；NUM_IMAGES；DATASET_NAME；RUN_EVAL；NUM_GPUS（评测用）
 DEFAULT_CKPT="z_outputs/res101_from_pretrained_160000iters_bs8/model_0159999.pth"
