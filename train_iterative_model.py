@@ -88,7 +88,7 @@ def setup(args):
         ((cfg.MODEL.SAM3.ENABLED) and (not cfg.MODEL.DETR.LOAD_FULL_WEIGHTS))
         or (cfg.MODEL.DETR.LOAD_HEAD_ONLY and cfg.MODEL.DETR.HEAD_WEIGHTS)
     ):
-        cfg.MODEL.WEIGHTS = ""
+        cfg.MODEL.WEIGHTS = cfg.MODEL.DETR.HEAD_WEIGHTS
     register_datasets(cfg)
     if cfg.DATASETS.TYPE == "ACTION GENOME" and len(cfg.DATASETS.TRAIN) > 0:
         train_name = cfg.DATASETS.TRAIN[0]
@@ -168,6 +168,7 @@ def main(args):
     ckpt = torch.load(cfg.MODEL.WEIGHTS, map_location="cpu")
     ckpt_state = ckpt.get("model", ckpt)
     model_state = trainer.model.state_dict()
+    model_state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in model_state.items()}
     total_model = len(model_state)
     total_ckpt = len(ckpt_state)
     loaded = 0

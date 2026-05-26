@@ -520,7 +520,8 @@ class IterativeRelationCriterionBase(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_relation_boxes)
         num_relation_boxes = torch.clamp(num_relation_boxes / get_world_size(), min=1).item()
-        losses.update(self.get_relation_loss(relation_outputs, relation_targets, combined_indices['relation'], num_relation_boxes, **kwargs))
+        if not self.detection_only:
+            losses.update(self.get_relation_loss(relation_outputs, relation_targets, combined_indices['relation'], num_relation_boxes, **kwargs))
         return losses
 
     def _compute_obj_split_aux_for_role(self, raw_split_logits, targets, indices):
@@ -667,7 +668,7 @@ class IterativeRelationCriterionBase(nn.Module):
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices))
         losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
         losses.update(self.get_roi_refine_losses(outputs, entity_targets, combined_indices))
-        if 'aux_outputs_r' in outputs:
+        if 'aux_outputs_r' in outputs and not self.detection_only:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],
                                         'relation_subject_logits': aux_outputs_r_sub['pred_logits'], 'relation_subject_boxes': aux_outputs_r_sub['pred_boxes'],
@@ -715,6 +716,7 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
             empty_rel_weight[-1] = kwargs['reweight_rel_eos_coef']
         self.register_buffer('empty_rel_weight', empty_rel_weight)
         print ("SCALED", self.empty_rel_weight)
+        self.detection_only = kwargs.get("detection_only", False)
 
     def get_relation_loss(self, outputs, targets, indices, num_relation_boxes, **kwargs):
         src_logits = outputs['relation_logits']
@@ -765,7 +767,7 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
 
         n_layers = 1 + len(outputs['aux_outputs_r'])
 
-        # Relation  Branch
+        # Relation Branch
         relation_outputs_without_aux = {k: v for k, v in outputs.items() if 'aux_outputs' not in k and 'relation' in k}
         combined_indices, k_mean_log, augmented_targets = self.matcher.forward_relation(outputs, targets, layer_num=n_layers)
         if self.o2m_scheme =='static' or not self.match_independent:
@@ -781,7 +783,7 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
         losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices, **kwargs))
         losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
         losses.update(self.get_roi_refine_losses(outputs, entity_targets, combined_indices))
-        if 'aux_outputs_r' in outputs:
+        if 'aux_outputs_r' in outputs and not self.detection_only:
             for i, (aux_outputs_r, aux_outputs_r_sub, aux_outputs_r_obj) in enumerate(zip(outputs['aux_outputs_r'], outputs['aux_outputs_r_sub'], outputs['aux_outputs_r_obj'])):
                 relation_aux_outputs = {'relation_logits': aux_outputs_r['pred_logits'], 'relation_boxes': aux_outputs_r['pred_boxes'],
                                         'relation_subject_logits': aux_outputs_r_sub['pred_logits'], 'relation_subject_boxes': aux_outputs_r_sub['pred_boxes'],

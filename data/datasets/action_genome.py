@@ -64,6 +64,7 @@ class ActionGenomeTrainData:
         self.video_to_frames = self._group_frames_by_video(self.frame_list)
         self.split_videos = self._build_video_split()
         self.broken_image_paths = self._load_broken_image_paths()
+        self.frame_dims = self._load_frame_dimensions()
 
         self.class_names, self.predicate_names = self._collect_vocab()
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
@@ -239,6 +240,14 @@ class ActionGenomeTrainData:
             return None
         return [x1, y1, x2, y2]
 
+    def _load_frame_dimensions(self):
+        cache_path = os.path.join(self.ann_dir, "frame_dimensions.json")
+        if os.path.isfile(cache_path):
+            import json
+            with open(cache_path) as f:
+                return json.load(f)
+        return None
+
     def _build_dataset_dicts(self):
         dataset_dicts = []
         image_id = 0
@@ -258,11 +267,14 @@ class ActionGenomeTrainData:
                 skipped_broken += 1
                 continue
 
-            try:
-                with Image.open(frame_path) as img:
-                    width, height = img.size
-            except Exception:
-                continue
+            if self.frame_dims is not None and frame_key in self.frame_dims:
+                width, height = self.frame_dims[frame_key]
+            else:
+                try:
+                    with Image.open(frame_path) as img:
+                        width, height = img.size
+                except Exception:
+                    continue
 
             # AG bbox coordinates are defined in annotation-space (often <= 480px side),
             # and may differ from the currently extracted frame resolution.

@@ -8,7 +8,7 @@
 #   1. BACKBONE_WEIGHTS (默认: ImageNet R-101)
 #      - 由 MODEL.WEIGHTS 传入，通过 DetectionCheckpointer.resume_or_load() 加载
 #      - 只包含 ResNet-101 backbone（ImageNet 分类预训练）
-#   2. DETR_HEAD_WEIGHTS (默认: vg_objectdetector_pretrained.pth)
+#   2. DETR_HEAD_WEIGHTS (默认: model_0099999.pth)
 #      - 若设置，会通过 MODEL.DETR.HEAD_WEIGHTS + MODEL.DETR.LOAD_HEAD_ONLY=True 加载
 #      - 只加载 DETR 部分（transformer + 检测头 + 关系头），不覆盖 backbone
 #      - 若类别数不匹配，最后一层 class_embed 会被跳过，其余层仍会加载
@@ -59,7 +59,7 @@ BACKBONE_WEIGHTS="${BACKBONE_WEIGHTS:-detectron2://ImageNetPretrained/MSRA/R-101
 # DETR_HEAD_WEIGHTS: VG 上训好的 DETR 权重（包含 transformer + 检测头 + 关系头）
 # 设置为空字符串则只使用 backbone，不加载 DETR head 预训练
 DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-/home/tione/output/shizekun1_v/model_0099999.pth}"
-# DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-vg_objectdetector_pretrained.pth}"
+# DETR_HEAD_WEIGHTS="${DETR_HEAD_WEIGHTS:-model_0099999.pth}"
 # 是否将 DETR_HEAD_WEIGHTS 作为 MODEL.WEIGHTS 全量加载（true/1=全量；false/0=仅 HEAD_WEIGHTS+LOAD_HEAD_ONLY）
 # 兼容旧变量 LOAD_FULL_DETR_WEIGHTS；默认 1（完整加载）
 DETR_LOAD_FULL_WEIGHTS="${DETR_LOAD_FULL_WEIGHTS:-${LOAD_FULL_DETR_WEIGHTS:-1}}"

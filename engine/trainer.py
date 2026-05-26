@@ -639,8 +639,9 @@ class JointTransformerTrainer(DefaultTrainer):
         """
         重写训练步骤，添加详细的性能监控
         """
-        # Inject current iter for gate schedule
-        qi = getattr(self.model.detr, "query_injector", None)
+        # Inject current iter for gate schedule (unwrap DDP if needed)
+        _model = self.model.module if hasattr(self.model, 'module') else self.model
+        qi = getattr(_model.detr, "query_injector", None)
         if qi is not None:
             qi._current_iter = self.iter
         assert self.model.training, "[Trainer] model was changed to eval mode!"

@@ -48,7 +48,7 @@ VIS_REL_SCORE_THRESH=0.3                # 可视化时的关系/框分数阈值 
 
 # DETR head-only / 查询设置
 DETR_HEAD_ONLY=False                    # 是否只从权重中加载 DETR 头部
-DETR_HEAD_WEIGHTS="vg_objectdetector_pretrained.pth"  # DETR 头部权重文件
+DETR_HEAD_WEIGHTS="model_0099999.pth"  # DETR 头部权重文件
 DETR_NUM_OBJECT_QUERIES=300              # DETR object query 数量
 DETR_NUM_RELATION_QUERIES=300            # DETR relation query 数量
 
@@ -60,7 +60,7 @@ VG_IMAGE_DATA="${DATASET_ROOT}/image_data.json"       # 图像元信息 json
 VG_ATTRIBUTE_H5="${DATASET_ROOT}/VG-SGG-with-attri.h5"     # GT box / rel / attr h5
 
 # 预训练权重路径
-PRETRAINED_WEIGHTS="vg_objectdetector_pretrained.pth" # 预训练 DETR+ResNet 权重
+PRETRAINED_WEIGHTS="model_0099999.pth" # 预训练 DETR+ResNet 权重
 
 # 输出目录（默认使用时间戳；如果启用 RESUME，会在后面覆盖）
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -220,7 +220,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --detr-head-weights    DETR head 权重路径"
             echo "  --obj-queries N        DETR 对象 query 数 (默认: 300)"
             echo "  --rel-queries N        DETR 关系 query 数 (默认: 300)"
-            echo "  --pretrained PATH       预训练权重路径 (默认: vg_objectdetector_pretrained.pth)"
+            echo "  --pretrained PATH       预训练权重路径 (默认: model_0099999.pth)"
             echo "  --dataset PATH          数据集根目录 (默认: 自动检测)"
             echo "  --resume-dir DIR        从指定 finetune 目录恢复训练（真正的 resume，包括 Adam 等优化器状态）"
             echo "  -h, --help              显示此帮助信息"

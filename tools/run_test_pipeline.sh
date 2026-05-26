@@ -41,7 +41,7 @@ VG_IMAGE_DATA="${DATASET_ROOT}/image_data.json"
 VG_ATTRIBUTE_H5="${DATASET_ROOT}/VG-SGG-with-attri.h5"
 
 # 预训练权重路径
-PRETRAINED_WEIGHTS="vg_objectdetector_pretrained.pth"
+PRETRAINED_WEIGHTS="model_0099999.pth"
 
 # 输出目录
 OUTPUT_BASE="output_pipeline_20260122_082926"
@@ -94,7 +94,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpus NUM_GPUS         使用的 GPU 数量 (默认: 1)"
             echo "  --overfit NUM_IMAGES    过拟合数据集大小 (默认: 10)"
             echo "  --batch-size SIZE       批次大小 (默认: 2)"
-            echo "  --pretrained PATH       预训练权重路径 (默认: vg_objectdetector_pretrained.pth)"
+            echo "  --pretrained PATH       预训练权重路径 (默认: model_0099999.pth)"
             echo "  --dataset PATH          数据集根目录 (默认: 自动检测)"
             echo "  -h, --help              显示此帮助信息"
             echo ""
