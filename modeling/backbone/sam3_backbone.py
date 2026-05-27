@@ -615,12 +615,14 @@ class Sam3MaskedBackbone(nn.Module):
                             self.feature_stride, self.feature_stride * factor,
                         )
                         self._patch_merge_logged = True
-                else:
+                elif self.use_patch_merge:
                     assert False, (
                         f"[SAM3 PatchMerge] FAILED — factor={factor} is not a power of 2. "
                         f"USE_PATCH_MERGE=True requires power-of-2 downsample factor. "
                         f"feature_stride={self.feature_stride}, target_stride={self.target_stride}"
                     )
+                else:
+                    proj_feat = F.avg_pool2d(proj_feat, kernel_size=factor, stride=factor, ceil_mode=False)
                 self.feature_stride = self.feature_stride * factor
 
         # Assert: if USE_PATCH_MERGE=True, patch merge MUST have been used.
