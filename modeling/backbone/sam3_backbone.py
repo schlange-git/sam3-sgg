@@ -51,6 +51,7 @@ class Sam3MaskedBackbone(nn.Module):
             )
         self.use_patch_merge = getattr(cfg.MODEL.SAM3, "USE_PATCH_MERGE", False)
         self._patch_merge_logged = False
+        self._last_aux_features = {}  # cached intermediate features for ROI_REFINE
 
         # If using precomputed features, verify directory exists
         if self.use_precomputed:
@@ -345,12 +346,11 @@ class Sam3MaskedBackbone(nn.Module):
                         src_c = c + (dy * factor + dx) * self.feature_dim
                         layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
         layer.to(self.device)
-        if self.freeze:
-            layer.eval()
-        else:
-            layer.train()
+        # Always trainable: the X-SAM 1x1 conv learns sub-pixel fusion weights
+        # even when SAM3 backbone is frozen.
+        layer.train()
         for p in layer.parameters():
-            p.requires_grad_(not self.freeze)
+            p.requires_grad_(True)
         self._patch_merge_proj = layer
         return self._patch_merge_proj
 
@@ -390,12 +390,10 @@ class Sam3MaskedBackbone(nn.Module):
             for p in self._merge_proj_layer.parameters():
                 p.requires_grad_(not freeze)
         if self._patch_merge_proj is not None:
-            if freeze:
-                self._patch_merge_proj.eval()
-            else:
-                self._patch_merge_proj.train()
+            # X-SAM 1x1 conv is always trainable (learns sub-pixel fusion)
+            self._patch_merge_proj.train()
             for p in self._patch_merge_proj.parameters():
-                p.requires_grad_(not freeze)
+                p.requires_grad_(True)
         if self.fpn_layers is not None:
             for layer in self.fpn_layers.values():
                 if freeze:
@@ -415,6 +413,15 @@ class Sam3MaskedBackbone(nn.Module):
             img = self.transform(img)
             processed.append(img)
         return torch.stack(processed, dim=0)
+
+    def get_last_aux_features(self):
+        """Return cached intermediate feature maps for ROI_REFINE.
+        Returns dict mapping stride -> NestedTensor."""
+        assert self._last_aux_features, (
+            "get_last_aux_features() called before forward(). "
+            "ROI_REFINE requires SAM3 backbone to run forward() first."
+        )
+        return self._last_aux_features
 
     def _select_feature(self, backbone_out: Dict[str, torch.Tensor]) -> torch.Tensor:
         candidate = None
@@ -559,7 +566,9 @@ class Sam3MaskedBackbone(nn.Module):
         if self.use_fpn and self.use_backbone_fpn:
             ordered_native = self._extract_native_multiscale(backbone_out, image_batch.shape[2])
             if ordered_native is not None:
-                return self._build_nested_from_multiscale(ordered_native, images)
+                result = self._build_nested_from_multiscale(ordered_native, images)
+                self._last_aux_features = result  # also use FPN features as aux
+                return result
 
         feat = self._select_feature(backbone_out)
         if self.channel_repeat > 1:
@@ -583,6 +592,9 @@ class Sam3MaskedBackbone(nn.Module):
         h_feat = proj_feat.shape[2]
         self.feature_stride = max(1, int(round(h_in / float(h_feat))))
         _orig_stride = self.feature_stride  # saved for assertion below
+        # Cache intermediate features for ROI_REFINE (before any downsampling)
+        masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
+        self._last_aux_features = {self.feature_stride: NestedTensor(proj_feat, masks[0])}
         # Downsample to target stride if requested (helps reduce encoder memory)
         if self.target_stride and self.feature_stride < self.target_stride:
             factor = self.target_stride // self.feature_stride
@@ -752,12 +764,10 @@ class Sam3MaskedBackbone(nn.Module):
                 p.requires_grad_(not self.freeze)
 
         if self._patch_merge_proj is not None:
-            if self.freeze:
-                self._patch_merge_proj.eval()
-            else:
-                self._patch_merge_proj.train()
+            # X-SAM 1x1 conv is always trainable
+            self._patch_merge_proj.train()
             for p in self._patch_merge_proj.parameters():
-                p.requires_grad_(not self.freeze)
+                p.requires_grad_(True)
 
         for layer in self._level_proj_layers.values():
             if self.freeze:

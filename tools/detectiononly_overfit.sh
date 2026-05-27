@@ -6,7 +6,7 @@ set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
 
-OUTPUT_DIR="${1:-z_outputs/pretrain_det_overfit_v2_16000}"
+OUTPUT_DIR="${1:-z_outputs/detectiononly_overfit_v5_16000}"
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 
 echo "=============================================="
@@ -44,6 +44,7 @@ TRAIN_OPTS=(
     SOLVER.WARMUP_ITERS "500"
     SOLVER.CHECKPOINT_PERIOD "2000"
     TEST.EVAL_PERIOD "2000"
+    DATALOADER.NUM_WORKERS "2"
 )
 
 echo "[CUDA] Clearing cache..."
