@@ -194,6 +194,7 @@ class IterativeRelationDETR(DETR):
         self.temporal_mode = str(getattr(cfg.MODEL.TEMPORAL, "MODE", "feature_ema")).lower()
         self.temporal_agg = None
         self.query_injector = None
+        self.relation_query_injector = None
         self.object_memory_bank = None
         self._memory_states = {}
         self.person_score_scale = float(getattr(cfg.MODEL.DETR, "PERSON_SCORE_SCALE", 1.0))
@@ -223,6 +224,10 @@ class IterativeRelationDETR(DETR):
             )
         if self.temporal_enabled and self.temporal_mode == "object_query_memory_v1":
             self.query_injector = TemporalQueryInjector(transformer.d_model, max_iter=cfg.SOLVER.MAX_ITER, output_dir=cfg.OUTPUT_DIR)
+            if cfg.MODEL.TEMPORAL.RELATION_MEMORY_ENABLED:
+                self.relation_query_injector = TemporalQueryInjector(transformer.d_model, max_iter=cfg.SOLVER.MAX_ITER, output_dir=cfg.OUTPUT_DIR)
+            else:
+                self.relation_query_injector = None
             self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
 
     def _classify_object_embeddings(self, embeddings):
@@ -293,6 +298,9 @@ class IterativeRelationDETR(DETR):
             object_bqd = object_embed.unsqueeze(1).repeat(1, bs, 1)
             subject_embed = self.query_injector(subject_bqd, memory_batch)
             object_embed = self.query_injector(object_bqd, memory_batch)
+            if self.relation_query_injector is not None:
+                relation_bqd = relation_embed.unsqueeze(1).repeat(1, bs, 1)
+                relation_embed = self.relation_query_injector(relation_bqd, memory_batch)
 
         output = self.transformer(
             self.input_proj(src),
