@@ -802,6 +802,9 @@ class JointTransformerTrainer(DefaultTrainer):
             weight_decay = cfg.SOLVER.WEIGHT_DECAY
             if "backbone" in key:
                 lr = lr * cfg.SOLVER.BACKBONE_MULTIPLIER
+            if "gate" in key:
+                lr = lr * cfg.SOLVER.GATE_LR_MULTIPLIER
+                logger.info("Setting LR for gate {} to {}".format(key, lr))
             if "relation" in key:
                 lr = lr * cfg.SOLVER.RELATION_MULTIPLIER
                 logger.info("Setting LR for {} to {}".format(key, lr)) 
