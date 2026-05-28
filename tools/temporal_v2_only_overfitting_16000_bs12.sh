@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Temporal Memory v2 overfit: 5 videos, 280 consecutive frames, 1 GPU
+# Temporal Memory v2 overfit: 10 videos, 1090 consecutive frames, 1 GPU
 # Full task, no X-SAM, no ROI14, gate starts at 0.5 (free learning)
 set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
