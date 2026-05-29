@@ -7,7 +7,7 @@ set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
 
-OUTPUT_DIR="${1:-z_outputs/full_pretrain_roi14_bs48_iter50000}"
+OUTPUT_DIR="${1:-z_outputs/full_roi14_only_bs48_from99999pth_iter50000}"
 NUM_GPUS="${2:-4}"
 
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
@@ -31,7 +31,7 @@ TRAIN_OPTS=(
     MODEL.TEMPORAL.EVAL_ENABLED "False"
 
     # X-SAM + ROI14
-    MODEL.SAM3.USE_PATCH_MERGE "True"
+    MODEL.SAM3.USE_PATCH_MERGE "False"
     MODEL.ROI_REFINE.ENABLED "True"
     MODEL.ROI_REFINE.LOSS_ENABLED "True"
 

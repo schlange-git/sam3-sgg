@@ -38,6 +38,7 @@ class ROIRefineHead(nn.Module):
         self.detach_boxes = bool(detach_boxes)
         self.apply_to = str(apply_to)
         self.only_roi_cls = False
+        self._last_gate_stats = None
 
         in_dim = self.hidden_dim * self.pool_size * self.pool_size
         self.roi_proj = nn.Sequential(
@@ -118,6 +119,13 @@ class ROIRefineHead(nn.Module):
 
         rois, keep_mask, flat_indices = self._build_rois(boxes_cxcywh, image_h, image_w)
         if flat_indices.numel() == 0:
+            self._last_gate_stats = {
+                "count": 0,
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+            }
             return embeddings, keep_mask
 
         roi_feat = roi_align(
@@ -133,15 +141,28 @@ class ROIRefineHead(nn.Module):
         flat_embeddings = embeddings.reshape(b * n, c)
         selected_embeddings = flat_embeddings[flat_indices]
         if self.gate is not None:
-            residual = self.gate(torch.cat((selected_embeddings, roi_emb), dim=-1)) * roi_emb
+            gate_values = self.gate(torch.cat((selected_embeddings, roi_emb), dim=-1))
+            gate_detached = gate_values.detach().float()
+            self._last_gate_stats = {
+                "count": int(gate_detached.numel()),
+                "mean": float(gate_detached.mean().item()),
+                "std": float(gate_detached.std(unbiased=False).item()),
+                "min": float(gate_detached.min().item()),
+                "max": float(gate_detached.max().item()),
+            }
+            residual = gate_values * roi_emb
         else:
+            self._last_gate_stats = None
             residual = roi_emb
 
         refined_flat = flat_embeddings.clone()
-        if self.only_roi_cls:
-            # Replace embedding with roi projection entirely (no original embedding contribution)
+        if self.gate is not None:
+            # Convex fusion: gate=0 keeps the query feature, gate=1 uses the ROI feature.
+            refined_flat[flat_indices] = (1.0 - gate_values) * selected_embeddings + gate_values * roi_emb
+        elif self.only_roi_cls:
+            # Replace embedding with roi projection entirely (no original embedding contribution).
             refined_flat[flat_indices] = residual
         else:
-            # Default: residual addition
+            # Default no-gate fallback: residual addition.
             refined_flat[flat_indices] = refined_flat[flat_indices] + residual
         return refined_flat.reshape(b, n, c).contiguous(), keep_mask

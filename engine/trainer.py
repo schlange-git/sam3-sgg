@@ -644,6 +644,9 @@ class JointTransformerTrainer(DefaultTrainer):
         qi = getattr(_model.detr, "query_injector", None)
         if qi is not None:
             qi._current_iter = self.iter
+        rqi = getattr(_model.detr, "relation_query_injector", None)
+        if rqi is not None:
+            rqi._current_iter = self.iter
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         start = time.perf_counter()
         
@@ -745,6 +748,34 @@ class JointTransformerTrainer(DefaultTrainer):
             self.grad_scaler.scale(losses).backward()
         else:
             losses.backward()
+        gate_log_path = os.environ.get("ROI_GATE_LOG_PATH", "")
+        gate_log_period = int(os.environ.get("ROI_GATE_LOG_PERIOD", "20"))
+        roi_gate_before = None
+        roi_gate_grad_norm = None
+        roi_gate_output_stats = None
+        if gate_log_path and comm.is_main_process() and gate_log_period > 0 and self.iter % gate_log_period == 0:
+            try:
+                detr_module = getattr(_model, "detr", None)
+                roi_gate_output_stats = getattr(detr_module, "_last_roi_gate_stats", None)
+                gate_params = [
+                    p
+                    for name, p in _model.named_parameters()
+                    if "roi_refine_head.gate" in name and p.requires_grad
+                ]
+                if len(gate_params) > 0:
+                    roi_gate_before = torch.cat([p.detach().flatten().cpu() for p in gate_params])
+                    grad_parts = [
+                        p.grad.detach().flatten().float().cpu()
+                        for p in gate_params
+                        if p.grad is not None
+                    ]
+                    if len(grad_parts) > 0:
+                        roi_gate_grad_norm = float(torch.cat(grad_parts).norm().item())
+                    else:
+                        roi_gate_grad_norm = 0.0
+            except Exception:
+                roi_gate_before = None
+                roi_gate_grad_norm = None
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         backward_time = time.perf_counter() - backward_start
         
@@ -761,6 +792,43 @@ class JointTransformerTrainer(DefaultTrainer):
             self.grad_scaler.update()
         else:
             self.optimizer.step()
+        if roi_gate_before is not None:
+            try:
+                gate_params = [
+                    p
+                    for name, p in _model.named_parameters()
+                    if "roi_refine_head.gate" in name and p.requires_grad
+                ]
+                roi_gate_after = torch.cat([p.detach().flatten().cpu() for p in gate_params])
+                update_norm = float((roi_gate_after - roi_gate_before).norm().item())
+                write_header = not os.path.exists(gate_log_path)
+                os.makedirs(os.path.dirname(gate_log_path) or ".", exist_ok=True)
+                obj_stats = (roi_gate_output_stats or {}).get("object") or {}
+
+                def _stat(stats, key):
+                    if key == "count":
+                        return int(stats.get(key, 0))
+                    return float(stats.get(key, 0.0))
+
+                with open(gate_log_path, "a") as f:
+                    if write_header:
+                        f.write(
+                            "iter,"
+                            "object_count,object_gate_mean,object_gate_std,object_gate_min,object_gate_max,"
+                            "grad_norm,update_norm\n"
+                        )
+                    f.write(
+                        f"{self.iter},"
+                        f"{_stat(obj_stats, 'count')},"
+                        f"{_stat(obj_stats, 'mean'):.8f},"
+                        f"{_stat(obj_stats, 'std'):.8f},"
+                        f"{_stat(obj_stats, 'min'):.8f},"
+                        f"{_stat(obj_stats, 'max'):.8f},"
+                        f"{float(roi_gate_grad_norm):.8f},"
+                        f"{update_norm:.8f}\n"
+                    )
+            except Exception:
+                pass
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         optimizer_time = time.perf_counter() - optimizer_start
         

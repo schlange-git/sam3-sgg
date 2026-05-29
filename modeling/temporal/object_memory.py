@@ -50,6 +50,9 @@ class ObjectMemoryBank(nn.Module):
         self.detach_memory = bool(getattr(tcfg, "DETACH_MEMORY", True))
         self.d_model = int(d_model)
         self.ema_momentum = float(getattr(tcfg, "EMA_MOMENTUM", 0.9))
+        self.match_iou_thresh = float(getattr(tcfg, "MEMORY_MATCH_IOU_THRESH", self.iou_thresh))
+        self.match_require_class = bool(getattr(tcfg, "MEMORY_MATCH_REQUIRE_CLASS", True))
+        self.store_gt_boxes = bool(getattr(tcfg, "MEMORY_STORE_GT_BOXES", True))
 
     def init_empty(self, device: torch.device) -> MemoryState:
         return MemoryState(
@@ -74,7 +77,7 @@ class ObjectMemoryBank(nn.Module):
         order = valid_ids[torch.argsort(scores, descending=True)]
         k = min(self.num_slots, order.numel())
         # Score-weighted: low-confidence memories fade out
-        w = scores / scores.max().clamp(min=1e-6)
+        w = state.scores[order[:k]] / scores.max().clamp(min=1e-6)
         out[:k] = state.queries[order[:k]] * w[:k].unsqueeze(-1)
         return out
 
@@ -89,6 +92,63 @@ class ObjectMemoryBank(nn.Module):
         boxes = pred_boxes[keep]
         scores = scores[keep]
         labels = labels[keep]
+        if scores.numel() > self.topk:
+            topk_idx = torch.topk(scores, k=self.topk, dim=0).indices
+            queries = queries[topk_idx]
+            boxes = boxes[topk_idx]
+            scores = scores[topk_idx]
+            labels = labels[topk_idx]
+        return queries, boxes, scores, labels
+
+    def _select_matched_gt_candidates(
+        self,
+        hs_obj: torch.Tensor,
+        pred_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        target_boxes: torch.Tensor,
+        target_labels: torch.Tensor,
+    ):
+        if (
+            hs_obj is None or pred_logits is None or pred_boxes is None or
+            target_boxes is None or target_labels is None or target_boxes.numel() == 0
+        ):
+            return None
+        probs = pred_logits.softmax(dim=-1)
+        cls_probs = probs[..., :-1]
+        scores, labels = cls_probs.max(dim=-1)
+        pred_xyxy = _cxcywh_to_xyxy(pred_boxes)
+        target_xyxy = _cxcywh_to_xyxy(target_boxes)
+        ious = _pairwise_iou_xyxy(pred_xyxy, target_xyxy)
+        if self.match_require_class:
+            class_match = labels[:, None] == target_labels.long()[None, :]
+            ious = ious.masked_fill(~class_match, -1.0)
+        best_iou, best_tgt = ious.max(dim=1)
+        keep = best_iou >= self.match_iou_thresh
+        if int(keep.sum().item()) == 0:
+            return None
+
+        keep_idx = torch.where(keep)[0]
+        matched_targets = best_tgt[keep_idx]
+        queries = hs_obj[keep_idx]
+        boxes = target_boxes[matched_targets] if self.store_gt_boxes else pred_boxes[keep_idx]
+        scores = (scores[keep_idx] * best_iou[keep_idx].clamp(min=0.0)).clamp(max=1.0)
+        labels = target_labels[matched_targets].long()
+
+        # Keep only the strongest prediction for each GT target to avoid filling memory
+        # with duplicate predictions for the same object/relation.
+        selected = []
+        for tgt_idx in torch.unique(matched_targets):
+            same = torch.where(matched_targets == tgt_idx)[0]
+            best_local = same[torch.argmax(scores[same])]
+            selected.append(best_local)
+        selected = torch.stack(selected) if len(selected) > 0 else keep_idx.new_zeros((0,))
+        if selected.numel() == 0:
+            return None
+        queries = queries[selected]
+        boxes = boxes[selected]
+        scores = scores[selected]
+        labels = labels[selected]
+
         if scores.numel() > self.topk:
             topk_idx = torch.topk(scores, k=self.topk, dim=0).indices
             queries = queries[topk_idx]
@@ -116,6 +176,23 @@ class ObjectMemoryBank(nn.Module):
         if hs_obj is None or pred_logits is None or pred_boxes is None:
             return state
         selected = self._select_candidates(hs_obj, pred_logits, pred_boxes)
+        return self._update_from_selected(state, selected)
+
+    def update_matched_gt(
+        self,
+        state: MemoryState,
+        hs_obj: torch.Tensor,
+        pred_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        target_boxes: torch.Tensor,
+        target_labels: torch.Tensor,
+    ) -> MemoryState:
+        selected = self._select_matched_gt_candidates(
+            hs_obj, pred_logits, pred_boxes, target_boxes, target_labels
+        )
+        return self._update_from_selected(state, selected)
+
+    def _update_from_selected(self, state: MemoryState, selected) -> MemoryState:
         matched_slots = torch.zeros((self.num_slots,), dtype=torch.bool, device=state.queries.device)
         if selected is None:
             self._expire_unmatched(state, matched_slots)

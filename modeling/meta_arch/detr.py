@@ -491,21 +491,22 @@ class IterativeRelationDetr(Detr):
             dict[str: Tensor]:
                 mapping from a named loss to a tensor storing the loss. Used during training only.
         """
-        # 检查是否使用预提取特征
-        if hasattr(self.detr, 'use_pre_extracted_features') and self.detr.use_pre_extracted_features:
-            # 预提取特征模式：直接传递特征字典给DETR模型
-            output = self.detr(batched_inputs)
-        else:
-            # 标准图像处理模式
-            images = self.preprocess_image(batched_inputs)
-            output = self.detr(images)
-
+        targets = None
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             gt_relations = [x["relations"].to(self.device) for x in batched_inputs]
-            
             targets = self.prepare_targets((gt_instances, gt_relations))
-            
+
+        # 检查是否使用预提取特征
+        if hasattr(self.detr, 'use_pre_extracted_features') and self.detr.use_pre_extracted_features:
+            # 预提取特征模式：直接传递特征字典给DETR模型
+            output = self.detr(batched_inputs, targets=targets)
+        else:
+            # 标准图像处理模式
+            images = self.preprocess_image(batched_inputs)
+            output = self.detr(images, targets=targets)
+
+        if self.training:
             loss_dict = self.criterion(output, targets)
             
             weight_dict = self.criterion.weight_dict

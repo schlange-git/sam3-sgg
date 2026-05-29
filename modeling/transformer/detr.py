@@ -68,21 +68,36 @@ class TemporalAggregator(nn.Module):
 class TemporalQueryInjector(nn.Module):
     """Lightweight cross-attention: all queries attend to memory bank."""
 
-    def __init__(self, d_model: int, max_iter: int = 160000, output_dir: str = "/tmp"):
+    def __init__(
+        self,
+        d_model: int,
+        max_iter: int = 160000,
+        output_dir: str = "/tmp",
+        name: str = "object",
+        gate_min: float = 0.0,
+        gate_max: float = 1.0,
+        gate_warmup_iters: int = 0,
+    ):
         super().__init__()
         self.max_iter = max_iter
-        self._gate_file = os.path.join(output_dir, "gate_log.csv")
-        self._gate_txt = os.path.join(output_dir, "gate_log.txt")
+        self.name = str(name)
+        self.gate_min = float(gate_min)
+        self.gate_max = float(gate_max)
+        self.gate_warmup_iters = int(gate_warmup_iters)
+        assert self.gate_max >= self.gate_min, "gate_max must be >= gate_min."
+        self._gate_file = os.path.join(output_dir, f"gate_log_{self.name}.csv")
+        self._gate_txt = os.path.join(output_dir, f"gate_log_{self.name}.txt")
         with open(self._gate_file, "w") as gf:
-            gf.write("iter,gate,ceiling\n")
+            gf.write("iter,raw_gate,effective_gate,warmup_factor,gate_min,gate_max\n")
         with open(self._gate_txt, "w") as gf:
-            gf.write("# gate log: iter | gate_score | ceiling\n")
+            gf.write("# gate log: iter | raw_gate | effective_gate | warmup_factor | range\n")
         self.memory_proj_k = nn.Linear(d_model, d_model)
         self.memory_proj_v = nn.Linear(d_model, d_model)
         self.query_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.gate = nn.Parameter(torch.tensor(0.0))  # init~0.001, +0.05/step, max=0.3
+        self.gate = nn.Parameter(torch.tensor(0.0))
         self._call_count = 0
+        self._current_iter = 0
         self.scale = d_model ** -0.5
 
     def forward(self, base_queries_qbd: torch.Tensor, memory_queries_bmd: torch.Tensor) -> torch.Tensor:
@@ -95,23 +110,35 @@ class TemporalQueryInjector(nn.Module):
 
         # Cross-attention: Q attends to K, output attends to V
         attn = torch.einsum('qbd,mbd->qbm', Q, K) * self.scale
-        attn = torch.softmax(attn, dim=1)  # [Q, B, M]
+        attn = torch.softmax(attn, dim=2)  # normalize over memory slots: [Q, B, M]
         mem_out = torch.einsum('qbm,mbd->qbd', attn, V)
         mem_out = self.out_proj(mem_out)
 
         # Learned gating: blend memory with original
-        gate = torch.sigmoid(self.gate)
+        raw_gate = torch.sigmoid(self.gate)
+        bounded_gate = self.gate_min + (self.gate_max - self.gate_min) * raw_gate
         self._call_count += 1
+        it = int(getattr(self, "_current_iter", self._call_count))
+        if self.gate_warmup_iters > 0:
+            warmup_factor = min(max(float(it) / float(self.gate_warmup_iters), 0.0), 1.0)
+        else:
+            warmup_factor = 1.0
+        gate = bounded_gate * warmup_factor
         if self.training:
-            it = self._call_count
-            steps = it * 16 // max(self.max_iter, 1)
-            ceiling = min(0.01 + 0.05 * steps, 0.3)
-            # ceiling not applied to gate - learns freely
             if it % 50 == 0:
                 with open(self._gate_file, "a") as gf:
-                    gf.write(f"{it},{float(gate.mean().item()):.6f},{float(ceiling):.4f}\n")
+                    gf.write(
+                        f"{it},{float(raw_gate.mean().item()):.6f},"
+                        f"{float(gate.mean().item()):.6f},{float(warmup_factor):.6f},"
+                        f"{self.gate_min:.6f},{self.gate_max:.6f}\n"
+                    )
                 with open(self._gate_txt, "a") as gf:
-                    gf.write(f"iter: {it:6d}  gate_score: {float(gate.mean().item()):.6f}  ceiling: {float(ceiling):.4f}\n")
+                    gf.write(
+                        f"iter: {it:6d}  raw_gate: {float(raw_gate.mean().item()):.6f}  "
+                        f"effective_gate: {float(gate.mean().item()):.6f}  "
+                        f"warmup: {float(warmup_factor):.4f}  "
+                        f"range: [{self.gate_min:.4f}, {self.gate_max:.4f}]\n"
+                    )
         return gate * mem_out + (1.0 - gate) * base_queries_qbd
 
 
@@ -139,7 +166,7 @@ class DETR(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -196,7 +223,13 @@ class IterativeRelationDETR(DETR):
         self.query_injector = None
         self.relation_query_injector = None
         self.object_memory_bank = None
+        self.relation_memory_bank = None
         self._memory_states = {}
+        self._relation_memory_states = {}
+        tcfg = cfg.MODEL.TEMPORAL
+        self.memory_update_mode = str(getattr(tcfg, "MEMORY_UPDATE_MODE", "prediction")).lower()
+        self.relation_memory_source = str(getattr(tcfg, "RELATION_MEMORY_SOURCE", "object")).lower()
+        self.relation_memory_update_mode = str(getattr(tcfg, "RELATION_MEMORY_UPDATE_MODE", "prediction")).lower()
         self.person_score_scale = float(getattr(cfg.MODEL.DETR, "PERSON_SCORE_SCALE", 1.0))
         self.person_class_index = int(getattr(cfg.MODEL.DETR, "PERSON_CLASS_INDEX", 0))
         roi_refine_cfg = cfg.MODEL.ROI_REFINE
@@ -223,12 +256,30 @@ class IterativeRelationDETR(DETR):
                 hidden_dim=transformer.d_model, alpha_init=alpha_init
             )
         if self.temporal_enabled and self.temporal_mode == "object_query_memory_v1":
-            self.query_injector = TemporalQueryInjector(transformer.d_model, max_iter=cfg.SOLVER.MAX_ITER, output_dir=cfg.OUTPUT_DIR)
+            self.query_injector = TemporalQueryInjector(
+                transformer.d_model,
+                max_iter=cfg.SOLVER.MAX_ITER,
+                output_dir=cfg.OUTPUT_DIR,
+                name="object",
+                gate_min=float(getattr(tcfg, "GATE_MIN", 0.0)),
+                gate_max=float(getattr(tcfg, "GATE_MAX", 1.0)),
+                gate_warmup_iters=int(getattr(tcfg, "GATE_WARMUP_ITERS", 0)),
+            )
             if cfg.MODEL.TEMPORAL.RELATION_MEMORY_ENABLED:
-                self.relation_query_injector = TemporalQueryInjector(transformer.d_model, max_iter=cfg.SOLVER.MAX_ITER, output_dir=cfg.OUTPUT_DIR)
+                self.relation_query_injector = TemporalQueryInjector(
+                    transformer.d_model,
+                    max_iter=cfg.SOLVER.MAX_ITER,
+                    output_dir=cfg.OUTPUT_DIR,
+                    name="relation",
+                    gate_min=float(getattr(tcfg, "RELATION_GATE_MIN", getattr(tcfg, "GATE_MIN", 0.0))),
+                    gate_max=float(getattr(tcfg, "RELATION_GATE_MAX", getattr(tcfg, "GATE_MAX", 1.0))),
+                    gate_warmup_iters=int(getattr(tcfg, "RELATION_GATE_WARMUP_ITERS", getattr(tcfg, "GATE_WARMUP_ITERS", 0))),
+                )
             else:
                 self.relation_query_injector = None
             self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
+            if self.relation_query_injector is not None and self.relation_memory_source == "relation":
+                self.relation_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
 
     def _classify_object_embeddings(self, embeddings):
         assert embeddings.dim() == 3, f"Expected [B,Q,D] embeddings, got {tuple(embeddings.shape)}."
@@ -243,10 +294,11 @@ class IterativeRelationDETR(DETR):
 
     def reset_temporal_memory(self):
         self._memory_states = {}
+        self._relation_memory_states = {}
         if self.temporal_agg is not None:
             self.temporal_agg.reset()
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, targets=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -299,8 +351,18 @@ class IterativeRelationDETR(DETR):
             subject_embed = self.query_injector(subject_bqd, memory_batch)
             object_embed = self.query_injector(object_bqd, memory_batch)
             if self.relation_query_injector is not None:
+                relation_memory_batch = memory_batch
+                if self.relation_memory_bank is not None:
+                    relation_memory_batch = []
+                    for i in range(bs):
+                        vid = str(video_ids[i]) if video_ids[i] is not None else "__novid__"
+                        state = self._relation_memory_states.get(vid)
+                        if state is None:
+                            state = self.relation_memory_bank.init_empty(src.device)
+                        relation_memory_batch.append(self.relation_memory_bank.get_memory_queries(state))
+                    relation_memory_batch = torch.stack(relation_memory_batch, dim=0)  # [B, M, D]
                 relation_bqd = relation_embed.unsqueeze(1).repeat(1, bs, 1)
-                relation_embed = self.relation_query_injector(relation_bqd, memory_batch)
+                relation_embed = self.relation_query_injector(relation_bqd, relation_memory_batch)
 
         output = self.transformer(
             self.input_proj(src),
@@ -365,6 +427,10 @@ class IterativeRelationDETR(DETR):
             obj_refined, obj_mask = self.roi_refine_head(
                 obj_emb, obj_boxes, roi_feature, image_h, image_w
             )
+            obj_gate_stats = getattr(self.roi_refine_head, "_last_gate_stats", None)
+            self._last_roi_gate_stats = {
+                "object": dict(obj_gate_stats) if obj_gate_stats is not None else None,
+            }
             sub_roi_logits = self._classify_object_embeddings(sub_refined)
             obj_roi_logits = self._classify_object_embeddings(obj_refined)
             if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8:
@@ -438,7 +504,8 @@ class IterativeRelationDETR(DETR):
                     })
                 out['aux_outputs_obj_split'] = aux_outputs_obj_split
 
-        # Update memory after each step using current frame predictions.
+        # Update memory after each step. In matched_gt mode, only predictions that
+        # can be associated with GT boxes/classes are written into memory.
         if (
             self.object_memory_bank is not None
             and (self.training or self.temporal_eval)
@@ -455,8 +522,48 @@ class IterativeRelationDETR(DETR):
                 hs_obj = torch.cat([out['hs_subject_last'][i], out['hs_object_last'][i]], dim=0)
                 pred_logits = torch.cat([out['relation_subject_logits'][i], out['relation_object_logits'][i]], dim=0)
                 pred_boxes = torch.cat([out['relation_subject_boxes'][i], out['relation_object_boxes'][i]], dim=0)
-                state = self.object_memory_bank.update(state, hs_obj, pred_logits, pred_boxes)
+                if self.memory_update_mode == "matched_gt" and targets is not None:
+                    state = self.object_memory_bank.update_matched_gt(
+                        state,
+                        hs_obj,
+                        pred_logits,
+                        pred_boxes,
+                        targets[i]["combined_boxes"].to(pred_boxes.device),
+                        targets[i]["combined_labels"].to(pred_logits.device),
+                    )
+                else:
+                    state = self.object_memory_bank.update(state, hs_obj, pred_logits, pred_boxes)
                 self._memory_states[vid] = state
+        if (
+            self.relation_memory_bank is not None
+            and (self.training or self.temporal_eval)
+            and out.get('hs_relation_last') is not None
+        ):
+            video_ids = getattr(samples, "video_ids", None)
+            if video_ids is None:
+                video_ids = [None] * bs
+            for i in range(bs):
+                vid = str(video_ids[i]) if video_ids[i] is not None else "__novid__"
+                state = self._relation_memory_states.get(vid)
+                if state is None:
+                    state = self.relation_memory_bank.init_empty(src.device)
+                if self.relation_memory_update_mode == "matched_gt" and targets is not None:
+                    state = self.relation_memory_bank.update_matched_gt(
+                        state,
+                        out['hs_relation_last'][i],
+                        out['relation_logits'][i],
+                        out['relation_boxes'][i],
+                        targets[i]["relation_boxes"].to(out['relation_boxes'].device),
+                        targets[i]["relation_labels"].to(out['relation_logits'].device),
+                    )
+                else:
+                    state = self.relation_memory_bank.update(
+                        state,
+                        out['hs_relation_last'][i],
+                        out['relation_logits'][i],
+                        out['relation_boxes'][i],
+                    )
+                self._relation_memory_states[vid] = state
         return out
 
     @torch.jit.unused
