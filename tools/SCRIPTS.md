@@ -49,3 +49,5 @@
 ## 关于 `.gitignore`
 
 当前 `.gitignore` 已包含 `docs/`、`z_outputs/`、`dataset/`、`detectron2/` 等规则；这些规则只影响未被 Git 跟踪的新文件。已经被 Git 跟踪过的文件，即使路径命中 ignore 规则，后续修改或删除仍会出现在 `git status` 中。若要让某个已跟踪目录以后真正不再进入 changes，需要显式从索引移除，例如 `git rm --cached -r docs`，再提交这次索引变更。
+|  | 验证 X-SAM 在 ROI yaml 配置（eiou+corner+person_score_scale）下是否独立破坏收敛 |  | ；train/test 都是  | ，，，，使用  | 单卡，BS=12，16000 iter，LR=1e-4，steps=(4000,12000)，eval=2000 | 若此脚本收敛则说明 X-SAM 与 ROI config profile 兼容，问题在 temporal+X-SAM 组合 |
+|  | 从已过拟合的 X-SAM checkpoint 出发，追加 temporal+ROI 训练，验证初始化梯度方向冲突假说 |  | ；train/test 都是  | ，，，，RELATION_MEMORY，matched_GT | 单卡，BS=12，16000 iter，LR=1e-4，steps=(4000,12000)，gate warmup，eval=2000 | 需先运行  产出 checkpoint |
