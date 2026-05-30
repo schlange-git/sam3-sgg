@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Four-GPU overfit probe with all temporal relation fixes enabled.
-# Fixes enabled:
-#   - relation attention softmax over memory slots
-#   - bounded/warmed object and relation gates
-#   - dedicated relation memory bank
-#   - matched-GT-only memory updates
-# ROI refine and X-SAM patch merge are disabled to isolate temporal behavior.
+# Four-GPU overfit probe combining the passed component probes:
+#   - fixed temporal v2 relation memory
+#   - X-SAM patch merge
+#   - ROI refine gate fusion
 export PYTHONPATH="/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching/detectron2:${PYTHONPATH:-}"
 source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || true
 set -euo pipefail
@@ -13,18 +10,24 @@ set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
 
-OUTPUT_DIR="${1:-z_outputs/overfit_temporal_v2_relation_fixed_all_no_roi_bs48_4000}"
+OUTPUT_DIR="${1:-z_outputs/overfit_temporal_xsam_roi_fixed_all_bs48_4000}"
 NUM_GPUS="${2:-4}"
-CONFIG="configs/speaq_actiongenome_minimal.yaml"
-PORT="${PORT:-29563}"
+CONFIG="configs/speaq_ag_roi.yaml"
+PORT="${PORT:-29573}"
 
 mkdir -p "${OUTPUT_DIR}"
+export ROI_GATE_LOG_PATH="${ROI_GATE_LOG_PATH:-${OUTPUT_DIR}/roi_gate_log.csv}"
+export ROI_GATE_LOG_PERIOD="${ROI_GATE_LOG_PERIOD:-50}"
+export LEARNABLE_DIAGNOSTICS_LOG_PATH="${LEARNABLE_DIAGNOSTICS_LOG_PATH:-${OUTPUT_DIR}/learnable_diagnostics.csv}"
+export LEARNABLE_DIAGNOSTICS_LOG_PERIOD="${LEARNABLE_DIAGNOSTICS_LOG_PERIOD:-50}"
 
 echo "==========================================================="
-echo "[Overfit Temporal V2 Relation Fixed-All No ROI] OUTPUT=${OUTPUT_DIR}"
-echo "[Overfit Temporal V2 Relation Fixed-All No ROI] GPU=${NUM_GPUS}, BS=48, MAX_ITER=4000"
-echo "[Overfit Temporal V2 Relation Fixed-All No ROI] LR=4e-4 STEPS=(1000,3000) WARMUP=125"
-echo "[Overfit Temporal V2 Relation Fixed-All No ROI] train/test = dataset_overfit_temporal as AG_train"
+echo "[Overfit Temporal + X-SAM + ROI Fixed-All] OUTPUT=${OUTPUT_DIR}"
+echo "[Overfit Temporal + X-SAM + ROI Fixed-All] GPU=${NUM_GPUS}, BS=48, MAX_ITER=4000"
+echo "[Overfit Temporal + X-SAM + ROI Fixed-All] LR=4e-4 STEPS=(1000,3000) WARMUP=125"
+echo "[Overfit Temporal + X-SAM + ROI Fixed-All] train/test = dataset_overfit_temporal as AG_train"
+echo "[Diagnostics] ROI=${ROI_GATE_LOG_PATH} period=${ROI_GATE_LOG_PERIOD}"
+echo "[Diagnostics] learnable=${LEARNABLE_DIAGNOSTICS_LOG_PATH} period=${LEARNABLE_DIAGNOSTICS_LOG_PERIOD}"
 echo "==========================================================="
 
 TRAIN_OPTS=(
@@ -34,16 +37,30 @@ TRAIN_OPTS=(
     DATASETS.TEST "('AG_train',)"
     DATASETS.ACTION_GENOME.ANNOTATIONS "dataset_overfit_temporal/annotations"
     DATASETS.ACTION_GENOME.FRAMES "dataset/frames"
+    DATASETS.ACTION_GENOME.VIDEOS "dataset/videos"
     DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN "-1"
     DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL "0"
 
     MODEL.SAM3.ENABLED "True"
     MODEL.SAM3.CHECKPOINT_PATH "sam3/weights/sam3.pt"
     MODEL.SAM3.FREEZE "True"
-    MODEL.SAM3.USE_PATCH_MERGE "False"
+    MODEL.SAM3.USE_PATCH_MERGE "True"
+    MODEL.SAM3.TARGET_STRIDE "28"
+    MODEL.SAM3.FPN_STRIDES "[7, 14, 28]"
+    MODEL.SAM3.USE_FPN "False"
+    MODEL.SAM3.USE_BACKBONE_FPN "True"
+    MODEL.SAM3.MULTISCALE_MERGE "last"
 
-    MODEL.ROI_REFINE.ENABLED "False"
-    MODEL.ROI_REFINE.LOSS_ENABLED "False"
+    MODEL.ROI_REFINE.ENABLED "True"
+    MODEL.ROI_REFINE.STRIDE "14"
+    MODEL.ROI_REFINE.POOL_SIZE "7"
+    MODEL.ROI_REFINE.SMALL_AREA_THRESH "1.0"
+    MODEL.ROI_REFINE.DETACH_BOXES "True"
+    MODEL.ROI_REFINE.USE_GATE "True"
+    MODEL.ROI_REFINE.LOSS_ENABLED "True"
+    MODEL.ROI_REFINE.LOSS_WEIGHT "1.0"
+    MODEL.ROI_REFINE.APPLY_TO "small_only"
+    MODEL.ROI_REFINE.ONLY_ROI_CLS "False"
 
     MODEL.TEMPORAL.ENABLED "True"
     MODEL.TEMPORAL.EVAL_ENABLED "True"
@@ -56,7 +73,6 @@ TRAIN_OPTS=(
     MODEL.TEMPORAL.MEMORY_MATCH_REQUIRE_CLASS "True"
     MODEL.TEMPORAL.MEMORY_STORE_GT_BOXES "True"
     MODEL.TEMPORAL.DETACH_MEMORY "True"
-
     MODEL.TEMPORAL.GATE_MIN "0.0"
     MODEL.TEMPORAL.GATE_MAX "0.20"
     MODEL.TEMPORAL.GATE_WARMUP_ITERS "500"
@@ -64,6 +80,10 @@ TRAIN_OPTS=(
     MODEL.TEMPORAL.RELATION_GATE_MAX "0.10"
     MODEL.TEMPORAL.RELATION_GATE_WARMUP_ITERS "750"
 
+    MODEL.DETR.BOX_LOSS_TYPE "eiou"
+    MODEL.DETR.USE_CORNER_LOSS "True"
+    MODEL.DETR.CORNER_LOSS_WEIGHT "0.5"
+    MODEL.DETR.PERSON_SCORE_SCALE "200.0"
     MODEL.WEIGHTS "model_0099999.pth"
     MODEL.DETR.HEAD_WEIGHTS "model_0099999.pth"
     MODEL.DETR.LOAD_HEAD_ONLY "False"

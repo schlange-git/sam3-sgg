@@ -85,12 +85,6 @@ class TemporalQueryInjector(nn.Module):
         self.gate_max = float(gate_max)
         self.gate_warmup_iters = int(gate_warmup_iters)
         assert self.gate_max >= self.gate_min, "gate_max must be >= gate_min."
-        self._gate_file = os.path.join(output_dir, f"gate_log_{self.name}.csv")
-        self._gate_txt = os.path.join(output_dir, f"gate_log_{self.name}.txt")
-        with open(self._gate_file, "w") as gf:
-            gf.write("iter,raw_gate,effective_gate,warmup_factor,gate_min,gate_max\n")
-        with open(self._gate_txt, "w") as gf:
-            gf.write("# gate log: iter | raw_gate | effective_gate | warmup_factor | range\n")
         self.memory_proj_k = nn.Linear(d_model, d_model)
         self.memory_proj_v = nn.Linear(d_model, d_model)
         self.query_proj = nn.Linear(d_model, d_model)
@@ -98,6 +92,7 @@ class TemporalQueryInjector(nn.Module):
         self.gate = nn.Parameter(torch.tensor(0.0))
         self._call_count = 0
         self._current_iter = 0
+        self._last_gate_stats = None
         self.scale = d_model ** -0.5
 
     def forward(self, base_queries_qbd: torch.Tensor, memory_queries_bmd: torch.Tensor) -> torch.Tensor:
@@ -124,22 +119,17 @@ class TemporalQueryInjector(nn.Module):
         else:
             warmup_factor = 1.0
         gate = bounded_gate * warmup_factor
-        if self.training:
-            if it % 50 == 0:
-                with open(self._gate_file, "a") as gf:
-                    gf.write(
-                        f"{it},{float(raw_gate.mean().item()):.6f},"
-                        f"{float(gate.mean().item()):.6f},{float(warmup_factor):.6f},"
-                        f"{self.gate_min:.6f},{self.gate_max:.6f}\n"
-                    )
-                with open(self._gate_txt, "a") as gf:
-                    gf.write(
-                        f"iter: {it:6d}  raw_gate: {float(raw_gate.mean().item()):.6f}  "
-                        f"effective_gate: {float(gate.mean().item()):.6f}  "
-                        f"warmup: {float(warmup_factor):.4f}  "
-                        f"range: [{self.gate_min:.4f}, {self.gate_max:.4f}]\n"
-                    )
+        self._last_gate_stats = {
+            "raw_gate": float(raw_gate.detach().mean().item()),
+            "effective_gate": float(gate.detach().mean().item()),
+            "warmup_factor": float(warmup_factor),
+            "gate_min": float(self.gate_min),
+            "gate_max": float(self.gate_max),
+        }
         return gate * mem_out + (1.0 - gate) * base_queries_qbd
+
+    def get_last_gate_stats(self):
+        return dict(self._last_gate_stats) if self._last_gate_stats is not None else None
 
 
 @DETR_REGISTRY.register()

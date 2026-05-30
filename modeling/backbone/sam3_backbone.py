@@ -204,6 +204,8 @@ class Sam3MaskedBackbone(nn.Module):
         self._merge_proj_layer: Optional[nn.Module] = None
         # Optional patch-merge projection layer (pixel-unshuffle → 1×1 conv)
         self._patch_merge_proj: Optional[nn.Module] = None
+        self._patch_merge_factor: Optional[int] = None
+        self._patch_merge_init_weight: Optional[torch.Tensor] = None
 
         # FPN layers for multi-scale features (if enabled)
         # Note: FPN layer creation is deferred until forward() when actual feature_stride is known
@@ -345,7 +347,10 @@ class Sam3MaskedBackbone(nn.Module):
                     for dx in range(factor):
                         src_c = c + (dy * factor + dx) * self.feature_dim
                         layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
+        self._patch_merge_factor = int(factor)
+        self._patch_merge_init_weight = layer.weight.detach().clone()
         layer.to(self.device)
+        self._patch_merge_init_weight = self._patch_merge_init_weight.to(self.device)
         # Always trainable: the X-SAM 1x1 conv learns sub-pixel fusion weights
         # even when SAM3 backbone is frozen.
         layer.train()
@@ -353,6 +358,23 @@ class Sam3MaskedBackbone(nn.Module):
             p.requires_grad_(True)
         self._patch_merge_proj = layer
         return self._patch_merge_proj
+
+    def get_patch_merge_stats(self):
+        """Return X-SAM patch-merge deviation from avg-pool initialization."""
+        if self._patch_merge_proj is None or self._patch_merge_init_weight is None:
+            return None
+        weight = self._patch_merge_proj.weight.detach().float()
+        init = self._patch_merge_init_weight.to(weight.device).float()
+        delta = weight - init
+        return {
+            "factor": int(self._patch_merge_factor or 0),
+            "weight_mean": float(weight.mean().item()),
+            "weight_std": float(weight.std(unbiased=False).item()),
+            "delta_mean_abs": float(delta.abs().mean().item()),
+            "delta_max_abs": float(delta.abs().max().item()),
+            "delta_norm": float(delta.norm().item()),
+            "init_norm": float(init.norm().item()),
+        }
 
     def set_freeze(self, freeze: bool) -> None:
         """

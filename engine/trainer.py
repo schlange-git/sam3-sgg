@@ -649,6 +649,37 @@ class JointTransformerTrainer(DefaultTrainer):
             rqi._current_iter = self.iter
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         start = time.perf_counter()
+
+        def _flatten_params_by_name(model, name_substring):
+            params = [
+                p
+                for name, p in model.named_parameters()
+                if name_substring in name and p.requires_grad
+            ]
+            if len(params) == 0:
+                return None, []
+            flat = torch.cat([p.detach().flatten().cpu() for p in params])
+            return flat, params
+
+        def _grad_norm(params):
+            parts = [
+                p.grad.detach().flatten().float().cpu()
+                for p in params
+                if p.grad is not None
+            ]
+            if len(parts) == 0:
+                return 0.0
+            return float(torch.cat(parts).norm().item())
+
+        def _scalar(stats, key, default=0.0):
+            if stats is None:
+                return default
+            return float(stats.get(key, default))
+
+        def _count(stats, key="count"):
+            if stats is None:
+                return 0
+            return int(stats.get(key, 0))
         
         # 数据加载时间
         # 在 detectron2 中，_data_loader_iter 是一个 property（定义在 TrainerBase 中）
@@ -734,12 +765,32 @@ class JointTransformerTrainer(DefaultTrainer):
             if isinstance(hook, PerformanceMonitorHook):
                 hook.forward_times.append(forward_time)
                 hook.forward_time = forward_time
+
+        self._ensure_late_patch_merge_optimizer_params(_model)
         
         if isinstance(loss_dict, torch.Tensor):
             losses = loss_dict
             loss_dict = {"total_loss": loss_dict}
         else:
             losses = sum(loss_dict.values())
+        diagnostics_log_path = os.environ.get("LEARNABLE_DIAGNOSTICS_LOG_PATH", "")
+        diagnostics_log_period = int(os.environ.get("LEARNABLE_DIAGNOSTICS_LOG_PERIOD", "50"))
+        diagnostics_enabled = (
+            bool(diagnostics_log_path)
+            and comm.is_main_process()
+            and diagnostics_log_period > 0
+            and self.iter % diagnostics_log_period == 0
+        )
+        diagnostics_state = None
+        if diagnostics_enabled:
+            roi_before, roi_params = _flatten_params_by_name(_model, "roi_refine_head.gate")
+            xsam_before, xsam_params = _flatten_params_by_name(_model, "_patch_merge_proj")
+            diagnostics_state = {
+                "roi_before": roi_before,
+                "roi_params": roi_params,
+                "xsam_before": xsam_before,
+                "xsam_params": xsam_params,
+            }
         
         # 反向传播时间（支持 AMP）
         backward_start = time.perf_counter()
@@ -748,6 +799,9 @@ class JointTransformerTrainer(DefaultTrainer):
             self.grad_scaler.scale(losses).backward()
         else:
             losses.backward()
+        if diagnostics_state is not None:
+            diagnostics_state["roi_grad_norm"] = _grad_norm(diagnostics_state["roi_params"])
+            diagnostics_state["xsam_grad_norm"] = _grad_norm(diagnostics_state["xsam_params"])
         gate_log_path = os.environ.get("ROI_GATE_LOG_PATH", "")
         gate_log_period = int(os.environ.get("ROI_GATE_LOG_PERIOD", "20"))
         roi_gate_before = None
@@ -829,6 +883,90 @@ class JointTransformerTrainer(DefaultTrainer):
                     )
             except Exception:
                 pass
+        if diagnostics_state is not None:
+            try:
+                detr_module = getattr(_model, "detr", None)
+                backbone_module = None
+                if detr_module is not None and hasattr(detr_module, "backbone"):
+                    backbone_container = detr_module.backbone
+                    if isinstance(backbone_container, torch.nn.Sequential) and len(backbone_container) > 0:
+                        backbone_module = backbone_container[0]
+
+                object_gate_stats = None
+                relation_gate_stats = None
+                if detr_module is not None:
+                    obj_injector = getattr(detr_module, "query_injector", None)
+                    rel_injector = getattr(detr_module, "relation_query_injector", None)
+                    if obj_injector is not None and hasattr(obj_injector, "get_last_gate_stats"):
+                        object_gate_stats = obj_injector.get_last_gate_stats()
+                    if rel_injector is not None and hasattr(rel_injector, "get_last_gate_stats"):
+                        relation_gate_stats = rel_injector.get_last_gate_stats()
+
+                roi_stats = getattr(detr_module, "_last_roi_gate_stats", None) if detr_module is not None else None
+                roi_obj_stats = (roi_stats or {}).get("object") or {}
+
+                patch_stats = None
+                if backbone_module is not None and hasattr(backbone_module, "get_patch_merge_stats"):
+                    patch_stats = backbone_module.get_patch_merge_stats()
+
+                roi_update_norm = 0.0
+                if diagnostics_state["roi_before"] is not None:
+                    roi_after, _ = _flatten_params_by_name(_model, "roi_refine_head.gate")
+                    if roi_after is not None:
+                        roi_update_norm = float((roi_after - diagnostics_state["roi_before"]).norm().item())
+
+                xsam_update_norm = 0.0
+                if diagnostics_state["xsam_before"] is not None:
+                    xsam_after, _ = _flatten_params_by_name(_model, "_patch_merge_proj")
+                    if xsam_after is not None:
+                        xsam_update_norm = float((xsam_after - diagnostics_state["xsam_before"]).norm().item())
+
+                write_header = not os.path.exists(diagnostics_log_path)
+                os.makedirs(os.path.dirname(diagnostics_log_path) or ".", exist_ok=True)
+                with open(diagnostics_log_path, "a") as f:
+                    if write_header:
+                        f.write(
+                            "iter,"
+                            "temporal_object_raw_gate,temporal_object_effective_gate,temporal_object_warmup,"
+                            "temporal_object_gate_min,temporal_object_gate_max,"
+                            "temporal_relation_raw_gate,temporal_relation_effective_gate,temporal_relation_warmup,"
+                            "temporal_relation_gate_min,temporal_relation_gate_max,"
+                            "roi_object_count,roi_object_gate_mean,roi_object_gate_std,roi_object_gate_min,roi_object_gate_max,"
+                            "roi_gate_grad_norm,roi_gate_update_norm,"
+                            "xsam_patch_factor,xsam_weight_mean,xsam_weight_std,xsam_delta_mean_abs,xsam_delta_max_abs,"
+                            "xsam_delta_norm,xsam_init_norm,xsam_grad_norm,xsam_update_norm\n"
+                        )
+                    f.write(
+                        f"{self.iter},"
+                        f"{_scalar(object_gate_stats, 'raw_gate'):.8f},"
+                        f"{_scalar(object_gate_stats, 'effective_gate'):.8f},"
+                        f"{_scalar(object_gate_stats, 'warmup_factor'):.8f},"
+                        f"{_scalar(object_gate_stats, 'gate_min'):.8f},"
+                        f"{_scalar(object_gate_stats, 'gate_max'):.8f},"
+                        f"{_scalar(relation_gate_stats, 'raw_gate'):.8f},"
+                        f"{_scalar(relation_gate_stats, 'effective_gate'):.8f},"
+                        f"{_scalar(relation_gate_stats, 'warmup_factor'):.8f},"
+                        f"{_scalar(relation_gate_stats, 'gate_min'):.8f},"
+                        f"{_scalar(relation_gate_stats, 'gate_max'):.8f},"
+                        f"{_count(roi_obj_stats)},"
+                        f"{_scalar(roi_obj_stats, 'mean'):.8f},"
+                        f"{_scalar(roi_obj_stats, 'std'):.8f},"
+                        f"{_scalar(roi_obj_stats, 'min'):.8f},"
+                        f"{_scalar(roi_obj_stats, 'max'):.8f},"
+                        f"{float(diagnostics_state.get('roi_grad_norm', 0.0)):.8f},"
+                        f"{roi_update_norm:.8f},"
+                        f"{int(_scalar(patch_stats, 'factor', 0.0))},"
+                        f"{_scalar(patch_stats, 'weight_mean'):.8f},"
+                        f"{_scalar(patch_stats, 'weight_std'):.8f},"
+                        f"{_scalar(patch_stats, 'delta_mean_abs'):.8f},"
+                        f"{_scalar(patch_stats, 'delta_max_abs'):.8f},"
+                        f"{_scalar(patch_stats, 'delta_norm'):.8f},"
+                        f"{_scalar(patch_stats, 'init_norm'):.8f},"
+                        f"{float(diagnostics_state.get('xsam_grad_norm', 0.0)):.8f},"
+                        f"{xsam_update_norm:.8f}\n"
+                    )
+            except Exception:
+                pass
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         optimizer_time = time.perf_counter() - optimizer_start
         
@@ -846,6 +984,41 @@ class JointTransformerTrainer(DefaultTrainer):
             # 如果 _trainer 不存在，尝试直接调用（不应该发生）
             logger = logging.getLogger(__name__)
             logger.warning("Cannot find _trainer._write_metrics, metrics may not be written")
+
+    def _ensure_late_patch_merge_optimizer_params(self, model):
+        """Add lazily-created X-SAM patch-merge params to the optimizer once."""
+        if getattr(self, "_late_patch_merge_params_added", False):
+            return
+        patch_params = [
+            p
+            for name, p in model.named_parameters()
+            if "_patch_merge_proj" in name and p.requires_grad
+        ]
+        if len(patch_params) == 0:
+            return
+        existing = {
+            id(p)
+            for group in self.optimizer.param_groups
+            for p in group.get("params", [])
+        }
+        missing = [p for p in patch_params if id(p) not in existing]
+        if len(missing) == 0:
+            self._late_patch_merge_params_added = True
+            return
+        lr = self.cfg.SOLVER.BASE_LR * self.cfg.SOLVER.BACKBONE_MULTIPLIER * self.cfg.SOLVER.ENTITY_MULTIPLIER
+        self.optimizer.add_param_group(
+            {
+                "params": missing,
+                "lr": lr,
+                "weight_decay": self.cfg.SOLVER.WEIGHT_DECAY,
+            }
+        )
+        self._late_patch_merge_params_added = True
+        logging.getLogger("detectron2").info(
+            "Added %d lazily-created X-SAM patch-merge parameters to optimizer with lr=%s",
+            len(missing),
+            lr,
+        )
 
 
     @classmethod
