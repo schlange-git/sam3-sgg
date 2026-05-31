@@ -176,12 +176,17 @@ class Detr(nn.Module):
         if self.mask_on:
             losses += ["masks"]
         self.criterion = build_criterion(cfg.MODEL.DETR.CRITERION, self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight, losses=losses, use_gt_box=self.use_gt_box, use_gt_label=self.use_gt_label, num_relation_classes=self.num_relation_classes, intersection_iou_threshold=cfg.MODEL.DETR.INTERSECTION_IOU_THRESHOLD, intersection_iou_lambda=cfg.MODEL.DETR.INTERSECTION_IOU_LAMBDA, intersection_loss=cfg.MODEL.DETR.INTERSECTION_LOSS, rel_eos_coef=no_rel_weight, statistics=statistics, reweight_relations=cfg.MODEL.DETR.REWEIGHT_RELATIONS, reweight_rel_eos_coef=cfg.MODEL.DETR.REWEIGHT_REL_EOS_COEF, neg_rel_fraction=cfg.MODEL.DETR.NEGATIVE_RELATION_FRACTION, max_rel_pairs=cfg.MODEL.DETR.MAX_RELATION_PAIRS, use_reweight_log=cfg.MODEL.DETR.REWEIGHT_USE_LOG, focal_alpha=cfg.MODEL.DETR.FOCAL_ALPHA, create_bg_pairs=create_bg_pairs, oversample_param=cfg.MODEL.DETR.OVERSAMPLE_PARAM, undersample_param=cfg.MODEL.DETR.UNDERSAMPLE_PARAM, person_class_weight=cfg.MODEL.DETR.PERSON_CLASS_WEIGHT, obj_split_enabled=cfg.MODEL.OBJ_SPLIT.ENABLED, obj_split_regular_classes=list(cfg.MODEL.OBJ_SPLIT.REGULAR_CLASSES), obj_split_small_classes=list(cfg.MODEL.OBJ_SPLIT.SMALL_SHARED_CLASSES), obj_split_fine_groups=[list(g) for g in list(cfg.MODEL.OBJ_SPLIT.FINE_GROUPS)], obj_split_fine_names=list(cfg.MODEL.OBJ_SPLIT.FINE_GROUP_NAMES), roi_refine_enabled=cfg.MODEL.ROI_REFINE.ENABLED, roi_refine_loss_enabled=cfg.MODEL.ROI_REFINE.LOSS_ENABLED, roi_refine_small_area_thresh=cfg.MODEL.ROI_REFINE.SMALL_AREA_THRESH, \
+            obj_missed_aux_cfg=cfg.MODEL.DETR.OBJ_MISSED_AUX, \
             one2many_scheme =cfg.MODEL.DETR.ONE2MANY_SCHEME, match_independent = cfg.MODEL.DETR.MATCH_INDEPENDENT, \
             box_loss_type=cfg.MODEL.DETR.BOX_LOSS_TYPE, use_corner_loss=cfg.MODEL.DETR.USE_CORNER_LOSS, corner_loss_weight=cfg.MODEL.DETR.CORNER_LOSS_WEIGHT,
             detection_only=cfg.MODEL.DETR.DETECTION_ONLY)
         self.criterion.to(self.device)
 
         self.use_sam3_backbone = cfg.MODEL.SAM3.ENABLED
+        # QualityAux flags (inference-only, default OFF)
+        self._aux_discount = float(getattr(cfg.MODEL.DETR.OBJ_MISSED_AUX, "DISCOUNT_FACTOR", 0.0))
+        self._aux_discount_iou = float(getattr(cfg.MODEL.DETR.OBJ_MISSED_AUX, "DISCOUNT_IOU_THRESH", 0.5))
+        self._triplet_conf_alpha = float(getattr(cfg.MODEL.DETR.OBJ_MISSED_AUX, "TRIPLET_CONF_ALPHA", 0.0))
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
         pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
@@ -609,6 +614,26 @@ class IterativeRelationDetr(Detr):
             box_s = output['aux_outputs_r_sub'][self.test_index]['pred_boxes']
             box_o = output['aux_outputs_r_obj'][self.test_index]['pred_boxes']
 
+        # QualityAux discount: penalize shadow detections
+        discount_factor = float(getattr(self, "_aux_discount", 0.0))
+        discount_iou_thresh = float(getattr(self, "_aux_discount_iou", 0.5))
+        if discount_factor > 0 and not self.training:
+            for b in range(B):
+                for br_s, br_l, br_b in [(scores_s, labels_s, box_s), (scores_o, labels_o, box_o)]:
+                    for cls_id in br_l[b].unique():
+                        if cls_id < 0:
+                            continue
+                        mask = br_l[b] == cls_id
+                        idxs = mask.nonzero(as_tuple=True)[0]
+                        if len(idxs) <= 1:
+                            continue
+                        boxes_xyxy = Boxes(box_cxcywh_to_xyxy(br_b[b][idxs]))
+                        ious = pairwise_iou(boxes_xyxy, boxes_xyxy)
+                        for k in range(len(idxs)):
+                            penalty = ious[k, :k].max().item() if k > 0 else 0.0
+                            if penalty > discount_iou_thresh:
+                                br_s[b, idxs[k]] *= discount_factor
+
         for i, (scores_per_image_s, labels_per_image_s, box_per_image_s, scores_per_image_o, labels_per_image_o, box_per_image_o, scores_per_image_r, labels_per_image_r, logits_per_image_r, src_per_image_s, src_per_image_o, image_size) in enumerate(zip(
             scores_s, labels_s, box_s, scores_o, labels_o, box_o, scores_r, labels_r, logits_r, src_head_s, src_head_o, image_sizes
         )):
@@ -632,7 +657,19 @@ class IterativeRelationDetr(Detr):
 
             else:
                 image_boxes = Boxes(box_cxcywh_to_xyxy(torch.cat([box_per_image_s, box_per_image_o])))
-                image_scores = torch.cat([scores_per_image_s, scores_per_image_o])
+                # Dual scoring: blend triplet confidence into detection scores
+                triplet_alpha = float(getattr(self, "_triplet_conf_alpha", 0.0))
+                if triplet_alpha > 0 and not self.training:
+                    r_logits = logits_per_image_r
+                    r_prob = F.softmax(r_logits, dim=-1)
+                    r_conf = r_prob[:, :-1].max(dim=-1).values
+                    r_conf = r_conf.unsqueeze(-1).repeat(1, M).reshape(-1)
+                    scores_per_image_s = scores_per_image_s * (1 - triplet_alpha + triplet_alpha * r_conf[:scores_per_image_s.shape[0]])
+                    scores_per_image_o = scores_per_image_o * (1 - triplet_alpha + triplet_alpha * r_conf[:scores_per_image_o.shape[0]])
+                    image_scores = torch.cat([scores_per_image_s, scores_per_image_o])
+                else:
+                    image_scores = torch.cat([scores_per_image_s, scores_per_image_o])
+
                 image_pred_classes = torch.cat([labels_per_image_s, labels_per_image_o])
                 keep = batched_nms(image_boxes.tensor, image_scores, image_pred_classes, self.nms_thresh) # shape : (169,)
                 keep_classes = image_pred_classes[keep] # shape : (169,) (may vary)

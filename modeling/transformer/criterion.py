@@ -247,6 +247,11 @@ class IterativeRelationCriterionBase(nn.Module):
         self.reweight_rel = kwargs['reweight_relations']
         self.use_reweight_log = kwargs['use_reweight_log']
         self.person_class_weight = kwargs.get('person_class_weight', 1.0)
+        self.obj_missed_aux_cfg = kwargs.get("obj_missed_aux_cfg", None)
+        self.obj_missed_aux_enabled = bool(
+            self.obj_missed_aux_cfg is not None
+            and getattr(self.obj_missed_aux_cfg, "ENABLED", False)
+        )
         self.obj_split_enabled = bool(kwargs.get('obj_split_enabled', False))
         self.obj_split_regular_classes = [int(x) for x in kwargs.get('obj_split_regular_classes', [])]
         self.obj_split_small_classes = [int(x) for x in kwargs.get('obj_split_small_classes', [])]
@@ -308,6 +313,13 @@ class IterativeRelationCriterionBase(nn.Module):
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
+        # Mask quality-aux-matched bg queries from primary CE
+        aux_ignored = kwargs.get("aux_masked_src", None)
+        if aux_ignored is not None:
+            for b, q_indices in enumerate(aux_ignored):
+                if q_indices.numel() > 0:
+                    target_classes[b, q_indices] = -100
+
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight_obj)
         losses = {'loss_ce': loss_ce}
@@ -483,6 +495,9 @@ class IterativeRelationCriterionBase(nn.Module):
 
     def get_relation_losses(self, relation_outputs, entity_targets, relation_targets, combined_indices, **kwargs):
         losses = {}
+        aux_masked_sub = kwargs.pop("aux_masked_subject", None)
+        aux_masked_obj = kwargs.pop("aux_masked_object", None)
+
         num_subject_boxes = sum(len(t[1]) for t in combined_indices['subject'])
         num_subject_boxes = torch.as_tensor([num_subject_boxes], dtype=torch.float, device=next(iter(relation_outputs.values())).device)
         if is_dist_avail_and_initialized():
@@ -492,7 +507,9 @@ class IterativeRelationCriterionBase(nn.Module):
         for loss in self.losses:
             subject_losses = None
             if loss == 'labels':
-                subject_losses = self.get_loss(loss, relation_subject_outputs, entity_targets, combined_indices['subject'], num_subject_boxes, **kwargs)
+                kw_sub = {k: v for k, v in kwargs.items()}
+                kw_sub["aux_masked_src"] = aux_masked_sub
+                subject_losses = self.get_loss(loss, relation_subject_outputs, entity_targets, combined_indices['subject'], num_subject_boxes, **kw_sub)
             if loss == 'boxes':
                 subject_losses = self.get_loss(loss, relation_subject_outputs, entity_targets, combined_indices['subject'], num_subject_boxes)
             if subject_losses is not None:
@@ -508,7 +525,9 @@ class IterativeRelationCriterionBase(nn.Module):
         for loss in self.losses:
             object_losses = None
             if loss == 'labels':
-                object_losses = self.get_loss(loss, relation_object_outputs, entity_targets, combined_indices['object'], num_object_boxes, **kwargs)
+                kw_obj = {k: v for k, v in kwargs.items()}
+                kw_obj["aux_masked_src"] = aux_masked_obj
+                object_losses = self.get_loss(loss, relation_object_outputs, entity_targets, combined_indices['object'], num_object_boxes, **kw_obj)
             if loss == 'boxes':
                 object_losses = self.get_loss(loss, relation_object_outputs, entity_targets, combined_indices['object'], num_object_boxes)
             if object_losses is not None:
@@ -705,6 +724,9 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
         #o2m
         self.o2m_scheme = kwargs['one2many_scheme']
         self.match_independent = kwargs['match_independent']
+        self._qaux_cum_sub = 0
+        self._qaux_cum_obj = 0
+        self._qaux_last_log_iter = -1
 
         if self.reweight_rel:
             empty_rel_weight = self.statistics['fg_rel_count'] / self.statistics['fg_rel_count'].sum() 
@@ -780,7 +802,33 @@ class IterativeRelationCriterion(IterativeRelationCriterionBase):
         entity_targets = [{'boxes': x['combined_boxes'], 'labels': x['combined_labels']} for x in augmented_targets]
         relation_targets = [{'boxes': x['relation_boxes'], 'labels': x['relation_labels']} for x in augmented_targets]
         kwargs = {'aux_loss' : False}
-        losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices, **kwargs))
+        # Quality-aware auxiliary matching
+        aux_masked_subject = None
+        aux_masked_object = None
+        quality_aux_indices = None
+        if self.obj_missed_aux_enabled:
+            from detectron2.utils.events import get_event_storage
+            storage = get_event_storage()
+            start_iter = int(getattr(self.obj_missed_aux_cfg, "START_ITER", 0))
+            if storage.iter >= start_iter:
+                from .obj_missed_aux import build_quality_aware_aux_indices
+                quality_aux_indices = build_quality_aware_aux_indices(
+                    outputs=relation_outputs_without_aux,
+                    targets=targets,
+                    combined_indices=combined_indices,
+                    cfg=self.obj_missed_aux_cfg,
+                )
+                aux_masked_subject = [quality_aux_indices["subject"][b][0] for b in range(len(targets))]
+                aux_masked_object = [quality_aux_indices["object"][b][0] for b in range(len(targets))]
+                self._qaux_cum_sub += quality_aux_indices.get("_cum_sub", 0)
+                self._qaux_cum_obj += quality_aux_indices.get("_cum_obj", 0)
+                if storage.iter - self._qaux_last_log_iter >= 100:
+                    import logging as _logging
+                    _lg = _logging.getLogger("detectron2")
+                    _lg.info("[QualityAux] cum: sub=%d obj=%d (iter %d)" % (self._qaux_cum_sub, self._qaux_cum_obj, storage.iter))
+                    self._qaux_last_log_iter = storage.iter
+
+        losses.update(self.get_relation_losses(relation_outputs_without_aux, entity_targets, relation_targets, combined_indices, aux_masked_subject=aux_masked_subject, aux_masked_object=aux_masked_object, **kwargs))
         losses.update(self.get_obj_split_aux_losses(outputs, entity_targets, combined_indices))
         losses.update(self.get_roi_refine_losses(outputs, entity_targets, combined_indices))
         if 'aux_outputs_r' in outputs and not self.detection_only:
