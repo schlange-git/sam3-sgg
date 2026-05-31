@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Overfit temporal v2 only, matching full-training solver config.
+# Verify that temporal v2 alone can overfit with full config scaling.
+set -euo pipefail
+PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
+cd "$PROJ"
+OUTPUT_DIR="${1:-z_outputs/overfit_temporal_v2_full_config_bs12_16000}"
+mkdir -p "${OUTPUT_DIR}"
+echo "[Overfit Temporal V2 Full-Config] OUTPUT=${OUTPUT_DIR}"
+
+python3 train_iterative_model.py     --num-gpus 1 --config-file configs/speaq_ag_roi.yaml     --dist-url tcp://127.0.0.1:29550     OUTPUT_DIR "${OUTPUT_DIR}"     DATASETS.TRAIN "('AG_train',)"     DATASETS.TEST "('AG_train',)"     DATASETS.ACTION_GENOME.ANNOTATIONS dataset_overfit_temporal/annotations     DATASETS.ACTION_GENOME.FRAMES dataset/frames     DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN -1     DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL 0     MODEL.SAM3.ENABLED True     MODEL.SAM3.CHECKPOINT_PATH sam3/weights/sam3.pt     MODEL.SAM3.FREEZE True     MODEL.SAM3.USE_PATCH_MERGE False     MODEL.ROI_REFINE.ENABLED False     MODEL.ROI_REFINE.LOSS_ENABLED False     MODEL.TEMPORAL.ENABLED True     MODEL.TEMPORAL.EVAL_ENABLED True     MODEL.TEMPORAL.MODE object_query_memory_v1     MODEL.TEMPORAL.RELATION_MEMORY_ENABLED True     MODEL.TEMPORAL.RELATION_MEMORY_SOURCE relation     MODEL.TEMPORAL.MEMORY_UPDATE_MODE matched_gt     MODEL.TEMPORAL.RELATION_MEMORY_UPDATE_MODE matched_gt     MODEL.TEMPORAL.GATE_MIN 0.0     MODEL.TEMPORAL.GATE_MAX 0.20     MODEL.TEMPORAL.GATE_WARMUP_ITERS 500     MODEL.TEMPORAL.RELATION_GATE_MIN 0.0     MODEL.TEMPORAL.RELATION_GATE_MAX 0.10     MODEL.TEMPORAL.RELATION_GATE_WARMUP_ITERS 750     MODEL.DETR.BOX_LOSS_TYPE giou     MODEL.DETR.USE_CORNER_LOSS False     MODEL.DETR.PERSON_SCORE_SCALE 1.0     MODEL.WEIGHTS model_0099999.pth     MODEL.DETR.HEAD_WEIGHTS model_0099999.pth     MODEL.DETR.LOAD_HEAD_ONLY False     MODEL.DETR.LOAD_FULL_WEIGHTS True     SOLVER.IMS_PER_BATCH 12     SOLVER.BASE_LR 0.0008     SOLVER.MAX_ITER 4000     SOLVER.STEPS '(1000,3000)'     SOLVER.WARMUP_ITERS 125     SOLVER.CHECKPOINT_PERIOD 500     SOLVER.GATE_LR_MULTIPLIER 5.0     TEST.EVAL_PERIOD 500     DATALOADER.NUM_WORKERS 2
+RET=$?
+echo "[Overfit Temporal V2 Full-Config] Done exit=${RET}"
