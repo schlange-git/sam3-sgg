@@ -3,6 +3,7 @@ import os
 DETR model and criterion classes.
 """
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn
 
@@ -396,18 +397,23 @@ class IterativeRelationDETR(DETR):
                 image_h = self.sam3_image_size
                 image_w = self.sam3_image_size
             else:
-                # ResNet+FPN backbone path: use features list from backbone forward
-                # features list is ordered from fine to coarse (p3, p4, p5, p6)
-                # Index from the end: -1 = p6 (coarsest), -2 = p5, -3 = p4
-                fpn_level = int(getattr(self, "resnet_fpn_level", 0))
-                feat_idx = -(1 + fpn_level)  # 0 -> -1 (coarsest), 1 -> -2 (finer)
+                # ResNet backbone path: features list from fine to coarse
+                # Without FPN: res2(256ch,s4), res3(512ch,s8), res4(1024ch,s16), res5(2048ch,s32)
+                # With FPN: all levels 256ch. Use RESNET_FPN_LEVEL to pick the feature index.
+                fpn_level = int(getattr(self, "resnet_fpn_level", 1))  # default: res4 (stride 16)
+                feat_idx = -(1 + fpn_level)  # 0->-1(res5), 1->-2(res4), 2->-3(res3), 3->-4(res2)
                 assert abs(feat_idx) <= len(features), (
-                    f"ROI_REFINE RESNET_FPN_LEVEL={fpn_level} out of range. "
-                    f"Available FPN levels: {len(features)}"
+                    f"ROI_REFINE RESNET_FPN_LEVEL={fpn_level} out of range. "f"{len(features)} levels available."
                 )
-                roi_nested = features[feat_idx]
-                roi_feature, roi_mask = roi_nested.decompose()
-                # Derive effective image size from feature map dimensions (avoids divisibility issues)
+                roi_feature, roi_mask = features[feat_idx].decompose()
+                # Project to hidden_dim if channels don't match
+                fc = roi_feature.shape[1]
+                target_c = self.roi_refine_head.hidden_dim
+                if fc != target_c:
+                    if not hasattr(self, "_roi_resnet_proj") or self._roi_resnet_proj is None:
+                        self._roi_resnet_proj = nn.Conv2d(fc, target_c, 1).to(roi_feature.device)
+                        nn.init.kaiming_normal_(self._roi_resnet_proj.weight)
+                    roi_feature = self._roi_resnet_proj(roi_feature)
                 image_h = roi_feature.shape[2] * self.roi_refine_stride
                 image_w = roi_feature.shape[3] * self.roi_refine_stride
             expected_feat_h = image_h // self.roi_refine_stride

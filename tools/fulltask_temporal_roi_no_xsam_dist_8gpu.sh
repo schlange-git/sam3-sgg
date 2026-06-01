@@ -4,7 +4,7 @@ source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || true
 set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
-OUTPUT_DIR="${1:-z_outputs/fulltask_temporal_roi_no_xsam_bs96_iter40000}"
+OUTPUT_DIR="${1:-z_outputs/fulltask_temporal_roi_no_xsam_bs96_iter40000_gate}"
 NUM_GPUS="${2:-8}"
 CONFIG="configs/speaq_ag_roi.yaml"
 PORT="${PORT:-29500}"
