@@ -247,6 +247,7 @@ class IterativeRelationDETR(DETR):
                 detach_boxes=bool(roi_refine_cfg.DETACH_BOXES),
                 use_gate=bool(roi_refine_cfg.USE_GATE),
                 apply_to=str(roi_refine_cfg.APPLY_TO),
+                class_names=MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes,
             )
             self.roi_refine_head.only_roi_cls = bool(roi_refine_cfg.ONLY_ROI_CLS)
         if self.temporal_enabled and self.temporal_mode == "feature_ema":
