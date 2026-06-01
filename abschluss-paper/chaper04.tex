@@ -1,0 +1,160 @@
+\chapter{Methodological Components for Efficient Video Scene Graph Generation}
+
+\section{Region-of-Interest Refinement at Native Feature Stride}
+
+\subsection{Problem Statement and Motivation}
+
+In the DETR-based Scene Graph Generation (SGG) pipeline, object detection and relation prediction share a common transformer encoder-decoder architecture. The SAM3 visual backbone produces feature maps at a native stride of approximately 14 pixels ($72 \times 72$ spatial resolution for a $1008 \times 1008$ input). While this stride provides a reasonable balance between spatial resolution and computational cost for the DETR encoder, the subsequent decoder processes object queries at a fixed, relatively coarse representation. Small objects—whose bounding boxes occupy a limited area in the original image—are particularly disadvantaged: their feature representations at stride~14 may contain only a handful of activated positions, making fine-grained localization and classification difficult.
+
+Prior work has demonstrated that region-level feature refinement can substantially improve detection quality, especially for small instances. Mask~R-CNN introduced RoIAlign, which extracts fixed-size feature descriptors from region proposals using bilinear interpolation, avoiding the quantization errors of earlier RoIPool layers and achieving significant gains at high IoU thresholds~\cite{he2017mask}. Feature Pyramid Networks (FPN) route region proposals of different scales to feature maps at different strides, enabling small objects to be processed at higher spatial resolutions~\cite{lin2017feature}. Both principles—spatially precise feature extraction and scale-adaptive feature routing—motivate the ROI refinement module introduced in this chapter.
+
+\subsection{Design Rationale and Architecture}
+
+The ROI refinement module, denoted ROI14 throughout this thesis, operates as a lightweight post-detection refinement head. It is designed to complement—rather than replace—the standard DETR detection head. The key design decisions are as follows.
+
+\textbf{Feature Source: Native Stride-14 Auxiliary Features.}
+The SAM3 backbone's forward pass caches intermediate features before any downsampling operation. These features are at the native SAM3 output stride of approximately~14 ($72 \times 72$ spatial grid). Unlike the downsampled features fed to the DETR encoder (which are at stride~28 after pixel-unshuffle or average pooling), the native stride-14 features preserve finer spatial detail that is critical for small-object localization. The cached features are exposed via a dedicated \texttt{get\_last\_aux\_features()} interface on the SAM3 backbone wrapper, returning a dictionary keyed by stride.
+
+\textbf{RoI Pooling.}
+For each predicted bounding box from the DETR decoder—specifically boxes from the subject and object heads—the module extracts a fixed-size feature descriptor (default: $7 \times 7$) from the stride-14 feature map using RoIAlign-style bilinear interpolation. The pooled features are processed by a small convolutional head (two Conv2d layers with LayerNorm and ReLU activation) to produce a compact region representation.
+
+\textbf{Classification-Only Refinement.}
+The ROI refinement head outputs refined classification logits for subject and object entities. It does not regress new bounding boxes; instead, it reuses the box coordinates from the DETR decoder. This design choice keeps the module lightweight and focuses its capacity on improving class discrimination for challenging cases—particularly small objects and tail categories. The refined logits replace the original logits only for entities whose predicted box area falls below a configurable threshold \texttt{SMALL\_AREA\_THRESH}.
+
+\textbf{Learned Gating (Convex Fusion).}
+The final classification logit is a convex combination of the original decoder logit and the ROI-refined logit:
+\begin{equation}
+\mathrm{logit}_{\mathrm{final}} = \gamma \cdot \mathrm{logit}_{\mathrm{roi}} + (1-\gamma) \cdot \mathrm{logit}_{\mathrm{orig}},
+\end{equation}
+where $\gamma \in [0,1]$ is a learnable gating parameter. At initialization, $\gamma \approx 0$, meaning the model starts by trusting the original decoder prediction. During training, $\gamma$ can increase if ROI refinement proves beneficial, allowing the model to autonomously determine the optimal fusion ratio. This gating mechanism is inspired by the learned skip-connection gating in Gated Feedback RNNs~\cite{chung2015gated}.
+
+\subsection{Training and Inference}
+
+The ROI refinement head is trained jointly with the main SGG objective. Its loss consists of cross-entropy classification losses for subject and object branches:
+\begin{equation}
+\mathcal{L}_{\mathrm{roi}} = \mathcal{L}_{\mathrm{roi\_subject\_cls}} + \mathcal{L}_{\mathrm{roi\_object\_cls}}.
+\end{equation}
+The loss weight is controlled by \texttt{ROI\_REFINE.LOSS\_WEIGHT} (default:~1.0). At inference time, the refined logits replace the original logits in the NMS post-processing pipeline for qualifying entities.
+
+% ======================================================================
+
+\section{Cross-Attention Temporal Query Injection with Learned Gating}
+
+\subsection{Problem Statement and Motivation}
+
+Video Scene Graph Generation (Video SGG) extends the single-image SGG task to video sequences. In video data, adjacent frames exhibit strong temporal correlations: (1)~\textit{object persistence}—the same physical entity appears across multiple frames with stable appearance, location, and category; (2)~\textit{relation persistence}—spatial relationships and interaction patterns such as $\langle\text{person}, \text{holding}, \text{cup}\rangle$ typically remain unchanged or change smoothly between adjacent frames; (3)~\textit{complementary information}—individual frames may suffer from occlusion, motion blur, or viewpoint changes, while neighboring frames can provide supplementary cues. Effectively exploiting this temporal information can benefit both object detection and relation prediction sub-tasks.
+
+A straightforward approach to temporal modeling is additive query injection (V1 design): historical object queries are projected and directly added to current-frame queries with a fixed hyperparameter controlling the blending ratio. This method has three limitations: (1)~the fixed blending ratio cannot adapt to different queries' varying needs for temporal context; (2)~a hard-replacement memory update (overwriting memory slots with new detections) causes abrupt memory state changes when detection quality fluctuates; (3)~low-confidence detections are indiscriminately stored in memory, potentially propagating erroneous information to subsequent frames.
+
+The V2 design proposed in this section addresses all three limitations through cross-attention fusion, exponential moving average (EMA) memory updates, and confidence-weighted memory retrieval. The total modification amounts to approximately 40~lines of code, does not alter the backbone or transformer structure, and is fully backward-compatible with the V1 configuration.
+
+\subsection{Design Overview}
+
+The temporal memory system consists of two cooperating components: (1)~an \textit{Object Memory Bank} that maintains a fixed-size set of learnable memory slots, each storing a historical object query feature, a confidence score, and a validity mask; and (2)~a \textit{Temporal Query Injector} that fuses memory features with current-frame queries through cross-attention with learned gating.
+
+\subsection{Component 1: Cross-Attention Temporal Query Injector}
+
+Let $\mathbf{Q} \in \mathbb{R}^{Q \times B \times D}$ denote the current frame's object queries and $\mathbf{M} \in \mathbb{R}^{B \times M \times D}$ denote the memory bank with $M$ slots retrieved from previous frames. The injector performs cross-attention followed by learned gating.
+
+\textbf{Cross-Attention.}
+\begin{equation}
+\begin{aligned}
+\mathbf{Q}_{\mathrm{proj}} &= \mathrm{Linear}_Q(\mathbf{Q}), \\
+\mathbf{K}_{\mathrm{proj}} &= \mathrm{Linear}_K(\mathbf{M}), \\
+\mathbf{V}_{\mathrm{proj}} &= \mathrm{Linear}_V(\mathbf{M}).
+\end{aligned}
+\end{equation}
+\begin{equation}
+\mathrm{Attn}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \mathrm{softmax}\!\left(\frac{\mathbf{Q}_{\mathrm{proj}} \mathbf{K}_{\mathrm{proj}}^\top}{\sqrt{D}}\right) \mathbf{V}_{\mathrm{proj}}.
+\end{equation}
+
+Each object query attends to all $M$ memory slots, allowing flexible retrieval of relevant historical information. The attention output is projected through a final linear layer:
+\begin{equation}
+\mathbf{Q}_{\mathrm{mem}} = \mathrm{Linear}_O(\mathrm{Attn}(\mathbf{Q}, \mathbf{K}, \mathbf{V})).
+\end{equation}
+
+\textbf{Learned Gating.}
+\begin{equation}
+\gamma = \sigma(w_g), \quad w_g \in \mathbb{R},
+\end{equation}
+\begin{equation}
+\mathbf{Q}_{\mathrm{out}} = \gamma \cdot \mathbf{Q}_{\mathrm{mem}} + (1-\gamma) \cdot \mathbf{Q}_{\mathrm{base}}.
+\end{equation}
+
+The gating parameter $w_g$ is initialized to $0$ (yielding $\gamma \approx 0.5$), giving equal weight to memory and current queries at the start of training. Through gradient-based optimization, $w_g$ adapts to learn the optimal fusion ratio. The residual connection $\mathbf{Q}_{\mathrm{out}} = \gamma \mathbf{Q}_{\mathrm{mem}} + (1-\gamma) \mathbf{Q}_{\mathrm{base}}$ ensures that if the memory output is unhelpful, the model can degenerate to pure object queries ($\gamma \to 0$).
+
+\textbf{Relation to Prior Work.}
+The cross-attention mechanism follows the scaled dot-product attention formulation from the Transformer architecture~\cite{vaswani2017attention}. The gating mechanism is inspired by the learned gates in Gated Recurrent Units (GRU) and Gated Feedback RNNs~\cite{chung2015gated,chung2014empirical}. The use of external memory with content-based addressing relates to Memory Networks~\cite{weston2015memory} and Neural Turing Machines~\cite{graves2014neural}, though our memory bank is significantly simpler (fixed-size slots with EMA-based writing instead of differentiable read-write heads).
+
+\subsection{Component 2: EMA Memory Update with Matched-GT Filtering}
+
+The memory bank is updated after each frame using an exponential moving average (EMA):
+\begin{equation}
+\mathbf{m}_s^{(t)} = \alpha \cdot \mathbf{m}_s^{(t-1)} + (1-\alpha) \cdot \mathbf{q}^{(t)},
+\end{equation}
+where $\alpha = 0.9$ is the EMA momentum and $\mathbf{q}^{(t)}$ is the new query feature. The EMA update acts as a temporal low-pass filter:
+\begin{equation}
+\mathbf{m}_s^{(t)} = \alpha^t \mathbf{m}_s^{(0)} + (1-\alpha) \sum_{i=1}^{t} \alpha^{t-i} \mathbf{q}^{(i)},
+\end{equation}
+giving recent frames higher weight with exponential decay.
+
+A \textit{matched-GT} filtering mechanism is applied before writing to memory: only predictions that can be associated with ground-truth objects (via $\mathrm{IoU} \geq 0.5$ and class agreement) are stored. This prevents low-quality or false-positive detections from polluting the memory bank. For each ground-truth target, only the strongest matching prediction is kept to avoid filling memory slots with duplicates.
+
+\subsection{Gating Constraints and Warmup Schedule}
+
+To prevent the gate from oscillating during early training, bounded gating is employed:
+\begin{equation}
+\gamma_{\mathrm{effective}} = \gamma_{\mathrm{min}} + (\gamma_{\mathrm{max}} - \gamma_{\mathrm{min}}) \cdot \sigma(w_g) \cdot \lambda_{\mathrm{warmup}}(t),
+\end{equation}
+where $\gamma_{\mathrm{min}}, \gamma_{\mathrm{max}}$ define the allowed range and $\lambda_{\mathrm{warmup}}(t) = \min(t / T_{\mathrm{warmup}}, 1)$ smoothly activates the gate over the first $T_{\mathrm{warmup}}$ iterations. Separate gate parameters and bounds are maintained for object queries ($\gamma_{\mathrm{max}} = 0.20$) and relation queries ($\gamma_{\mathrm{max}} = 0.10$), reflecting the observation that relation predictions benefit less from entity-level temporal memory. The gate parameter receives a $5\times$ learning rate multiplier to ensure it escapes the sigmoid saddle point at initialization.
+
+\subsection{Video-Level State Isolation}
+
+Each video maintains an independent memory state, keyed by \texttt{video\_id} in a dictionary \texttt{MemoryStates}. When the video switches (detected via \texttt{CACHE\_RESET\_ON\_VIDEO\_SWITCH}), the memory state is automatically reset, preventing cross-video memory contamination. This design is essential for datasets like Action Genome~\cite{ji2020action}, where videos are semantically independent.
+
+% ======================================================================
+
+\section{Pixel-Unshuffle Patch Merge for Information-Preserving Downsampling}
+
+\subsection{Problem Statement and Motivation}
+
+The SAM3 backbone, when operating at its standard input resolution of $1008 \times 1008$, produces feature maps of spatial size $72 \times 72$, corresponding to a stride of approximately 14~pixels. This yields $5{,}184$ visual tokens per image. DETR-series transformer encoders have $O(N^2)$ self-attention complexity in the number of input tokens $N$. With $N \approx 5{,}000$, the self-attention computation and memory consumption exceed the capacity of a single consumer GPU (24--48~GB).
+
+The conventional solution is to apply $2 \times 2$ average pooling (stride~2) to reduce the spatial resolution from $72 \times 72$ to $36 \times 36$, cutting the token count by a factor of~4. However, average pooling irreversibly discards fine-grained spatial structure: each $2 \times 2$ window is compressed into a single scalar mean, permanently erasing the sub-pixel activation pattern. This information loss disproportionately harms small objects---whose feature activations may span only 1--3 spatial positions---and tail categories---whose sparse training samples provide weak gradient signals that are further diluted by pooling.
+
+\subsection{Proposed Method: Pixel-Unshuffle Patch Merge}
+
+Inspired by the Pixel-Unshuffle Connector introduced in X-SAM~\cite{xsam2026}, we propose replacing average pooling with a two-stage \textit{space-to-depth} pipeline.
+
+\textbf{Stage~1 --- Lossless Rearrangement (Pixel-Unshuffle).}
+The $2 \times 2$ spatial neighborhood is folded into the channel dimension via the pixel-unshuffle operation (equivalent to space-to-depth):
+\begin{equation}
+\mathbb{R}^{B \times C \times H \times W} \xrightarrow{\mathrm{pixel\_unshuffle}(f=2)} \mathbb{R}^{B \times (C \cdot f^2) \times (H/f) \times (W/f)}.
+\end{equation}
+This is a bijection---every scalar value is preserved, with zero information loss. The operation is the inverse of the pixel shuffle operation introduced for image super-resolution~\cite{shi2016real}, and is analogous to the Focus layer in YOLOv5~\cite{ultralytics2020yolov5}.
+
+\textbf{Stage~2 --- Learnable Projection ($1\times1$ Convolution).}
+A $1 \times 1$ convolution projects the expanded channel dimension back to the target dimension:
+\begin{equation}
+\mathbf{F}^{\mathrm{patch}}_{b,c,i,j} = \sum_{k=0}^{C \cdot f^2 - 1} \mathbf{W}_{c,k} \cdot \mathbf{F}^{\prime}_{b,k,i,j},
+\end{equation}
+where $\mathbf{W} \in \mathbb{R}^{C \times (C \cdot f^2)}$.
+
+\textbf{Weight Initialization (Critical Design).}
+The convolution weights are initialized to exactly mimic average pooling behavior at the start of training:
+\begin{equation}
+\mathbf{W}_{c, k} = \begin{cases} \dfrac{1}{f^2}, & \text{if } k = c + (\mathrm{dy} \cdot f + \mathrm{dx}) \cdot C \\[4pt] 0, & \text{otherwise} \end{cases}
+\end{equation}
+for $\mathrm{dy}, \mathrm{dx} \in [0, f-1]$. Under this initialization, the pixel-unshuffle~+~$1\times1$ conv pipeline produces numerically identical output to average pooling, ensuring that training starts from a known, stable baseline. During training, the $1\times1$ convolution weights are always kept trainable (\texttt{requires\_grad=True}) regardless of the SAM3 backbone freeze state, allowing the model to learn non-uniform sub-pixel fusion weights that can amplify discriminative features for small objects.
+
+\subsection{Integration and Configurable Behavior}
+
+The patch merge module is integrated into the SAM3 backbone wrapper and controlled by a single boolean flag \texttt{USE\_PATCH\_MERGE}. When enabled, the backbone forward pass: (1)~extracts native stride-14 features from SAM3, (2)~applies an optional $1\times1$ projection layer to adjust channels, (3)~computes the native feature stride as $\mathrm{round}(\mathrm{input\_h} \,/\, \mathrm{feature\_h})$, (4)~if the native stride is smaller than \texttt{TARGET\_STRIDE}, computes the downsampling factor $f = \mathrm{TARGET\_STRIDE} \,/\, \mathrm{native\_stride}$, (5)~applies pixel-unshuffle (if $f$ is a power of two) and the $1\times1$ conv; otherwise falls back to average pooling.
+
+For the standard configuration with SAM3 native stride~14 and $\mathrm{TARGET\_STRIDE} = 32$ (or equivalently~28), the factor is $f = 2$, yielding a $2 \times 2$ patch merge with $f^2 = 4\times$ channel expansion before projection.
+
+\subsection{Relationship to Related Work}
+
+The pixel-unshuffle operation was originally introduced as the inverse of pixel shuffle (sub-pixel convolution) for efficient image super-resolution, where it rearranges channel dimensions into spatial dimensions for upsampling~\cite{shi2016real}. In this work, the operation is used in the opposite direction---rearranging spatial dimensions into channels for lossless downsampling---which is the same direction used by the Focus layer in YOLOv5~\cite{ultralytics2020yolov5} and the patch embedding in Vision Transformers~\cite{dosovitskiy2021image}. The key distinction from prior work is the combination with a learnable $1\times1$ convolution initialized to mimic average pooling, which provides a smooth optimization landscape: the model can start from a known-good baseline and gradually discover non-uniform sub-pixel fusion patterns through gradient descent.
+
+The most direct inspiration is the Pixel-Unshuffle Connector proposed in X-SAM (AAAI~2026) for segmentation tasks~\cite{xsam2026}. While X-SAM uses this connector to bridge multi-scale features for mask prediction, this work adapts the same principle to the scene graph generation domain, where the downstream task is object detection and relation prediction rather than pixel-level segmentation. The training dynamics differ accordingly: in segmentation, the $1\times1$ conv receives dense pixel-level supervision; in SGG, it receives sparse object-level gradients propagated through the DETR decoder, making the learning signal weaker and the initialization strategy more critical.
