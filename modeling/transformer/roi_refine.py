@@ -22,6 +22,7 @@ class ROIRefineHead(nn.Module):
         detach_boxes: bool,
         use_gate: bool,
         apply_to: str,
+        class_names: list = None,
     ):
         super().__init__()
         assert hidden_dim > 0, "ROIRefineHead hidden_dim must be positive."
@@ -37,6 +38,7 @@ class ROIRefineHead(nn.Module):
         self.small_area_thresh = float(small_area_thresh)
         self.detach_boxes = bool(detach_boxes)
         self.apply_to = str(apply_to)
+        self.class_names = class_names
         self.only_roi_cls = False
         self._last_gate_stats = None
 
