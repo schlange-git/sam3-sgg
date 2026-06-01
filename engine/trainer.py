@@ -619,7 +619,8 @@ class JointTransformerTrainer(DefaultTrainer):
             copy_cfg = copy.deepcopy(self.cfg)
             copy_cfg.defrost()
             if copy_cfg.DATASETS.TYPE == "ACTION GENOME":
-                copy_cfg.DATASETS.TEST = ("AG_val",)
+                # use config TEST setting, don't force AG_val
+                pass
             else:
                 copy_cfg.DATASETS.TEST = ("VG_test",)
             copy_cfg.freeze()
