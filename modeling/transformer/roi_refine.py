@@ -94,6 +94,7 @@ class ROIRefineHead(nn.Module):
         feature: torch.Tensor,
         image_h: int,
         image_w: int,
+        labels: torch.Tensor = None,
     ):
         assert embeddings.dim() == 3, f"Expected embeddings [B,N,C], got {tuple(embeddings.shape)}."
         assert feature.dim() == 4, f"Expected feature [B,C,H,W], got {tuple(feature.shape)}."
@@ -143,13 +144,21 @@ class ROIRefineHead(nn.Module):
         if self.gate is not None:
             gate_values = self.gate(torch.cat((selected_embeddings, roi_emb), dim=-1))
             gate_detached = gate_values.detach().float()
-            self._last_gate_stats = {
+            stats = {
                 "count": int(gate_detached.numel()),
                 "mean": float(gate_detached.mean().item()),
                 "std": float(gate_detached.std(unbiased=False).item()),
                 "min": float(gate_detached.min().item()),
                 "max": float(gate_detached.max().item()),
             }
+            if labels is not None and labels.numel() == gate_detached.numel():
+                for cls_id in labels.unique().tolist():
+                    mask = labels == cls_id
+                    if mask.sum() > 0:
+                        gv = gate_detached[mask]
+                        stats[f"cls_{int(cls_id)}_mean"] = float(gv.mean().item())
+                        stats[f"cls_{int(cls_id)}_count"] = int(mask.sum().item())
+            self._last_gate_stats = stats
             residual = gate_values * roi_emb
         else:
             self._last_gate_stats = None

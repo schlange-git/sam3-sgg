@@ -434,10 +434,12 @@ class IterativeRelationDETR(DETR):
             sub_boxes = output["relation_subject_coords"][-1]
             obj_boxes = output["relation_object_coords"][-1]
             sub_refined, sub_mask = self.roi_refine_head(
-                sub_emb, sub_boxes, roi_feature, image_h, image_w
+                sub_emb, sub_boxes, roi_feature, image_h, image_w,
+                labels=labels_s[b].argmax(dim=-1) if labels_s is not None else None,
             )
             obj_refined, obj_mask = self.roi_refine_head(
-                obj_emb, obj_boxes, roi_feature, image_h, image_w
+                obj_emb, obj_boxes, roi_feature, image_h, image_w,
+                labels=labels_o[b].argmax(dim=-1) if labels_o is not None else None,
             )
             obj_gate_stats = getattr(self.roi_refine_head, "_last_gate_stats", None)
             self._last_roi_gate_stats = {

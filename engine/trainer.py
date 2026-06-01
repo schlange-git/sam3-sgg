@@ -867,21 +867,16 @@ class JointTransformerTrainer(DefaultTrainer):
 
                 with open(gate_log_path, "a") as f:
                     if write_header:
-                        f.write(
-                            "iter,"
-                            "object_count,object_gate_mean,object_gate_std,object_gate_min,object_gate_max,"
-                            "grad_norm,update_norm\n"
-                        )
-                    f.write(
-                        f"{self.iter},"
-                        f"{_stat(obj_stats, 'count')},"
-                        f"{_stat(obj_stats, 'mean'):.8f},"
-                        f"{_stat(obj_stats, 'std'):.8f},"
-                        f"{_stat(obj_stats, 'min'):.8f},"
-                        f"{_stat(obj_stats, 'max'):.8f},"
-                        f"{float(roi_gate_grad_norm):.8f},"
-                        f"{update_norm:.8f}\n"
-                    )
+                        f.write("iter,object_count,object_gate_mean,object_gate_std,object_gate_min,object_gate_max,grad_norm,update_norm")
+                    cls_keys = sorted([k for k in obj_stats if k.startswith("cls_") and k.endswith("_mean")])
+                    if cls_keys:
+                        f.write("," + ",".join(cls_keys))
+                    f.write("\n")
+                    row = f"{self.iter},{_stat(obj_stats, 'count')},{_stat(obj_stats, 'mean'):.8f},{_stat(obj_stats, 'std'):.8f},{_stat(obj_stats, 'min'):.8f},{_stat(obj_stats, 'max'):.8f},{float(roi_gate_grad_norm):.8f},{update_norm:.8f}"
+                    per_cls_keys = sorted([k for k in obj_stats if k.startswith("cls_") and k.endswith("_mean")])
+                    for k in per_cls_keys:
+                        row += f",{float(obj_stats.get(k, 0.0)):.8f}"
+                    f.write(row + "\n")
             except Exception:
                 pass
         if diagnostics_state is not None:
