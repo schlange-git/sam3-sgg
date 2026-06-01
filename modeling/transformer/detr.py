@@ -86,6 +86,10 @@ class TemporalQueryInjector(nn.Module):
         self.gate_max = float(gate_max)
         self.gate_warmup_iters = int(gate_warmup_iters)
         assert self.gate_max >= self.gate_min, "gate_max must be >= gate_min."
+        self._gate_file = os.path.join(output_dir, f"gate_log_{self.name}.csv")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(self._gate_file, "w") as gf:
+            gf.write("iter,raw_gate,effective_gate,warmup_factor,gate_min,gate_max\n")
         self.memory_proj_k = nn.Linear(d_model, d_model)
         self.memory_proj_v = nn.Linear(d_model, d_model)
         self.query_proj = nn.Linear(d_model, d_model)
@@ -127,6 +131,9 @@ class TemporalQueryInjector(nn.Module):
             "gate_min": float(self.gate_min),
             "gate_max": float(self.gate_max),
         }
+        if self.training and it % 50 == 0:
+            with open(self._gate_file, "a") as gf:
+                gf.write(f"{it},{float(raw_gate.mean().item()):.6f},{float(gate.mean().item()):.6f},{float(warmup_factor):.6f},{self.gate_min:.6f},{self.gate_max:.6f}\n")
         return gate * mem_out + (1.0 - gate) * base_queries_qbd
 
     def get_last_gate_stats(self):
