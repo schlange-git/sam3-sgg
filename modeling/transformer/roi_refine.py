@@ -158,8 +158,9 @@ class ROIRefineHead(nn.Module):
                     mask = labels == cls_id
                     if mask.sum() > 0:
                         gv = gate_detached[mask]
-                        stats[f"cls_{int(cls_id)}_mean"] = float(gv.mean().item())
-                        stats[f"cls_{int(cls_id)}_count"] = int(mask.sum().item())
+                        cname = self.class_names[int(cls_id)] if self.class_names and int(cls_id) < len(self.class_names) else f"cls_{int(cls_id)}"
+                        stats[f"{cname}_mean"] = float(gv.mean().item())
+                        stats[f"{cname}_count"] = int(mask.sum().item())
             self._last_gate_stats = stats
             residual = gate_values * roi_emb
         else:
