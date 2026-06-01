@@ -12,7 +12,8 @@ PORT="${PORT:-29500}"
 echo "=============================================="
 echo "[Full Temporal+ROI No X-SAM] OUTPUT=${OUTPUT_DIR}"
 echo "[Full Temporal+ROI No X-SAM] GPU=${NUM_GPUS} BS=12/gpu (total=96)"
-echo "[Full Temporal+ROI No X-SAM] LR=4e-4 MAX_ITER=25K STEPS=(7.5K,22.5K)"
+echo "[Full Temporal+ROI No X-SAM] LR=4e-4 MAX_ITER=40K STEPS=(7.5K,30K)"
+export ROI_GATE_LOG_PATH="${OUTPUT_DIR}/roi_gate_log.csv"
 echo "=============================================="
 
 TRAIN_OPTS=(
@@ -45,8 +46,8 @@ TRAIN_OPTS=(
 
     SOLVER.IMS_PER_BATCH "96"
     SOLVER.BASE_LR "0.0004"
-    SOLVER.MAX_ITER "25000"
-    SOLVER.STEPS "(5000,15000)"
+    SOLVER.MAX_ITER "40000"
+    SOLVER.STEPS "(7500,30000)"
     SOLVER.WARMUP_ITERS "1500"
     SOLVER.WARMUP_METHOD "linear"
     SOLVER.CHECKPOINT_PERIOD "5000"
