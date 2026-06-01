@@ -436,11 +436,11 @@ class IterativeRelationDETR(DETR):
             all_labels = torch.cat([t.get("combined_labels", torch.tensor([], device=sub_emb.device, dtype=torch.long)) for t in targets]) if targets is not None else None
             sub_refined, sub_mask = self.roi_refine_head(
                 sub_emb, sub_boxes, roi_feature, image_h, image_w,
-                labels=all_labels,
+                labels=None,  # TODO: align with ROI subset
             )
             obj_refined, obj_mask = self.roi_refine_head(
                 obj_emb, obj_boxes, roi_feature, image_h, image_w,
-                labels=all_labels,
+                labels=None,  # TODO: align with ROI subset
             )
             obj_gate_stats = getattr(self.roi_refine_head, "_last_gate_stats", None)
             self._last_roi_gate_stats = {
