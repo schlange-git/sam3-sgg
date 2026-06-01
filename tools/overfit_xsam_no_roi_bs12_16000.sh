@@ -9,7 +9,7 @@ set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
 
-OUTPUT_DIR="${1:-z_outputs/overfit_xsam_no_roi_bs12_16000}"
+OUTPUT_DIR="${1:-z_outputs/overfit_xsam_no_roi_bs12_16000_reporduct}"
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29562}"
 
