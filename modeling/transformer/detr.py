@@ -225,6 +225,7 @@ class IterativeRelationDETR(DETR):
         roi_refine_cfg = cfg.MODEL.ROI_REFINE
         self.roi_refine_enabled = bool(roi_refine_cfg.ENABLED)
         self.roi_refine_stride = int(roi_refine_cfg.STRIDE)
+        self.resnet_fpn_level = int(getattr(roi_refine_cfg, "RESNET_FPN_LEVEL", 0))
         self.roi_refine_loss_enabled = bool(roi_refine_cfg.LOSS_ENABLED)
         self.roi_refine_head = None
         self.sam3_image_size = int(getattr(cfg.MODEL.SAM3, "IMAGE_SIZE", 1008))
@@ -378,27 +379,35 @@ class IterativeRelationDETR(DETR):
         if self.roi_refine_enabled:
             assert self.roi_refine_head is not None, "ROI_REFINE enabled but roi_refine_head was not built."
             assert isinstance(self.backbone, nn.Sequential) and len(self.backbone) > 0, (
-                "ROI_REFINE requires Joiner-style backbone with SAM3 as self.backbone[0]."
+                "ROI_REFINE requires Joiner-style backbone."
             )
             backbone_module = self.backbone[0]
-            assert hasattr(backbone_module, "get_last_aux_features"), (
-                "ROI_REFINE requires SAM3 backbone exposing get_last_aux_features()."
-            )
-            aux_features = backbone_module.get_last_aux_features()
-            assert isinstance(aux_features, dict), "ROI_REFINE aux_features must be a dict keyed by stride."
-            assert self.roi_refine_stride in aux_features, (
-                f"ROI_REFINE requires native stride{self.roi_refine_stride} feature. "
-                f"Available strides: {sorted(aux_features.keys())}."
-            )
-            roi_nested = aux_features[self.roi_refine_stride]
-            roi_feature, _ = roi_nested.decompose()
-            assert roi_feature.shape[0] == bs, (
-                f"ROI_REFINE feature batch {roi_feature.shape[0]} does not match DETR batch {bs}."
-            )
-            # SAM3 always resizes input to IMAGE_SIZE x IMAGE_SIZE internally,
-            # so the feature map spatial size is always IMAGE_SIZE / stride.
-            image_h = self.sam3_image_size
-            image_w = self.sam3_image_size
+            if hasattr(backbone_module, "get_last_aux_features"):
+                # SAM3 backbone path
+                aux_features = backbone_module.get_last_aux_features()
+                assert isinstance(aux_features, dict), "ROI_REFINE aux_features must be a dict keyed by stride."
+                assert self.roi_refine_stride in aux_features, (
+                    f"ROI_REFINE requires native stride{self.roi_refine_stride} feature. "
+                    f"Available strides: {sorted(aux_features.keys())}."
+                )
+                roi_nested = aux_features[self.roi_refine_stride]
+                roi_feature, _ = roi_nested.decompose()
+                # SAM3 always resizes input to IMAGE_SIZE x IMAGE_SIZE internally
+                image_h = self.sam3_image_size
+                image_w = self.sam3_image_size
+            else:
+                # ResNet+FPN backbone path: use features list from backbone forward
+                # features list is ordered from fine to coarse (p3, p4, p5, p6)
+                # Index from the end: -1 = p6 (coarsest), -2 = p5, -3 = p4
+                fpn_level = int(getattr(self, "resnet_fpn_level", 0))
+                feat_idx = -(1 + fpn_level)  # 0 -> -1 (coarsest), 1 -> -2 (finer)
+                assert abs(feat_idx) <= len(features), (
+                    f"ROI_REFINE RESNET_FPN_LEVEL={fpn_level} out of range. "
+                    f"Available FPN levels: {len(features)}"
+                )
+                roi_nested = features[feat_idx]
+                roi_feature, roi_mask = roi_nested.decompose()
+                image_h, image_w = samples.image_sizes[0]
             assert image_h % self.roi_refine_stride == 0 and image_w % self.roi_refine_stride == 0, (
                 f"ROI_REFINE SAM3 IMAGE_SIZE={image_h} must be divisible by stride {self.roi_refine_stride}."
             )

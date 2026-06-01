@@ -180,6 +180,7 @@ def add_dataset_config(cfg):
   _C.MODEL.ROI_REFINE.LOSS_WEIGHT = 1.0
   _C.MODEL.ROI_REFINE.APPLY_TO = "small_only"
   _C.MODEL.ROI_REFINE.ONLY_ROI_CLS = False
+  _C.MODEL.ROI_REFINE.RESNET_FPN_LEVEL = 0  # 0=coarsest(stride32/p5), 1=finer(stride16/p4)
 
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10
