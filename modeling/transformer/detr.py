@@ -407,14 +407,14 @@ class IterativeRelationDETR(DETR):
                 )
                 roi_nested = features[feat_idx]
                 roi_feature, roi_mask = roi_nested.decompose()
-                image_h, image_w = samples.image_sizes[0]
-            assert image_h % self.roi_refine_stride == 0 and image_w % self.roi_refine_stride == 0, (
-                f"ROI_REFINE SAM3 IMAGE_SIZE={image_h} must be divisible by stride {self.roi_refine_stride}."
-            )
-            expected_feat_size = image_h // self.roi_refine_stride
-            assert roi_feature.shape[-2] == expected_feat_size and roi_feature.shape[-1] == expected_feat_size, (
+                # Derive effective image size from feature map dimensions (avoids divisibility issues)
+                image_h = roi_feature.shape[2] * self.roi_refine_stride
+                image_w = roi_feature.shape[3] * self.roi_refine_stride
+            expected_feat_h = image_h // self.roi_refine_stride
+            expected_feat_w = image_w // self.roi_refine_stride
+            assert roi_feature.shape[-2] == expected_feat_h and roi_feature.shape[-1] == expected_feat_w, (
                 f"ROI_REFINE feature shape {tuple(roi_feature.shape[-2:])} does not match "
-                f"SAM3 image {image_h} / stride {self.roi_refine_stride} = {expected_feat_size}."
+                f"image ({image_h},{image_w}) / stride {self.roi_refine_stride} = ({expected_feat_h},{expected_feat_w})."
             )
             sub_emb = output["hs_subject_last"]
             obj_emb = output["hs_object_last"]
