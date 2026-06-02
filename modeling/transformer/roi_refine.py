@@ -146,6 +146,8 @@ class ROIRefineHead(nn.Module):
         if self.gate is not None:
             gate_values = self.gate(torch.cat((selected_embeddings, roi_emb), dim=-1))
             gate_detached = gate_values.detach().float()
+            flat_area = area.reshape(-1)[flat_indices]
+            area_mask = flat_area < self.small_area_thresh
             stats = {
                 "count": int(gate_detached.numel()),
                 "mean": float(gate_detached.mean().item()),
