@@ -153,8 +153,9 @@ class ROIRefineHead(nn.Module):
                 "min": float(gate_detached.min().item()),
                 "max": float(gate_detached.max().item()),
             }
-            if labels is not None:
-                labels = labels[flat_indices]  # align with ROI subset
+            # TODO: align labels with ROI subset (flat_indices vs combined_labels mismatch)
+            # if labels is not None:
+            #     labels = labels[flat_indices]
             if labels is not None and labels.numel() == gate_detached.numel():
                 for cls_id in labels.unique().tolist():
                     mask = labels == cls_id
