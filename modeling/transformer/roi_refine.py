@@ -147,8 +147,7 @@ class ROIRefineHead(nn.Module):
             gate_values = self.gate(torch.cat((selected_embeddings, roi_emb), dim=-1))
             gate_detached = gate_values.detach().float()
             flat_area = area.reshape(-1)[flat_indices]
-            area_median = flat_area.median() if flat_area.numel() > 0 else torch.tensor(0.0)
-            area_mask = flat_area < area_median
+            area_mask = flat_area < 0.03  # threshold from full-dataset stats (docs/area_threshold_stats.md)
             stats = {
                 "count": int(gate_detached.numel()),
                 "mean": float(gate_detached.mean().item()),
