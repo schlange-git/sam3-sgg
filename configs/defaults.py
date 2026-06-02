@@ -192,6 +192,7 @@ def add_dataset_config(cfg):
   _C.SOLVER.RELATION_MULTIPLIER = 1.0
   _C.SOLVER.ENTITY_MULTIPLIER = 1.0
   _C.SOLVER.GATE_LR_MULTIPLIER = 5.0  # high multiplier for temporal gate to escape saddle point
+  _C.SOLVER.EVAL_FIRST = True  # 训练前自动 eval 初始权重质量
   # 以 epoch 为主导的训练长度控制；若 >0，则用它和数据集长度推导 MAX_ITER
   _C.SOLVER.MAX_EPOCH = 1
   _C.SOLVER.MAX_TO_KEEP = 2

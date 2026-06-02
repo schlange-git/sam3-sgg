@@ -5,8 +5,8 @@ source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || true
 set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
-OUTPUT_DIR="${1:-z_outputs/fulltask_resnet_roi_bs96_iter40000}"
-NUM_GPUS="${2:-8}"
+OUTPUT_DIR="${1:-z_outputs/fulltask_resnet_noroi_bs48_iter80000}"
+NUM_GPUS="${2:-4}"
 CONFIG="configs/speaq_actiongenome_minimal.yaml"
 PORT="${PORT:-29500}"
 
@@ -29,8 +29,8 @@ TRAIN_OPTS=(
     MODEL.TEMPORAL.ENABLED "False"
     MODEL.TEMPORAL.EVAL_ENABLED "False"
 
-    MODEL.ROI_REFINE.ENABLED "True"
-    MODEL.ROI_REFINE.LOSS_ENABLED "True"
+    MODEL.ROI_REFINE.ENABLED "False"
+    MODEL.ROI_REFINE.LOSS_ENABLED "False"
     MODEL.ROI_REFINE.RESNET_FPN_LEVEL "1"
     MODEL.ROI_REFINE.STRIDE "16"
     MODEL.ROI_REFINE.APPLY_TO "all"
@@ -41,15 +41,15 @@ TRAIN_OPTS=(
     MODEL.DETR.LOAD_HEAD_ONLY "False"
     MODEL.DETR.LOAD_FULL_WEIGHTS "True"
 
-    SOLVER.IMS_PER_BATCH "96"
-    SOLVER.BASE_LR "0.0008"
-    SOLVER.MAX_ITER "40000"
-    SOLVER.STEPS "(6000,18000)"
+    SOLVER.IMS_PER_BATCH "48"
+    SOLVER.BASE_LR "0.0004"
+    SOLVER.MAX_ITER "80000"
+    SOLVER.STEPS "(12000,70000)"
     SOLVER.WARMUP_ITERS "1200"
     SOLVER.WARMUP_METHOD "linear"
     SOLVER.CHECKPOINT_PERIOD "5000"
 
-    TEST.EVAL_PERIOD "2000"
+    TEST.EVAL_PERIOD "200"
 )
 
 RESUME_ARGS=()

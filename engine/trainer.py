@@ -466,6 +466,61 @@ class SameVideoBatchSampler(Sampler):
         return sum(len(v) for v in self.video_to_indices.values())
 
 
+
+class EvalFirstHook(HookBase):
+    """训练前自动 eval，验证初始权重质量。由 SOLVER.EVAL_FIRST 控制。"""
+
+    def before_train(self):
+        if not comm.is_main_process():
+            return
+        cfg = self.trainer.cfg
+        if not getattr(cfg.SOLVER, "EVAL_FIRST", False):
+            return
+
+        logger = logging.getLogger(__name__)
+        logger.info("=" * 60)
+        logger.info("[EvalFirst] 训练前评估初始权重...")
+
+        # Determine eval dataset
+        if cfg.DATASETS.TYPE == "ACTION GENOME":
+            if cfg.DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL > 0:
+                test_dataset = "AG_val"
+            else:
+                test_dataset = "AG_train"
+        elif cfg.DATASETS.TEST:
+            test_dataset = cfg.DATASETS.TEST[0]
+        else:
+            test_dataset = "AG_train"
+
+        eval_cfg = cfg.clone()
+        eval_cfg.defrost()
+        eval_cfg.DATASETS.TEST = (test_dataset,)
+        eval_cfg.MODEL.TEMPORAL.EVAL_ENABLED = cfg.MODEL.TEMPORAL.ENABLED
+        eval_cfg.freeze()
+
+        logger.info("[EvalFirst] 评估数据集: %s", test_dataset)
+
+        model = self.trainer.model
+        results = self.trainer.__class__.test(eval_cfg, model)
+
+        if isinstance(results, dict):
+            bbox = results.get('bbox', {})
+            sg = results.get('SG', {})
+            if isinstance(bbox, dict):
+                logger.info("[EvalFirst] bbox | AP: %.4f  AP50: %.4f  Rec@50: %.4f",
+                           bbox.get('AP', 0), bbox.get('AP50', 0),
+                           bbox.get('Recall@50', 0))
+            if isinstance(sg, dict):
+                logger.info("[EvalFirst] SG   | R@20: %.5f  R@50: %.5f  mR@50: %.5f",
+                           sg.get('SGRecall@20', 0), sg.get('SGRecall@50', 0),
+                           sg.get('SGMeanRecall@50', 0))
+        else:
+            logger.info("[EvalFirst] 结果: %s", str(results)[:200])
+
+        # Restore training mode
+        model.train()
+        logger.info("=" * 60)
+
 class JointTransformerTrainer(DefaultTrainer):
     def __init__(self, cfg):
         """
@@ -630,6 +685,7 @@ class JointTransformerTrainer(DefaultTrainer):
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
         # ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+        ret.append(EvalFirstHook())
         ret.append(PeriodicCheckpointerWithEval(cfg.TEST.EVAL_PERIOD, test_and_save_results, test_at_end_of_training, self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_to_keep=cfg.SOLVER.MAX_TO_KEEP))
         if comm.is_main_process():
             # run writers in the end, so that evaluation metrics are written
