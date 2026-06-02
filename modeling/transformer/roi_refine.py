@@ -154,7 +154,7 @@ class ROIRefineHead(nn.Module):
                 "max": float(gate_detached.max().item()),
             }
             if labels is not None:
-                labels = labels[keep_indices]  # align with ROI subset
+                labels = labels[flat_indices]  # align with ROI subset
             if labels is not None and labels.numel() == gate_detached.numel():
                 for cls_id in labels.unique().tolist():
                     mask = labels == cls_id
