@@ -152,6 +152,10 @@ class ROIRefineHead(nn.Module):
                 "std": float(gate_detached.std(unbiased=False).item()),
                 "min": float(gate_detached.min().item()),
                 "max": float(gate_detached.max().item()),
+                "small_gate_mean": float(gate_detached[area_mask].mean().item()) if area_mask.any() else 0.0,
+                "small_gate_count": int(area_mask.sum().item()),
+                "large_gate_mean": float(gate_detached[~area_mask].mean().item()) if (~area_mask).any() else 0.0,
+                "large_gate_count": int((~area_mask).sum().item()),
             }
             # TODO: align labels with ROI subset (flat_indices vs combined_labels mismatch)
             # if labels is not None:
