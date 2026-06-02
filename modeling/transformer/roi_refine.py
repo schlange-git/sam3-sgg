@@ -82,12 +82,12 @@ class ROIRefineHead(nn.Module):
         flat_keep = keep_mask.reshape(-1)
         flat_indices = torch.nonzero(flat_keep, as_tuple=False).squeeze(1)
         if flat_indices.numel() == 0:
-            return boxes_cxcywh.new_zeros((0, 5)), keep_mask, flat_indices
+            return boxes_cxcywh.new_zeros((0, 5)), keep_mask, flat_indices, area
 
         flat_boxes = boxes_xyxy_pixel.reshape(b * n, 4)[flat_indices]
         flat_batch = batch_idx.reshape(b * n)[flat_indices].to(flat_boxes.dtype).unsqueeze(1)
         rois = torch.cat((flat_batch, flat_boxes), dim=1)
-        return rois, keep_mask, flat_indices
+        return rois, keep_mask, flat_indices, area
 
     def forward(
         self,
@@ -120,7 +120,7 @@ class ROIRefineHead(nn.Module):
             f"Feature width {feature.shape[-1]} does not match native stride{self.stride} for image_w={image_w}."
         )
 
-        rois, keep_mask, flat_indices = self._build_rois(boxes_cxcywh, image_h, image_w)
+        rois, keep_mask, flat_indices, area = self._build_rois(boxes_cxcywh, image_h, image_w)
         if flat_indices.numel() == 0:
             self._last_gate_stats = {
                 "count": 0,
