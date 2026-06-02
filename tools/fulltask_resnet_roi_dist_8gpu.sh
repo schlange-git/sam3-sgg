@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full task ResNet-101 + ROI14, 8 GPU
+# Full task ResNet-101 + ROI14, 8 GPU. Pure SpeaQ baseline, no SAM3/temporal/X-SAM.
 source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || true
 set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
@@ -25,16 +25,15 @@ TRAIN_OPTS=(
     DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN "-1"
 
     MODEL.SAM3.ENABLED "False"
+    MODEL.TEMPORAL.ENABLED "False"
+    MODEL.TEMPORAL.EVAL_ENABLED "False"
+
     MODEL.ROI_REFINE.ENABLED "True"
     MODEL.ROI_REFINE.LOSS_ENABLED "True"
     MODEL.ROI_REFINE.RESNET_FPN_LEVEL "1"
     MODEL.ROI_REFINE.STRIDE "16"
-    MODEL.TEMPORAL.ENABLED "False"
-    MODEL.TEMPORAL.EVAL_ENABLED "False"
-
-    MODEL.DETR.BOX_LOSS_TYPE "giou"
-    MODEL.DETR.USE_CORNER_LOSS "False"
-    MODEL.DETR.PERSON_SCORE_SCALE "1.0"
+    MODEL.ROI_REFINE.APPLY_TO "all"
+    MODEL.ROI_REFINE.SMALL_AREA_THRESH "0.02"
 
     MODEL.WEIGHTS "res101_pretrained.pth"
     MODEL.DETR.HEAD_WEIGHTS "res101_pretrained.pth"
