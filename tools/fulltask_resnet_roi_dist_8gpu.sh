@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Full task ResNet-101 + ROI14, 8 GPU. Pure SpeaQ baseline, no SAM3/temporal/X-SAM.
+# Eval-first: set EVAL_ONLY=1 to check checkpoint before training
 source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || true
 set -euo pipefail
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
