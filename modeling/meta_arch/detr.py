@@ -509,6 +509,11 @@ class IterativeRelationDetr(Detr):
         else:
             # 标准图像处理模式
             images = self.preprocess_image(batched_inputs)
+            # Attach video metadata for triplet memory (temporal_v3)
+            video_ids = [x.get("video_id", "__novid__") for x in batched_inputs]
+            frame_idxs = [x.get("frame_idx", 0) for x in batched_inputs]
+            images.video_ids = video_ids
+            images.frame_idxs = frame_idxs
             output = self.detr(images, targets=targets)
 
         if self.training:

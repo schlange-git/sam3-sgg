@@ -343,6 +343,8 @@ class ActionGenomeTrainData:
                 "width": width,
                 "video_id": video,
                 "frame_id": frame_name,
+                "frame_idx": int(''.join(filter(str.isdigit, frame_name)) or "0"),  # parsed from e.g. "000123.png"
+                "is_keyframe": True,
                 "annotations": annotations,
                 # Use int64 so that downstream tensors are torch.long and match DETR expectations
                 "relations": np.array(relations, dtype=np.int64) if len(relations) > 0 else np.zeros((0, 3), dtype=np.int64),

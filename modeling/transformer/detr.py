@@ -17,6 +17,10 @@ import numpy as np
 from detectron2.utils.registry import Registry
 import math 
 from ..temporal.object_memory import ObjectMemoryBank
+from ..temporal.triplet_memory import (
+    TripletMemoryManager, TripletMemoryEncoder, TemporalTripletInjector,
+    get_temporal_gate, get_memory_update_mode, get_prediction_threshold, make_union_box,
+)
 from .roi_refine import ROIRefineHead
 
 DETR_REGISTRY = Registry("DETR_REGISTRY")
@@ -192,6 +196,70 @@ class DETR(nn.Module):
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+
+        # ---- Triplet Memory: update with current predictions (temporal_v3) ----
+        if self.triplet_memory_enabled and self.triplet_memory_manager is not None and (self.training or self.temporal_eval):
+            video_ids = getattr(samples, "video_ids", None)
+            frame_idxs = getattr(samples, "frame_idxs", None)
+            if video_ids is not None and frame_idxs is not None and out.get("hs_relation_last") is not None:
+                with torch.no_grad():
+                    rel_logits = out["relation_logits"]
+                    rel_sub_logits = out["relation_subject_logits"]
+                    rel_obj_logits = out["relation_object_logits"]
+                    rel_sub_boxes = out["relation_subject_boxes"]
+                    rel_obj_boxes = out["relation_object_boxes"]
+                    hs_rel = out["hs_relation_last"]
+                    hs_obj = out["hs_object_last"]
+
+                    batch_candidates = []
+                    for b in range(bs):
+                        sub_prob = F.softmax(rel_sub_logits[b], dim=-1)
+                        obj_prob = F.softmax(rel_obj_logits[b], dim=-1)
+                        rel_prob = F.softmax(rel_logits[b], dim=-1)
+                        sub_score, sub_label = sub_prob[..., :-1].max(-1)
+                        obj_score, obj_label = obj_prob[..., :-1].max(-1)
+                        pred_score, pred_label = rel_prob[..., :-1].max(-1)
+
+                        cands = []
+                        quality = sub_score * obj_score * pred_score
+                        topk_upd = min(16, len(pred_score))
+                        thresh = 0.05
+                        _, topk_idx = quality.topk(min(topk_upd, quality.shape[0]))
+
+                        for r in topk_idx:
+                            q = quality[r]
+                            if q < thresh:
+                                continue
+                            signature = (int(sub_label[r]), int(pred_label[r]), int(obj_label[r]))
+                            sub_bx = rel_sub_boxes[b, r]
+                            obj_bx = rel_obj_boxes[b, r]
+                            union_bx = make_union_box(sub_bx, obj_bx)
+                            mem_feat = self.triplet_encoder(
+                                rel_query=hs_rel[b, r].unsqueeze(0),
+                                obj_query=hs_obj[b, r].unsqueeze(0),
+                                sub_box=sub_bx.unsqueeze(0),
+                                obj_box=obj_bx.unsqueeze(0),
+                                pred_prob=rel_prob[r, :-1].unsqueeze(0),
+                            )[0]
+                            cands.append({
+                                "signature": signature,
+                                "feat": mem_feat,
+                                "sub_box": sub_bx,
+                                "obj_box": obj_bx,
+                                "union_box": union_bx,
+                                "score": float(q),
+                                "sub_score": float(sub_score[r]),
+                                "obj_score": float(obj_score[r]),
+                                "pred_score": float(pred_score[r]),
+                            })
+                        batch_candidates.append(cands)
+
+                    self.triplet_memory_manager.update_batch(
+                        video_ids=video_ids,
+                        frame_idxs=frame_idxs,
+                        batch_candidates=batch_candidates,
+                    )
+
         return out
 
     @torch.jit.unused
@@ -224,6 +292,15 @@ class IterativeRelationDETR(DETR):
         self.object_memory_bank = None
         self.relation_memory_bank = None
         self._memory_states = {}
+        # ---- Triplet Memory (temporal_v3) ----
+        self.triplet_memory_enabled = (getattr(cfg.MODEL.TEMPORAL, "TRIPLET_MEMORY_ENABLED", False)
+                                       if hasattr(cfg, 'MODEL') else False)
+        self.triplet_memory_manager = None
+        self.triplet_encoder = None
+        self.triplet_injector_obj = None
+        self.triplet_injector_rel = None
+        self.triplet_iter_counter = 0
+
         self._relation_memory_states = {}
         tcfg = cfg.MODEL.TEMPORAL
         self.memory_update_mode = str(getattr(tcfg, "MEMORY_UPDATE_MODE", "prediction")).lower()
@@ -281,6 +358,27 @@ class IterativeRelationDETR(DETR):
             self.object_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
             if self.relation_query_injector is not None and self.relation_memory_source == "relation":
                 self.relation_memory_bank = ObjectMemoryBank(transformer.d_model, cfg)
+            # ---- Build Triplet Memory modules (temporal_v3) ----
+            tcfg = cfg.MODEL.TEMPORAL
+            if getattr(tcfg, "TRIPLET_MEMORY_ENABLED", False):
+                mem_dim = int(getattr(tcfg, "TRIPLET_MEMORY_DIM", 128))
+                num_rel_cls = int(cfg.MODEL.DETR.NUM_RELATION_CLASSES)
+                self.triplet_memory_enabled = True
+                self.triplet_memory_manager = TripletMemoryManager(cfg)
+                self.triplet_encoder = TripletMemoryEncoder(
+                    d_model=transformer.d_model, num_rel_classes=num_rel_cls,
+                    mem_dim=mem_dim)
+                assert getattr(tcfg, "INJECT_OBJECT", True) or getattr(tcfg, "INJECT_RELATION", True), (
+                    "[TripletMemory] ENABLED=True but INJECT_OBJECT=False and INJECT_RELATION=False!")
+                if getattr(tcfg, "INJECT_OBJECT", True):
+                    self.triplet_injector_obj = TemporalTripletInjector(
+                        d_model=transformer.d_model, mem_dim=mem_dim,
+                        nhead=cfg.MODEL.DETR.NHEADS, dropout=cfg.MODEL.DETR.DROPOUT)
+                if getattr(tcfg, "INJECT_RELATION", True):
+                    self.triplet_injector_rel = TemporalTripletInjector(
+                        d_model=transformer.d_model, mem_dim=mem_dim,
+                        nhead=cfg.MODEL.DETR.NHEADS, dropout=cfg.MODEL.DETR.DROPOUT)
+
 
     def _classify_object_embeddings(self, embeddings):
         assert embeddings.dim() == 3, f"Expected [B,Q,D] embeddings, got {tuple(embeddings.shape)}."
@@ -503,6 +601,38 @@ class IterativeRelationDETR(DETR):
             out['raw_split_logits_object'] = {
                 k: v[-1] for k, v in output['raw_split_logits_object'].items()
             }
+
+        # ---- Triplet Memory: inject into decoder features (temporal_v3) ----
+        if self.triplet_memory_enabled and self.triplet_memory_manager is not None and (self.training or self.temporal_eval):
+            video_ids = getattr(samples, "video_ids", None)
+            frame_idxs = getattr(samples, "frame_idxs", None)
+            if video_ids is not None and frame_idxs is not None:
+                mem, mem_mask = self.triplet_memory_manager.get_batch_memory(
+                    video_ids=video_ids, frame_idxs=frame_idxs, device=src.device)
+                self.triplet_iter_counter += 1
+
+                gate_obj = get_temporal_gate(
+                    self.triplet_iter_counter, 80000, 0.15, 0.10, 0.30)
+                gate_rel = get_temporal_gate(
+                    self.triplet_iter_counter, 80000, 0.30, 0.10, 0.30)
+
+                if mem is not None:
+                    if self.triplet_injector_obj is not None and output.get("hs_object_last") is not None:
+                        obj_q = output["hs_object_last"]
+                        B_obj = obj_q.shape[0]
+                        mem_exp = mem if mem.dim() == 3 else mem.unsqueeze(0).expand(B_obj, -1, -1)
+                        mask_exp = mem_mask if (mem_mask is not None and mem_mask.dim() == 2) else (
+                            mem_mask.unsqueeze(0).expand(B_obj, -1) if mem_mask is not None else None)
+                        output["hs_object_last"] = self.triplet_injector_obj(
+                            obj_q, mem_exp, memory_mask=mask_exp, gate=gate_obj)
+                    if self.triplet_injector_rel is not None and output.get("hs_relation_last") is not None:
+                        rel_q = output["hs_relation_last"]
+                        B_rel = rel_q.shape[0]
+                        mem_exp = mem if mem.dim() == 3 else mem.unsqueeze(0).expand(B_rel, -1, -1)
+                        mask_exp = mem_mask if (mem_mask is not None and mem_mask.dim() == 2) else (
+                            mem_mask.unsqueeze(0).expand(B_rel, -1) if mem_mask is not None else None)
+                        output["hs_relation_last"] = self.triplet_injector_rel(
+                            rel_q, mem_exp, memory_mask=mask_exp, gate=gate_rel)
         out['hs_subject_last'] = output.get('hs_subject_last')
         out['hs_object_last'] = output.get('hs_object_last')
         out['hs_relation_last'] = output.get('hs_relation_last')
@@ -581,6 +711,70 @@ class IterativeRelationDETR(DETR):
                         out['relation_boxes'][i],
                     )
                 self._relation_memory_states[vid] = state
+
+        # ---- Triplet Memory: update with current predictions (temporal_v3) ----
+        if self.triplet_memory_enabled and self.triplet_memory_manager is not None and (self.training or self.temporal_eval):
+            video_ids = getattr(samples, "video_ids", None)
+            frame_idxs = getattr(samples, "frame_idxs", None)
+            if video_ids is not None and frame_idxs is not None and out.get("hs_relation_last") is not None:
+                with torch.no_grad():
+                    rel_logits = out["relation_logits"]
+                    rel_sub_logits = out["relation_subject_logits"]
+                    rel_obj_logits = out["relation_object_logits"]
+                    rel_sub_boxes = out["relation_subject_boxes"]
+                    rel_obj_boxes = out["relation_object_boxes"]
+                    hs_rel = out["hs_relation_last"]
+                    hs_obj = out["hs_object_last"]
+
+                    batch_candidates = []
+                    for b in range(bs):
+                        sub_prob = F.softmax(rel_sub_logits[b], dim=-1)
+                        obj_prob = F.softmax(rel_obj_logits[b], dim=-1)
+                        rel_prob = F.softmax(rel_logits[b], dim=-1)
+                        sub_score, sub_label = sub_prob[..., :-1].max(-1)
+                        obj_score, obj_label = obj_prob[..., :-1].max(-1)
+                        pred_score, pred_label = rel_prob[..., :-1].max(-1)
+
+                        cands = []
+                        quality = sub_score * obj_score * pred_score
+                        topk_upd = min(16, len(pred_score))
+                        thresh = 0.05
+                        _, topk_idx = quality.topk(min(topk_upd, quality.shape[0]))
+
+                        for r in topk_idx:
+                            q = quality[r]
+                            if q < thresh:
+                                continue
+                            signature = (int(sub_label[r]), int(pred_label[r]), int(obj_label[r]))
+                            sub_bx = rel_sub_boxes[b, r]
+                            obj_bx = rel_obj_boxes[b, r]
+                            union_bx = make_union_box(sub_bx, obj_bx)
+                            mem_feat = self.triplet_encoder(
+                                rel_query=hs_rel[b, r].unsqueeze(0),
+                                obj_query=hs_obj[b, r].unsqueeze(0),
+                                sub_box=sub_bx.unsqueeze(0),
+                                obj_box=obj_bx.unsqueeze(0),
+                                pred_prob=rel_prob[r, :-1].unsqueeze(0),
+                            )[0]
+                            cands.append({
+                                "signature": signature,
+                                "feat": mem_feat,
+                                "sub_box": sub_bx,
+                                "obj_box": obj_bx,
+                                "union_box": union_bx,
+                                "score": float(q),
+                                "sub_score": float(sub_score[r]),
+                                "obj_score": float(obj_score[r]),
+                                "pred_score": float(pred_score[r]),
+                            })
+                        batch_candidates.append(cands)
+
+                    self.triplet_memory_manager.update_batch(
+                        video_ids=video_ids,
+                        frame_idxs=frame_idxs,
+                        batch_candidates=batch_candidates,
+                    )
+
         return out
 
     @torch.jit.unused
