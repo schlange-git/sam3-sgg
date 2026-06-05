@@ -95,7 +95,7 @@ class TemporalQueryInjector(nn.Module):
         self.memory_proj_v = nn.Linear(d_model, d_model)
         self.query_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.gate = nn.Parameter(torch.tensor(0.0))
+        self.gate = nn.Parameter(torch.tensor(-4.0))
         self._call_count = 0
         self._current_iter = 0
         self._last_gate_stats = None

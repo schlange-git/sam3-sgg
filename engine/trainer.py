@@ -468,18 +468,22 @@ class SameVideoBatchSampler(Sampler):
 
 
 class EvalFirstHook(HookBase):
-    """训练前自动 eval，验证初始权重质量。由 SOLVER.EVAL_FIRST 控制。"""
+    """训练前自动 eval，验证初始权重质量。由 SOLVER.EVAL_FIRST 控制。
+    注意：eval 需要所有进程参与（COCO evaluator 内部用 comm.gather），
+    因此不在 rank 0 处 return，而是只将日志输出限制在 rank 0。"""
 
     def before_train(self):
-        if not comm.is_main_process():
-            return
         cfg = self.trainer.cfg
         if not getattr(cfg.SOLVER, "EVAL_FIRST", False):
             return
 
-        logger = logging.getLogger(__name__)
-        logger.info("=" * 60)
-        logger.info("[EvalFirst] 训练前评估初始权重...")
+        is_main = comm.is_main_process()
+        logger = logging.getLogger('detectron2')
+
+        if is_main:
+            logger.info("=" * 60)
+            logger.info("[EvalFirst] 训练前评估初始权重...")
+            print("[EvalFirst] 训练前评估初始权重...", flush=True)
 
         # Determine eval dataset
         if cfg.DATASETS.TYPE == "ACTION GENOME":
@@ -498,28 +502,40 @@ class EvalFirstHook(HookBase):
         eval_cfg.MODEL.TEMPORAL.EVAL_ENABLED = cfg.MODEL.TEMPORAL.ENABLED
         eval_cfg.freeze()
 
-        logger.info("[EvalFirst] 评估数据集: %s", test_dataset)
+        if is_main:
+            logger.info("[EvalFirst] 评估数据集: %s", test_dataset)
+            print(f"[EvalFirst] 评估数据集: {test_dataset}", flush=True)
 
+        # 所有进程参与 eval （COCO evaluator 使用 comm.gather 收集结果）
         model = self.trainer.model
         results = self.trainer.__class__.test(eval_cfg, model)
 
-        if isinstance(results, dict):
+        if is_main and isinstance(results, dict):
             bbox = results.get('bbox', {})
+            bbox_recall = results.get('bbox_recall', {})
             sg = results.get('SG', {})
+            recall50 = bbox_recall.get('Recall@50', 0) if isinstance(bbox_recall, dict) else 0
             if isinstance(bbox, dict):
+                print("[EvalFirst] bbox | AP: {:.4f}  AP50: {:.4f}  Rec@50: {:.4f}".format(
+                           bbox.get('AP', 0), bbox.get('AP50', 0),
+                           recall50), flush=True)
                 logger.info("[EvalFirst] bbox | AP: %.4f  AP50: %.4f  Rec@50: %.4f",
                            bbox.get('AP', 0), bbox.get('AP50', 0),
-                           bbox.get('Recall@50', 0))
+                           recall50)
             if isinstance(sg, dict):
+                print("[EvalFirst] SG   | R@20: {:.5f}  R@50: {:.5f}  mR@50: {:.5f}".format(
+                           sg.get('SGRecall@20', 0), sg.get('SGRecall@50', 0),
+                           sg.get('SGMeanRecall@50', 0)), flush=True)
                 logger.info("[EvalFirst] SG   | R@20: %.5f  R@50: %.5f  mR@50: %.5f",
                            sg.get('SGRecall@20', 0), sg.get('SGRecall@50', 0),
                            sg.get('SGMeanRecall@50', 0))
-        else:
+        elif is_main:
             logger.info("[EvalFirst] 结果: %s", str(results)[:200])
 
-        # Restore training mode
+        # Restore training mode (all ranks)
         model.train()
-        logger.info("=" * 60)
+        if is_main:
+            logger.info("=" * 60)
 
 class JointTransformerTrainer(DefaultTrainer):
     def __init__(self, cfg):

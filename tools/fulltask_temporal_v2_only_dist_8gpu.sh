@@ -9,6 +9,9 @@ NUM_GPUS="${2:-8}"
 CONFIG="configs/speaq_ag_roi.yaml"
 PORT="${PORT:-29500}"
 
+mkdir -p "${OUTPUT_DIR}"
+export ROI_GATE_LOG_PATH="${OUTPUT_DIR}/roi_gate_log.csv"
+
 echo "=============================================="
 echo "[Full Temporal V2 Only] OUTPUT=${OUTPUT_DIR}"
 echo "[Full Temporal V2 Only] GPU=${NUM_GPUS} BS=12/gpu (total=96)"
@@ -65,16 +68,24 @@ TRAIN_OPTS=(
 )
 
 RESUME_ARGS=()
-if [[ -d "${OUTPUT_DIR}" ]]; then
-    shopt -s nullglob
-    CKPTS=("${OUTPUT_DIR}"/*.pth)
-    shopt -u nullglob
-    if (( ${#CKPTS[@]} > 0 )); then
-        LATEST=$(ls -1t "${CKPTS[@]}" 2>/dev/null | head -1)
-        if [[ -n "${LATEST}" ]]; then
-            echo "[Resume] ${LATEST}"
-            RESUME_ARGS=(--resume)
+if [[ "${AUTO_RESUME:-0}" == "1" ]]; then
+    if [[ -d "${OUTPUT_DIR}" ]]; then
+        shopt -s nullglob
+        CKPTS=("${OUTPUT_DIR}"/*.pth)
+        shopt -u nullglob
+        if (( ${#CKPTS[@]} > 0 )); then
+            LATEST=$(ls -1t "${CKPTS[@]}" 2>/dev/null | head -1)
+            if [[ -n "${LATEST}" ]]; then
+                echo "[Resume] ${LATEST}"
+                RESUME_ARGS=(--resume)
+            fi
         fi
+    fi
+else
+    if [[ -d "${OUTPUT_DIR}" ]] && [[ -n "$(ls -A "${OUTPUT_DIR}"/*.pth 2>/dev/null)" ]]; then
+        echo "[Warning] OUTPUT_DIR exists with checkpoints. Remove it or set AUTO_RESUME=1 to resume."
+        echo "  rm -rf ${OUTPUT_DIR}"
+        echo "  AUTO_RESUME=1 bash $0"
     fi
 fi
 
