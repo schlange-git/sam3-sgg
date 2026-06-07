@@ -141,7 +141,6 @@ class TripletMemoryEncoder(nn.Module):
     def __init__(self, d_model: int = 256, num_rel_classes: int = 26, mem_dim: int = 128):
         super().__init__()
         self.rel_query_proj = nn.Linear(d_model, mem_dim)
-        self.obj_query_proj = nn.Linear(d_model, mem_dim)
         self.box_proj = nn.Sequential(
             nn.Linear(12, 64),  # sub_box + obj_box + union_box
             nn.LayerNorm(64),
@@ -157,7 +156,7 @@ class TripletMemoryEncoder(nn.Module):
             nn.LayerNorm(32),
             nn.GELU(),
         )
-        in_dim = mem_dim + mem_dim + 64 + 64 + 32
+        in_dim = mem_dim + 64 + 64 + 32  # was +mem_dim(obj_query), removed (unsafe index)
         self.fusion = nn.Sequential(
             nn.Linear(in_dim, mem_dim),
             nn.LayerNorm(mem_dim),
@@ -165,13 +164,12 @@ class TripletMemoryEncoder(nn.Module):
             nn.Linear(mem_dim, mem_dim),
         )
 
-    def forward(self, rel_query: torch.Tensor, obj_query: torch.Tensor,
+    def forward(self, rel_query: torch.Tensor,
                 sub_box: torch.Tensor, obj_box: torch.Tensor,
                 pred_prob: torch.Tensor) -> torch.Tensor:
         """
         Args:
             rel_query: [N, d_model]
-            obj_query: [N, d_model]
             sub_box: [N, 4] xyxy normalized
             obj_box: [N, 4] xyxy normalized
             pred_prob: [N, num_rel_classes] detached
@@ -184,9 +182,8 @@ class TripletMemoryEncoder(nn.Module):
         geom_feat = self.geom_proj(geom)
         pred_feat = self.pred_proj(pred_prob.detach())
         rel_feat = self.rel_query_proj(rel_query)
-        obj_feat = self.obj_query_proj(obj_query)
 
-        feat = torch.cat([rel_feat, obj_feat, box_feat, geom_feat, pred_feat], dim=-1)
+        feat = torch.cat([rel_feat, box_feat, geom_feat, pred_feat], dim=-1)
         return self.fusion(feat)
 
 

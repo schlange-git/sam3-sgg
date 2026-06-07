@@ -222,8 +222,8 @@ class DETR(nn.Module):
 
                         cands = []
                         quality = sub_score * obj_score * pred_score
-                        topk_upd = min(16, len(pred_score))
-                        thresh = 0.05
+                        topk_upd = min(self._triplet_topk_update, len(pred_score))
+                        thresh = self._triplet_update_thresh
                         _, topk_idx = quality.topk(min(topk_upd, quality.shape[0]))
 
                         for r in topk_idx:
@@ -236,7 +236,6 @@ class DETR(nn.Module):
                             union_bx = make_union_box(sub_bx, obj_bx)
                             mem_feat = self.triplet_encoder(
                                 rel_query=hs_rel[b, r].unsqueeze(0),
-                                obj_query=hs_obj[b, r].unsqueeze(0),
                                 sub_box=sub_bx.unsqueeze(0),
                                 obj_box=obj_bx.unsqueeze(0),
                                 pred_prob=rel_prob[r, :-1].unsqueeze(0),
@@ -300,6 +299,13 @@ class IterativeRelationDETR(DETR):
         self.triplet_injector_obj = None
         self.triplet_injector_rel = None
         self.triplet_iter_counter = 0
+        self._triplet_gate_max_obj = float(getattr(cfg.MODEL.TEMPORAL, "GATE_MAX_OBJECT", 0.15))
+        self._triplet_gate_max_rel = float(getattr(cfg.MODEL.TEMPORAL, "GATE_MAX_RELATION", 0.30))
+        self._triplet_gate_zero_ratio = float(getattr(cfg.MODEL.TEMPORAL, "GATE_ZERO_END_RATIO", 0.10))
+        self._triplet_gate_warmup_ratio = float(getattr(cfg.MODEL.TEMPORAL, "GATE_WARMUP_END_RATIO", 0.30))
+        self._triplet_topk_update = int(getattr(cfg.MODEL.TEMPORAL, "TRIPLET_MEMORY_TOPK_UPDATE", 16))
+        self._triplet_update_thresh = float(getattr(cfg.MODEL.TEMPORAL, "UPDATE_SCORE_THRESH", 0.10))
+        self._triplet_debug_memory = bool(getattr(cfg.MODEL.TEMPORAL, "DEBUG_MEMORY", False))
 
         self._relation_memory_states = {}
         tcfg = cfg.MODEL.TEMPORAL
@@ -612,9 +618,11 @@ class IterativeRelationDETR(DETR):
                 self.triplet_iter_counter += 1
 
                 gate_obj = get_temporal_gate(
-                    self.triplet_iter_counter, 80000, 0.15, 0.10, 0.30)
+                    self.triplet_iter_counter, 80000,
+                    self._triplet_gate_max_obj, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
                 gate_rel = get_temporal_gate(
-                    self.triplet_iter_counter, 80000, 0.30, 0.10, 0.30)
+                    self.triplet_iter_counter, 80000,
+                    self._triplet_gate_max_rel, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
 
                 if mem is not None:
                     if self.triplet_injector_obj is not None and output.get("hs_object_last") is not None:
@@ -737,8 +745,8 @@ class IterativeRelationDETR(DETR):
 
                         cands = []
                         quality = sub_score * obj_score * pred_score
-                        topk_upd = min(16, len(pred_score))
-                        thresh = 0.05
+                        topk_upd = min(self._triplet_topk_update, len(pred_score))
+                        thresh = self._triplet_update_thresh
                         _, topk_idx = quality.topk(min(topk_upd, quality.shape[0]))
 
                         for r in topk_idx:
@@ -751,7 +759,6 @@ class IterativeRelationDETR(DETR):
                             union_bx = make_union_box(sub_bx, obj_bx)
                             mem_feat = self.triplet_encoder(
                                 rel_query=hs_rel[b, r].unsqueeze(0),
-                                obj_query=hs_obj[b, r].unsqueeze(0),
                                 sub_box=sub_bx.unsqueeze(0),
                                 obj_box=obj_bx.unsqueeze(0),
                                 pred_prob=rel_prob[r, :-1].unsqueeze(0),
