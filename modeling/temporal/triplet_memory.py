@@ -357,10 +357,11 @@ class TemporalTripletInjector(nn.Module):
 # TripletMemoryManager
 # ──────────────────────────────────────────────
 
-class TripletMemoryManager:
+class TripletMemoryManager(nn.Module):
     """Manages per-video memory banks and the encoder/injector/delta_emb modules."""
 
     def __init__(self, cfg):
+        super().__init__()
         self.cfg = cfg
         tcfg = cfg.MODEL.TEMPORAL
         mem_dim = int(getattr(tcfg, "TRIPLET_MEMORY_DIM", 128))
