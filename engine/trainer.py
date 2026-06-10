@@ -1078,12 +1078,12 @@ class JointTransformerTrainer(DefaultTrainer):
             {
                 "params": missing,
                 "lr": lr,
-                "weight_decay": self.cfg.SOLVER.WEIGHT_DECAY,
+                "weight_decay": 0.0,
             }
         )
         self._late_patch_merge_params_added = True
         logging.getLogger("detectron2").info(
-            "Added %d lazily-created X-SAM patch-merge parameters to optimizer with lr=%s",
+            "Added %d lazily-created X-SAM patch-merge parameters to optimizer with lr=%s weight_decay=0.0",
             len(missing),
             lr,
         )

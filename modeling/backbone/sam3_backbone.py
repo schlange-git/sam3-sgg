@@ -50,6 +50,9 @@ class Sam3MaskedBackbone(nn.Module):
                 "expected one of: last, sum, concat"
             )
         self.use_patch_merge = getattr(cfg.MODEL.SAM3, "USE_PATCH_MERGE", False)
+        self.patch_merge_init_noise_std = float(
+            getattr(cfg.MODEL.SAM3, "PATCH_MERGE_INIT_NOISE_STD", 0.0)
+        )
         self._patch_merge_logged = False
         self._last_aux_features = {}  # cached intermediate features for ROI_REFINE
 
@@ -347,6 +350,20 @@ class Sam3MaskedBackbone(nn.Module):
                     for dx in range(factor):
                         src_c = c + (dy * factor + dx) * self.feature_dim
                         layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
+            if self.patch_merge_init_noise_std > 0.0:
+                avgpool_weight = layer.weight.detach().clone()
+                layer.weight.add_(
+                    torch.randn_like(layer.weight) * self.patch_merge_init_noise_std
+                )
+                deviation = (layer.weight - avgpool_weight).abs().max().item()
+                assert deviation > 0.0, (
+                    "PATCH_MERGE_INIT_NOISE_STD>0 but patch-merge init weight unchanged"
+                )
+                logging.getLogger("detectron2").info(
+                    "X-SAM patch-merge: injected init noise std=%.4g, max|delta|=%.4g vs avg-pool",
+                    self.patch_merge_init_noise_std,
+                    deviation,
+                )
         self._patch_merge_factor = int(factor)
         self._patch_merge_init_weight = layer.weight.detach().clone()
         layer.to(self.device)
