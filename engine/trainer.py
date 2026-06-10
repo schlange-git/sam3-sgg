@@ -1099,7 +1099,12 @@ class JointTransformerTrainer(DefaultTrainer):
             and cfg.MODEL.SAM3.FREEZE
             and int(getattr(cfg.MODEL.SAM3, "UNFREEZE_AFTER_ITER", -1)) >= 0
         )
+        patch_merge_params = []
         for key, value in model.named_parameters(recurse=True):
+            if "_patch_merge_proj" in key:
+                if value.requires_grad:
+                    patch_merge_params.append(value)
+                continue
             include_frozen_sam3 = sam3_delayed_unfreeze and ("sam3_model" in key)
             if (not value.requires_grad) and (not include_frozen_sam3):
                 continue
@@ -1127,6 +1132,15 @@ class JointTransformerTrainer(DefaultTrainer):
                     int(getattr(cfg.MODEL.SAM3, "UNFREEZE_AFTER_ITER", -1)),
                 )
             params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
+
+        if patch_merge_params:
+            patch_lr = cfg.SOLVER.BASE_LR * cfg.SOLVER.BACKBONE_MULTIPLIER * cfg.SOLVER.ENTITY_MULTIPLIER
+            params += [{"params": patch_merge_params, "lr": patch_lr, "weight_decay": 0.0}]
+            logger.info(
+                "Adding %d X-SAM patch-merge parameters to optimizer with lr=%s weight_decay=0.0",
+                len(patch_merge_params),
+                patch_lr,
+            )
 
         def maybe_add_full_model_gradient_clipping(optim):  # optim: the optimizer class
             # detectron2 doesn't have full model gradient clipping now
