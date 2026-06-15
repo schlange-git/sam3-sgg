@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 单卡版 multi-slot clip-sample stateful 过拟合验证。
 set -euo pipefail
-source /root/miniconda3/etc/profile.d/conda.sh
+source /opt/conda/etc/profile.d/conda.sh
 conda activate base
 
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
