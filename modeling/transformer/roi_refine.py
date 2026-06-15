@@ -22,6 +22,7 @@ class ROIRefineHead(nn.Module):
         detach_boxes: bool,
         use_gate: bool,
         apply_to: str,
+        fusion: str = "convex",
         class_names: list = None,
     ):
         super().__init__()
@@ -31,6 +32,9 @@ class ROIRefineHead(nn.Module):
         assert apply_to in ("small_only", "all"), (
             f"Unsupported MODEL.ROI_REFINE.APPLY_TO={apply_to}; expected small_only or all."
         )
+        assert fusion in ("convex", "residual"), (
+            f"Unsupported MODEL.ROI_REFINE.FUSION={fusion}; expected convex or residual."
+        )
         self.hidden_dim = int(hidden_dim)
         self.pool_size = int(pool_size)
         self.stride = int(stride)
@@ -38,6 +42,7 @@ class ROIRefineHead(nn.Module):
         self.small_area_thresh = float(small_area_thresh)
         self.detach_boxes = bool(detach_boxes)
         self.apply_to = str(apply_to)
+        self.fusion = str(fusion)
         self.class_names = class_names
         self.only_roi_cls = False
         self._last_gate_stats = None
@@ -180,8 +185,12 @@ class ROIRefineHead(nn.Module):
 
         refined_flat = flat_embeddings.clone()
         if self.gate is not None:
-            # Convex fusion: gate=0 keeps the query feature, gate=1 uses the ROI feature.
-            refined_flat[flat_indices] = (1.0 - gate_values) * selected_embeddings + gate_values * roi_emb
+            if self.fusion == "convex":
+                # Convex fusion: gate=0 keeps the query feature, gate=1 uses the ROI feature.
+                refined_flat[flat_indices] = (1.0 - gate_values) * selected_embeddings + gate_values * roi_emb
+            else:
+                # Residual fusion: query feature plus gated ROI feature (e + g*roi).
+                refined_flat[flat_indices] = selected_embeddings + gate_values * roi_emb
         elif self.only_roi_cls:
             # Replace embedding with roi projection entirely (no original embedding contribution).
             refined_flat[flat_indices] = residual

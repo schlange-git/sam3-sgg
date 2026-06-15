@@ -1,0 +1,152 @@
+# 全内容训练配置: patch_merge + ROI(残差融合) + stage4 时序(clip 模式), 从 X-SAM 预训练权重微调。
+# 起始权重: z_outputs/xsam_local_pretrain_bs16_iter160000/model_0159999.pth
+#   (已含 patch_merge 下采样卷积 + AG 36/26 头, 预训练时 PERSON_SCORE_SCALE=1.0 / USE_PATCH_MERGE=True / TARGET_STRIDE=32)
+# 规模: IMS_PER_BATCH=24 (world_size 2 -> 12/卡) · MAX_ITER=200000 (20w) · eval/ckpt 周期=5000。
+# 新模块(roi_refine / triplet_memory_v3)预训练权重中不存在, 由 strict=False 加载后保持随机初始化。
+MODEL:
+  META_ARCHITECTURE: "IterativeRelationDetr"
+  WEIGHTS: "z_outputs/xsam_local_pretrain_bs16_iter160000/model_0159999.pth"
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  MASK_ON: False
+  RESNETS:
+    DEPTH: 101
+    STRIDE_IN_1X1: False
+    OUT_FEATURES: ["res2", "res3", "res4", "res5"]
+  DETR:
+    NAME: "IterativeRelationDETR"
+    TRANSFORMER: "IterativeRelationTransformer"
+    CRITERION: "IterativeRelationCriterion"
+    MATCHER: "SpeaQHungarianMatcher"
+    NUM_OBJECT_QUERIES: 100
+    NUM_RELATION_QUERIES: 100
+    NUM_CLASSES: 36
+    NUM_RELATION_CLASSES: 26
+    OBJECT_DEC_LAYERS: 6
+    REWEIGHT_RELATIONS: True
+    REWEIGHT_REL_EOS_COEF: 0.1
+    NO_OBJECT_WEIGHT: 0.1
+    PERSON_CLASS_WEIGHT: 1.0
+    PERSON_CLASS_INDEX: 0
+    # 与 X-SAM 预训练一致 (memory: scale=300 会损害训练)
+    PERSON_SCORE_SCALE: 1.0
+    NO_REL_WEIGHT: 0.1
+    BOX_LOSS_TYPE: "eiou"
+    USE_CORNER_LOSS: True
+    CORNER_LOSS_WEIGHT: 0.5
+    # 权重加载: 完整加载 X-SAM 预训练 (含 class/relation 头, 类别数已对齐 36/26)
+    HEAD_WEIGHTS: "z_outputs/xsam_local_pretrain_bs16_iter160000/model_0159999.pth"
+    LOAD_HEAD_ONLY: False
+    LOAD_FULL_WEIGHTS: True
+    LOAD_CLASS_HEAD: True
+  OBJ_SPLIT:
+    ENABLED: False
+  SAM3:
+    ENABLED: True
+    CHECKPOINT_PATH: "sam3/weights/sam3.pt"
+    IMAGE_SIZE: 1008
+    FEATURE_DIM: 256
+    CHANNEL_REPEAT: 1
+    FREEZE: True
+    DEVICE: "cuda"
+    TARGET_STRIDE: 32
+    USE_FPN: False
+    USE_BACKBONE_FPN: False
+    FPN_STRIDES: [8, 16, 32]
+    MULTISCALE_MERGE: "sum"
+    # patch_merge: X-SAM pixel-unshuffle + 可学习 1x1 conv;
+    #   该下采样卷积始终 requires_grad=True, 不随 SAM3.FREEZE 冻结。
+    #   roi_refine 走原生 stride-14 缓存特征(下采样前), 与 patch_merge 共存。
+    USE_PATCH_MERGE: True
+  TEMPORAL:
+    ENABLED: True
+    EVAL_ENABLED: True
+    MODE: "triplet_memory_v3"
+    TRIPLET_MEMORY_ENABLED: True
+    INJECT_OBJECT: True
+    INJECT_RELATION: True
+    NON_KEY_SKIP_LOSS: True
+    NON_KEY_SKIP_EVAL: True
+    NON_KEY_RUN_OBJECT_ONLY: True
+    DETACH_MEMORY: True
+  ROI_REFINE:
+    ENABLED: True
+    LOSS_ENABLED: True
+    LOSS_WEIGHT: 1.0
+    RESNET_FPN_LEVEL: 0
+    STRIDE: 14
+    POOL_SIZE: 7
+    APPLY_TO: "all"
+    SMALL_AREA_THRESH: 0.02
+    DETACH_BOXES: True
+    USE_GATE: True
+    ONLY_ROI_CLS: False
+    # 残差融合: refined = e + g*roi (需 USE_GATE=True)
+    FUSION: "residual"
+    # eval 单次前向同出 override(roi) 与 raw(origin) 两套指标 (raw_ 前缀)
+    EVAL_DUAL: True
+
+DATASETS:
+  TYPE: "ACTION GENOME"
+  TRAIN: ("AG_train",)
+  TEST: ("AG_val",)
+  ACTION_GENOME:
+    ANNOTATIONS: "dataset/annotations"
+    FRAMES: "dataset/frames"
+    NUM_VIDEOS_TRAIN: -1
+    NUM_VIDEOS_VAL: 400
+    FILTER_EMPTY_RELATIONS: True
+    FILTER_DUPLICATE_RELATIONS: True
+    FILTER_NON_OVERLAP: False
+    FORMAT_VID_WISE: True
+    VAL_SET_RANDOMIZED: False
+    # stage4 时序: 同视频批采样 (clip 模式)
+    SAMPLER_MODE: "clip"
+  AG_TEMPORAL:
+    ENABLED: True
+    CLIP_MODE: "between_keyframes"
+    NUM_INTERMEDIATE_FRAMES: 0
+
+SOLVER:
+  IMS_PER_BATCH: 24
+  MAX_EPOCH: 0
+  BASE_LR: 0.0004
+  STEPS: (30000, 175000)
+  MAX_ITER: 200000
+  GAMMA: 0.1
+  NUM_DECAYS: 2
+  WARMUP_FACTOR: 0.001
+  WARMUP_ITERS: 2000
+  WEIGHT_DECAY: 0.0001
+  OPTIMIZER: "ADAMW"
+  BACKBONE_MULTIPLIER: 0.05
+  GATE_LR_MULTIPLIER: 5.0
+  CHECKPOINT_PERIOD: 5000
+  EVAL_FIRST: True
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.1
+    NORM_TYPE: 2.0
+  AMP:
+    ENABLED: True
+
+INPUT:
+  MIN_SIZE_TRAIN: (1008,)
+  MAX_SIZE_TRAIN: 1008
+  MIN_SIZE_TEST: 1008
+  MAX_SIZE_TEST: 1008
+  CROP:
+    ENABLED: False
+    TYPE: "absolute_range"
+    SIZE: (360, 640)
+  FORMAT: "RGB"
+
+TEST:
+  EVAL_PERIOD: 5000
+
+DATALOADER:
+  FILTER_EMPTY_ANNOTATIONS: False
+  NUM_WORKERS: 4
+
+VERSION: 2

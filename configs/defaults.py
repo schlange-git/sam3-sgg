@@ -183,6 +183,10 @@ def add_dataset_config(cfg):
   _C.MODEL.ROI_REFINE.APPLY_TO = "small_only"
   _C.MODEL.ROI_REFINE.ONLY_ROI_CLS = False
   _C.MODEL.ROI_REFINE.RESNET_FPN_LEVEL = 0  # 0=coarsest(stride32/p5), 1=finer(stride16/p4)
+  # convex: (1-g)*e + g*roi ; residual: e + g*roi (需 USE_GATE=true)
+  _C.MODEL.ROI_REFINE.FUSION = "convex"
+  # eval 时单次前向同出 override(roi) 与 raw(origin) 两套指标 (raw_ 前缀附加)
+  _C.MODEL.ROI_REFINE.EVAL_DUAL = False
 
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10

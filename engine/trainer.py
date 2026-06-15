@@ -1327,7 +1327,18 @@ class JointTransformerTrainer(DefaultTrainer):
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
             if cfg.MODEL.DETR.RELATION_HEAD and cfg.MODEL.META_ARCHITECTURE != 'DetrWithSGGBBox' and cfg.MODEL.META_ARCHITECTURE != 'Detr' and cfg.MODEL.META_ARCHITECTURE != 'QuerySplitObjectDetr' and cfg.MODEL.META_ARCHITECTURE != 'QuerySplitUnionBoxDetr' and cfg.MODEL.META_ARCHITECTURE != 'QuerySplitObjectDetrTest' and cfg.MODEL.META_ARCHITECTURE != 'RelationDetr' and cfg.MODEL.META_ARCHITECTURE != 'ConditionalDETR' and cfg.MODEL.META_ARCHITECTURE != 'QueryConditionalDETR' and cfg.MODEL.META_ARCHITECTURE != 'QueryConditionalDeformableDETR' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxConditionalDETR' and cfg.MODEL.META_ARCHITECTURE != 'LatentRelationDETRTest' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxDETR' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxDeformableDETR' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxDETRTest' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxConditionalDETRTest' and cfg.MODEL.META_ARCHITECTURE != 'LatentRelationCoordsDETRTest' and cfg.MODEL.META_ARCHITECTURE != 'LatentBoxCoordsDetr':
             #  and cfg.MODEL.META_ARCHITECTURE != 'LatentRelationCoordsNoAttentionDETR':
-                evaluator = SceneGraphEvaluator(dataset_name, cfg, True, output_folder)
+                if cfg.MODEL.ROI_REFINE.ENABLED and cfg.MODEL.ROI_REFINE.EVAL_DUAL:
+                    # 单次前向同出 override(roi) 与 raw(origin) 两套指标，分别落盘到子目录
+                    evaluator = {
+                        "override": SceneGraphEvaluator(
+                            dataset_name, cfg, True, os.path.join(output_folder, "override")
+                        ),
+                        "raw": SceneGraphEvaluator(
+                            dataset_name, cfg, True, os.path.join(output_folder, "raw")
+                        ),
+                    }
+                else:
+                    evaluator = SceneGraphEvaluator(dataset_name, cfg, True, output_folder)
             else:
                 evaluator = COCOEvaluator(dataset_name, cfg, True, output_folder)
             results_i = scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator)

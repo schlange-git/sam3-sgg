@@ -37,10 +37,19 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
     logger.info("Start inference on {} images".format(len(data_loader)))
 
     total = len(data_loader)  # inference data loader must have a fixed length
-    
+
     # evaluator = COCOEvaluator(dataset_name, cfg, True, output_folder)
-    
-    evaluator.reset(total*num_devices)
+
+    # ROI EVAL_DUAL: evaluator 可能是 {"override":..., "raw":...} 字典，单次前向同出两套指标
+    dual_eval = isinstance(evaluator, dict)
+    if dual_eval:
+        assert "override" in evaluator and "raw" in evaluator, (
+            "Dual evaluator dict must contain 'override' and 'raw' keys."
+        )
+        evaluator["override"].reset(total * num_devices)
+        evaluator["raw"].reset(total * num_devices)
+    else:
+        evaluator.reset(total*num_devices)
     num_warmup = min(5, total - 1)
     
     # 在评估开始前清理显存，释放训练阶段占用的内存
@@ -65,7 +74,15 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_compute_time += time.perf_counter() - start_compute_time
-            evaluator.process(inputs, outputs)
+            if dual_eval:
+                assert isinstance(outputs, dict) and outputs.get("__roi_dual__"), (
+                    "Dual evaluator expects model outputs dict with '__roi_dual__'; "
+                    "got non-dual outputs. Check MODEL.ROI_REFINE.EVAL_DUAL wiring."
+                )
+                evaluator["override"].process(inputs, outputs["override"])
+                evaluator["raw"].process(inputs, outputs["raw"])
+            else:
+                evaluator.process(inputs, outputs)
             
             # 定期清理显存，避免内存碎片化（每100个样本清理一次）
             if torch.cuda.is_available() and (idx + 1) % 100 == 0:
@@ -95,6 +112,20 @@ def scenegraph_inference_on_dataset(cfg, model, data_loader, evaluator):
             total_compute_time_str, total_compute_time / (total - num_warmup), num_devices
         )
     )
+
+    if dual_eval:
+        results_override = evaluator["override"].evaluate()
+        results_raw = evaluator["raw"].evaluate()
+        if results_override is None:
+            results_override = {}
+        if results_raw is None:
+            results_raw = {}
+        # override(roi) 指标保持原 key（向后兼容 EVAL_FIRST / best 追踪）；
+        # raw(origin) 指标加 raw_ 前缀附加，单次前向同时产出两套结果。
+        results = dict(results_override)
+        for k, v in results_raw.items():
+            results["raw_" + str(k)] = v
+        return results
 
     results = evaluator.evaluate()
     # An evaluator may return None when not in main process.

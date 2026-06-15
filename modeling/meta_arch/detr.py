@@ -533,42 +533,61 @@ class IterativeRelationDetr(Detr):
                 image_sizes = [(x['height'], x['width']) for x in batched_inputs]
             else:
                 image_sizes = images.image_sizes
-            results = self.inference(output, image_sizes)
-            processed_results = []
-            debug_rel = os.environ.get("SPEAQ_DEBUG_REL_OUT", "0") == "1"
-            debug_limit = int(os.environ.get("SPEAQ_DEBUG_REL_OUT_LIMIT", "20"))
-            debug_count = getattr(self, "_debug_rel_out_count", 0)
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, image_sizes):
-                height = input_per_image.get("height", image_size[0])
-                width = input_per_image.get("width", image_size[1])
-                r = detector_postprocess(results_per_image, height, width)
-                if debug_rel and debug_count < debug_limit:
-                    rel_pair = getattr(results_per_image, "_rel_pair_idxs", None)
-                    rel_scores = getattr(results_per_image, "_pred_rel_scores", None)
-                    rel_labels = getattr(results_per_image, "_pred_rel_labels", None)
-                    logging.getLogger("detectron2").info(
-                        "[SPEAQ_DEBUG_REL_OUT] image_id=%s pred_boxes=%d "
-                        "rel_pair=%s rel_scores_shape=%s rel_labels_shape=%s",
-                        input_per_image.get("image_id", "unknown"),
-                        int(r.pred_boxes.tensor.shape[0]) if hasattr(r, "pred_boxes") else -1,
-                        "None" if rel_pair is None else str(tuple(rel_pair.shape)),
-                        "None" if rel_scores is None else str(tuple(rel_scores.shape)),
-                        "None" if rel_labels is None else str(tuple(rel_labels.shape)),
-                    )
-                    debug_count += 1
-                processed_results.append({
-                    "instances": r,
-                    "rel_pair_idxs": results_per_image._rel_pair_idxs,
-                    "pred_rel_scores": results_per_image._pred_rel_scores,
-                    "pred_rel_labels": results_per_image._pred_rel_labels,
-                    "query_index": results_per_image._query_index,
-                    "obj_split_sub_head_source": getattr(results_per_image, "_obj_split_sub_head_source", None),
-                    "obj_split_obj_head_source": getattr(results_per_image, "_obj_split_obj_head_source", None),
-                })
-            self._debug_rel_out_count = debug_count
-            return processed_results
+            roi_dual = getattr(self.detr, "roi_refine_enabled", False) and getattr(self.detr, "roi_eval_dual", False)
+            if roi_dual:
+                assert "relation_subject_logits_roi" in output and "relation_object_logits_roi" in output, (
+                    "ROI_REFINE.EVAL_DUAL=True but roi logits missing from detr output."
+                )
+                proc_override = self._postprocess_results(
+                    self.inference(output, image_sizes, "relation_subject_logits_roi", "relation_object_logits_roi"),
+                    batched_inputs, image_sizes,
+                )
+                proc_raw = self._postprocess_results(
+                    self.inference(output, image_sizes),
+                    batched_inputs, image_sizes,
+                )
+                return {"__roi_dual__": True, "override": proc_override, "raw": proc_raw}
+            return self._postprocess_results(
+                self.inference(output, image_sizes), batched_inputs, image_sizes
+            )
 
-    def inference(self, output, image_sizes):
+    def _postprocess_results(self, results, batched_inputs, image_sizes):
+        processed_results = []
+        debug_rel = os.environ.get("SPEAQ_DEBUG_REL_OUT", "0") == "1"
+        debug_limit = int(os.environ.get("SPEAQ_DEBUG_REL_OUT_LIMIT", "20"))
+        debug_count = getattr(self, "_debug_rel_out_count", 0)
+        for results_per_image, input_per_image, image_size in zip(results, batched_inputs, image_sizes):
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+            r = detector_postprocess(results_per_image, height, width)
+            if debug_rel and debug_count < debug_limit:
+                rel_pair = getattr(results_per_image, "_rel_pair_idxs", None)
+                rel_scores = getattr(results_per_image, "_pred_rel_scores", None)
+                rel_labels = getattr(results_per_image, "_pred_rel_labels", None)
+                logging.getLogger("detectron2").info(
+                    "[SPEAQ_DEBUG_REL_OUT] image_id=%s pred_boxes=%d "
+                    "rel_pair=%s rel_scores_shape=%s rel_labels_shape=%s",
+                    input_per_image.get("image_id", "unknown"),
+                    int(r.pred_boxes.tensor.shape[0]) if hasattr(r, "pred_boxes") else -1,
+                    "None" if rel_pair is None else str(tuple(rel_pair.shape)),
+                    "None" if rel_scores is None else str(tuple(rel_scores.shape)),
+                    "None" if rel_labels is None else str(tuple(rel_labels.shape)),
+                )
+                debug_count += 1
+            processed_results.append({
+                "instances": r,
+                "rel_pair_idxs": results_per_image._rel_pair_idxs,
+                "pred_rel_scores": results_per_image._pred_rel_scores,
+                "pred_rel_labels": results_per_image._pred_rel_labels,
+                "query_index": results_per_image._query_index,
+                "obj_split_sub_head_source": getattr(results_per_image, "_obj_split_sub_head_source", None),
+                "obj_split_obj_head_source": getattr(results_per_image, "_obj_split_obj_head_source", None),
+            })
+        self._debug_rel_out_count = debug_count
+        return processed_results
+
+
+    def inference(self, output, image_sizes, sub_key="relation_subject_logits", obj_key="relation_object_logits"):
         """
         Arguments:
             box_cls (Tensor): tensor of shape (batch_size, num_queries, K).
@@ -586,8 +605,8 @@ class IterativeRelationDetr(Detr):
             logits_r = F.softmax(output['relation_logits'], -1)
 
             # For each box we assign the best class or the second best if the best on is `no_object`.
-            scores_s, labels_s = F.softmax(output['relation_subject_logits'], -1)[:, :, :-1].max(-1)
-            scores_o, labels_o = F.softmax(output['relation_object_logits'], -1)[:, :, :-1].max(-1)
+            scores_s, labels_s = F.softmax(output[sub_key], -1)[:, :, :-1].max(-1)
+            scores_o, labels_o = F.softmax(output[obj_key], -1)[:, :, :-1].max(-1)
             B, _ = scores_s.size()
             
             scores_s, labels_s, scores_o, labels_o = map(lambda u: u.unsqueeze(-1).repeat(1,1,M).reshape(B, -1), (scores_s, labels_s, scores_o, labels_o))

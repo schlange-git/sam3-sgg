@@ -257,6 +257,7 @@ class IterativeRelationDETR(DETR):
         self.person_class_index = int(getattr(cfg.MODEL.DETR, "PERSON_CLASS_INDEX", 0))
         roi_refine_cfg = cfg.MODEL.ROI_REFINE
         self.roi_refine_enabled = bool(roi_refine_cfg.ENABLED)
+        self.roi_eval_dual = bool(getattr(roi_refine_cfg, "EVAL_DUAL", False))
         self.roi_refine_stride = int(roi_refine_cfg.STRIDE)
         self.resnet_fpn_level = int(getattr(roi_refine_cfg, "RESNET_FPN_LEVEL", 0))
         self.roi_refine_loss_enabled = bool(roi_refine_cfg.LOSS_ENABLED)
@@ -272,6 +273,7 @@ class IterativeRelationDETR(DETR):
                 detach_boxes=bool(roi_refine_cfg.DETACH_BOXES),
                 use_gate=bool(roi_refine_cfg.USE_GATE),
                 apply_to=str(roi_refine_cfg.APPLY_TO),
+                fusion=str(roi_refine_cfg.FUSION),
                 class_names=MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes,
             )
             self.roi_refine_head.only_roi_cls = bool(roi_refine_cfg.ONLY_ROI_CLS)
@@ -598,7 +600,8 @@ class IterativeRelationDETR(DETR):
             out['roi_subject_mask'] = output['roi_subject_mask']
             out['roi_object_mask'] = output['roi_object_mask']
             # [ROI_EVAL_RAW gate] 置 ROI_EVAL_RAW=1 时跳过替换 -> eval 用原始(pre-refine) logits, 仅用于对照评测
-            if not self.training and os.environ.get("ROI_EVAL_RAW", "0") != "1":
+            # [EVAL_DUAL gate] EVAL_DUAL=True 时不在此处覆盖, 由 meta_arch 单次前向同出 override/raw 两套结果
+            if not self.training and not self.roi_eval_dual and os.environ.get("ROI_EVAL_RAW", "0") != "1":
                 out['relation_subject_logits'] = out['relation_subject_logits_roi']
                 out['relation_object_logits'] = out['relation_object_logits_roi']
         if 'obj_split_subject_head_source_idx' in output:
