@@ -597,7 +597,8 @@ class IterativeRelationDETR(DETR):
             out['relation_object_logits_roi'] = output['relation_object_logits_roi']
             out['roi_subject_mask'] = output['roi_subject_mask']
             out['roi_object_mask'] = output['roi_object_mask']
-            if not self.training:
+            # [ROI_EVAL_RAW gate] 置 ROI_EVAL_RAW=1 时跳过替换 -> eval 用原始(pre-refine) logits, 仅用于对照评测
+            if not self.training and os.environ.get("ROI_EVAL_RAW", "0") != "1":
                 out['relation_subject_logits'] = out['relation_subject_logits_roi']
                 out['relation_object_logits'] = out['relation_object_logits_roi']
         if 'obj_split_subject_head_source_idx' in output:

@@ -17,6 +17,7 @@ echo "[Full v3+ROI v4] OUTPUT=${OUTPUT_DIR} GPU=${NUM_GPUS}"
 
 python3 train_iterative_model.py \
     --num-gpus "${NUM_GPUS}" \
+    --resume \
     --config-file configs/speaq_actiongenome_minimal.yaml \
     --dist-url tcp://127.0.0.1:29701 \
     OUTPUT_DIR "${OUTPUT_DIR}" \

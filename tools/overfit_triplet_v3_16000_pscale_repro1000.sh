@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
-# Full task v3-only (no v2, no ROI), 4 GPU DDP, 80000 iter, eval 5000.
-# v4 alignment: PERSON_SCORE_SCALE=300 (consistent person scoring so triplet
-#   memory bank fills and the injector receives gradient).
-# LR: 3-segment WarmupMultiStepLR, BASE_LR unchanged, GAMMA=0.1 -> final ~4e-6.
-#   seg1 0-12000: 4e-4 | seg2 12000-70000: 4e-5 | seg3 70000-80000: 4e-6 (near-keep tail).
+# Overfit triplet memory v3 + consistent person scoring.
+# Same as overfit_triplet_v3_16000.sh but enables PERSON_SCORE_SCALE=300 so the
+# person prior feeds BOTH eval output and the triplet-memory update (single source
+# of truth). Without it the relation-subject head under-scores person natively,
+# triplet quality collapses to ~0, the memory bank stays empty, and the injector
+# receives zero gradient. Base config is left untouched (fulltask relies on scale=1.0).
 set -euo pipefail
+source /opt/conda/etc/profile.d/conda.sh
+conda activate base
 PROJ=/home/cfs/shizekun1_v/sam3-sgg-Auxiliary-Matching
 cd "$PROJ"
-OUTPUT_DIR="${1:-z_outputs/fulltask_v3_only_v4_bs48_iter80000}"
-NUM_GPUS="${2:-4}"
+OUTPUT_DIR="${1:-z_outputs/overfit_triplet_v3_16000_pscale_repro1000}"
 mkdir -p "${OUTPUT_DIR}"
 export ROI_GATE_LOG_PATH="${OUTPUT_DIR}/roi_gate_log.csv"
-echo "[Full v3-Only v4] OUTPUT=${OUTPUT_DIR} GPU=${NUM_GPUS}"
+echo "[Triplet v3 16K pscale] OUTPUT=${OUTPUT_DIR}"
 
 python3 train_iterative_model.py \
-    --num-gpus "${NUM_GPUS}" \
-    --resume \
+    --num-gpus 1 \
     --config-file configs/speaq_actiongenome_minimal.yaml \
-    --dist-url tcp://127.0.0.1:29700 \
+    --dist-url tcp://127.0.0.1:29833 \
     OUTPUT_DIR "${OUTPUT_DIR}" \
-    DATASETS.ACTION_GENOME.ANNOTATIONS dataset/annotations \
+    DATASETS.TRAIN "('AG_train',)" \
+    DATASETS.TEST "('AG_train',)" \
+    DATASETS.ACTION_GENOME.ANNOTATIONS dataset_overfit_temporal/annotations \
     DATASETS.ACTION_GENOME.FRAMES dataset/frames \
     DATASETS.ACTION_GENOME.NUM_VIDEOS_TRAIN -1 \
+    DATASETS.ACTION_GENOME.NUM_VIDEOS_VAL 0 \
+    DATASETS.AG_TEMPORAL.ENABLED True \
+    DATASETS.AG_TEMPORAL.CLIP_MODE between_keyframes \
+    DATASETS.AG_TEMPORAL.NUM_INTERMEDIATE_FRAMES 0 \
     MODEL.WEIGHTS model_0099999.pth \
     MODEL.DETR.HEAD_WEIGHTS model_0099999.pth \
     MODEL.DETR.LOAD_HEAD_ONLY False \
@@ -43,17 +50,15 @@ python3 train_iterative_model.py \
     MODEL.TEMPORAL.NON_KEY_RUN_OBJECT_ONLY True \
     MODEL.ROI_REFINE.ENABLED False \
     MODEL.ROI_REFINE.LOSS_ENABLED False \
-    SOLVER.IMS_PER_BATCH 48 \
-    SOLVER.BASE_LR 0.0004 \
-    SOLVER.MAX_ITER 80000 \
-    SOLVER.GAMMA 0.1 \
-    SOLVER.NUM_DECAYS 2 \
-    SOLVER.STEPS '(12000,70000)' \
-    SOLVER.WARMUP_ITERS 2000 \
-    SOLVER.CHECKPOINT_PERIOD 5000 \
-    TEST.EVAL_PERIOD 5000 \
+    SOLVER.IMS_PER_BATCH 8 \
+    SOLVER.BASE_LR 0.0001 \
+    SOLVER.MAX_ITER 16000 \
+    SOLVER.STEPS '(4000,12000)' \
+    SOLVER.WARMUP_ITERS 500 \
+    SOLVER.CHECKPOINT_PERIOD 2000 \
+    TEST.EVAL_PERIOD 2000 \
     SOLVER.EVAL_FIRST True \
     DATALOADER.NUM_WORKERS 4
 
 RET=$?
-echo "[Full v3-Only v4] Done exit=${RET}"
+echo "[Triplet v3 16K pscale] Done exit=${RET}"
