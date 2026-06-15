@@ -467,6 +467,120 @@ class SameVideoBatchSampler(Sampler):
 
 
 
+class ClipSampleBatchSampler(Sampler):
+    """
+    clip-as-sample 采样器（时序范式 · 折中于 clip 与 lane 之间）。
+
+    一个 batch 由 num_slots 个 slot 拼成，每个 slot 取某视频【连续 clip_len 个关键帧】(升序)：
+      - batch_size 必须能被 clip_len 整除，num_slots = batch_size / clip_len；
+      - 每个视频【连续占据】一个 slot 直到走完，再换一个未占用视频
+        （memory 端靠 frame_idx 回退自动 reset），故其 memory 桶在权重漂移小的
+        紧凑窗口内累积——刻意贴近健康的 clip 模式、远离 lane 的逐帧时效漂移；
+      - 不 padding：每趟用随机相位选满 floor(n/clip_len) 个整块、丢弃边角 n%clip_len 帧，
+        相位逐趟随机故所有帧多趟下均被覆盖；clip 内 frame_idx 严格升序，绝不触发误 reset。
+
+    产出扁平单帧索引流，由 build_batch_data_loader 每 batch_size 个聚成一个 batch；
+    必须在模块级定义以支持 pickle / 多进程加载。per-rank 视频分片 videos[rank::world_size]。
+    """
+    def __init__(self, records, batch_size, base_seed, clip_len):
+        self.batch_size = max(1, int(batch_size))
+        self.clip_len = max(1, int(clip_len))
+        assert self.batch_size % self.clip_len == 0, (
+            f"ClipSampleBatchSampler: batch_size={self.batch_size} "
+            f"必须能被 clip_len={self.clip_len} 整除。"
+        )
+        self.num_slots = self.batch_size // self.clip_len
+        self.base_seed = int(base_seed)
+        self.rank = comm.get_rank()
+        self.world_size = comm.get_world_size()
+        grouped = defaultdict(list)
+        for idx, rec in enumerate(records):
+            grouped[str(rec.get("video_id", "__novid__"))].append(
+                (int(rec.get("frame_idx", 0)), idx)
+            )
+        videos = sorted(grouped.keys())
+        # 每个视频内严格按 frame_idx 升序，保证逐帧时序与 memory delta-t 正确
+        self.video_to_indices = {
+            k: [idx for _, idx in sorted(grouped[k])] for k in videos
+        }
+        shard = videos[self.rank :: self.world_size] if self.world_size > 1 else videos
+        if len(shard) == 0:
+            shard = videos
+        self.videos = shard
+        assert self.num_slots <= len(self.videos), (
+            f"ClipSampleBatchSampler: slot 数(batch_size/clip_len)={self.num_slots} "
+            f"必须 <= 本 rank 视频数={len(self.videos)}，否则无法保证 batch 内视频互不相同。"
+        )
+        for v in self.videos:
+            assert len(self.video_to_indices[v]) >= self.clip_len, (
+                f"ClipSampleBatchSampler: 视频 {v} 帧数={len(self.video_to_indices[v])} "
+                f"< clip_len={self.clip_len}，无法构成一个 clip。"
+            )
+
+    def _buildChunks(self, vid, g):
+        # 随机相位选满 floor(n/clip_len) 个整块，丢弃边角 n%clip_len 帧；块内升序、绝不复制末帧。
+        frames = self.video_to_indices[vid]
+        n = len(frames)
+        K = self.clip_len
+        num_chunks = n // K
+        rem = n - num_chunks * K
+        phase = int(torch.randint(0, rem + 1, (1,), generator=g).item()) if rem > 0 else 0
+        return [frames[phase + c * K : phase + (c + 1) * K] for c in range(num_chunks)]
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.base_seed + self.rank)
+        G = self.num_slots
+
+        def makeQueue():
+            order = torch.randperm(len(self.videos), generator=g).tolist()
+            return [self.videos[i] for i in order]
+
+        queue = makeQueue()
+
+        def drawVideo(held):
+            # 取一个当前未被任何 slot 占用的视频；耗尽则重洗，形成无限流。
+            nonlocal queue
+            scanned = 0
+            while True:
+                if not queue:
+                    queue = makeQueue()
+                vid = queue.pop(0)
+                if vid not in held:
+                    return vid
+                scanned += 1
+                assert scanned <= 2 * len(self.videos) + 2, "drawVideo 找不到空闲视频(不应发生)"
+
+        held = set()
+        slotVid = []
+        slotChunks = []
+        slotCursor = []
+        for _ in range(G):
+            vid = drawVideo(held)
+            held.add(vid)
+            slotVid.append(vid)
+            slotChunks.append(self._buildChunks(vid, g))
+            slotCursor.append(0)
+
+        while True:
+            for si in range(G):
+                if slotCursor[si] >= len(slotChunks[si]):
+                    # 该视频所有 clip 走完，换一个未占用视频从头开始（memory 靠 frame_idx 回跳 reset）
+                    held.discard(slotVid[si])
+                    newVid = drawVideo(held)
+                    held.add(newVid)
+                    slotVid[si] = newVid
+                    slotChunks[si] = self._buildChunks(newVid, g)
+                    slotCursor[si] = 0
+                chunk = slotChunks[si][slotCursor[si]]
+                slotCursor[si] += 1
+                for x in chunk:
+                    yield x
+
+    def __len__(self):
+        return sum(len(v) for v in self.video_to_indices.values())
+
+
 class EvalFirstHook(HookBase):
     """训练前自动 eval，验证初始权重质量。由 SOLVER.EVAL_FIRST 控制。
     注意：eval 需要所有进程参与（COCO evaluator 内部用 comm.gather），
@@ -578,6 +692,10 @@ class JointTransformerTrainer(DefaultTrainer):
     def _build_same_video_sampler(dataset_dicts, per_worker_batch_size, seed=42):
         return SameVideoBatchSampler(dataset_dicts, per_worker_batch_size, seed)
 
+    @staticmethod
+    def _build_clip_sample_sampler(dataset_dicts, per_worker_batch_size, seed=42, clip_len=4):
+        return ClipSampleBatchSampler(dataset_dicts, per_worker_batch_size, seed, clip_len)
+
     @classmethod
     def build_train_loader(cls, cfg):
         if cfg.DATASETS.TYPE == "ACTION GENOME" and cfg.DATASETS.ACTION_GENOME.FORMAT_VID_WISE:
@@ -596,11 +714,23 @@ class JointTransformerTrainer(DefaultTrainer):
                 cfg.SOLVER.IMS_PER_BATCH % world_size == 0
             ), "SOLVER.IMS_PER_BATCH must be divisible by world size."
             per_worker_batch = cfg.SOLVER.IMS_PER_BATCH // world_size
-            sampler = cls._build_same_video_sampler(
-                dataset_dicts,
-                per_worker_batch_size=per_worker_batch,
-                seed=cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED,
+            sampler_mode = cfg.DATASETS.ACTION_GENOME.SAMPLER_MODE
+            assert sampler_mode in ("clip", "clip_sample"), (
+                f"未知 SAMPLER_MODE={sampler_mode}，仅支持 'clip' / 'clip_sample'。"
             )
+            if sampler_mode == "clip_sample":
+                sampler = cls._build_clip_sample_sampler(
+                    dataset_dicts,
+                    per_worker_batch_size=per_worker_batch,
+                    seed=cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED,
+                    clip_len=cfg.DATASETS.ACTION_GENOME.CLIP_SAMPLE_LEN,
+                )
+            else:
+                sampler = cls._build_same_video_sampler(
+                    dataset_dicts,
+                    per_worker_batch_size=per_worker_batch,
+                    seed=cfg.DATASETS.VISUAL_GENOME.OVERFIT_SEED,
+                )
             return build_batch_data_loader(
                 dataset,
                 sampler,
