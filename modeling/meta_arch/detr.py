@@ -157,8 +157,10 @@ class Detr(nn.Module):
             weight_dict["loss_small_aux"] = float(cfg.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_SMALL)
             weight_dict["loss_fine_aux"] = float(cfg.MODEL.OBJ_SPLIT.AUX_LOSS_WEIGHT_FINE)
         if cfg.MODEL.ROI_REFINE.ENABLED and cfg.MODEL.ROI_REFINE.LOSS_ENABLED:
-            weight_dict["loss_roi_subject_cls"] = float(cfg.MODEL.ROI_REFINE.LOSS_WEIGHT)
-            weight_dict["loss_roi_object_cls"] = float(cfg.MODEL.ROI_REFINE.LOSS_WEIGHT)
+            # REPLACE_BEFORE_MATCHER 开启时 roi 分类作为主分类参与全程, roi loss 权重 x5
+            _roi_loss_scale = 5.0 if cfg.MODEL.ROI_REFINE.REPLACE_BEFORE_MATCHER else 1.0
+            weight_dict["loss_roi_subject_cls"] = float(cfg.MODEL.ROI_REFINE.LOSS_WEIGHT) * _roi_loss_scale
+            weight_dict["loss_roi_object_cls"] = float(cfg.MODEL.ROI_REFINE.LOSS_WEIGHT) * _roi_loss_scale
         corner_weight = cfg.MODEL.DETR.CORNER_LOSS_WEIGHT if cfg.MODEL.DETR.USE_CORNER_LOSS else 0.0
         if corner_weight > 0:
             weight_dict["loss_corner"] = corner_weight

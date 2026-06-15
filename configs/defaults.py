@@ -187,6 +187,10 @@ def add_dataset_config(cfg):
   _C.MODEL.ROI_REFINE.FUSION = "convex"
   # eval 时单次前向同出 override(roi) 与 raw(origin) 两套指标 (raw_ 前缀附加)
   _C.MODEL.ROI_REFINE.EVAL_DUAL = False
+  # 开启后: roi cls 在 matcher 之前无条件 (train+eval) 覆盖 main logits,
+  #   使 matcher / 主 relation cls loss / eval 全程使用 roi 分类结果; 同时 roi loss 权重 x5。
+  #   与 EVAL_DUAL 互斥 (替换后 eval 仅一套结果), 需 ENABLED=LOSS_ENABLED=True。
+  _C.MODEL.ROI_REFINE.REPLACE_BEFORE_MATCHER = False
 
   _C.MODEL.DETR.HIDDEN_DIM = 256
   _C.MODEL.DETR.NUM_OBJECT_QUERIES = 10

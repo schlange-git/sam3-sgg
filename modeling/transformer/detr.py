@@ -261,6 +261,11 @@ class IterativeRelationDETR(DETR):
         self.roi_refine_stride = int(roi_refine_cfg.STRIDE)
         self.resnet_fpn_level = int(getattr(roi_refine_cfg, "RESNET_FPN_LEVEL", 0))
         self.roi_refine_loss_enabled = bool(roi_refine_cfg.LOSS_ENABLED)
+        self.roi_replace_main = bool(getattr(roi_refine_cfg, "REPLACE_BEFORE_MATCHER", False))
+        if self.roi_replace_main:
+            assert self.roi_refine_enabled, "REPLACE_BEFORE_MATCHER 需要 ROI_REFINE.ENABLED=True。"
+            assert self.roi_refine_loss_enabled, "REPLACE_BEFORE_MATCHER 需要 ROI_REFINE.LOSS_ENABLED=True (x5 roi loss 才能生效)。"
+            assert not self.roi_eval_dual, "REPLACE_BEFORE_MATCHER 与 EVAL_DUAL 互斥: 替换后 main==roi, eval 仅一套结果。"
         self.roi_refine_head = None
         self.sam3_image_size = int(getattr(cfg.MODEL.SAM3, "IMAGE_SIZE", 1008))
         if self.roi_refine_enabled:
@@ -364,7 +369,10 @@ class IterativeRelationDETR(DETR):
         mem, mem_mask = self.triplet_memory_manager.get_batch_memory(
             video_ids=video_ids, frame_idxs=frame_idxs, device=device)
         self.triplet_iter_counter += 1
+        _tdbg = os.environ.get("TRIPLET_DEBUG") == "1" and (self.triplet_iter_counter <= 30 or self.triplet_iter_counter % 200 == 0)
         if mem is None:
+            if _tdbg:
+                print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem=None -> NO injection", flush=True)
             return output
 
         gate_obj = get_temporal_gate(
@@ -373,6 +381,9 @@ class IterativeRelationDETR(DETR):
         gate_rel = get_temporal_gate(
             self.triplet_iter_counter, self._triplet_max_iter,
             self._triplet_gate_max_rel, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
+        if _tdbg:
+            print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
+                  f"gate_obj={gate_obj:.4f} gate_rel={gate_rel:.4f}", flush=True)
         mask_exp = mem_mask if (mem_mask is not None and mem_mask.dim() == 2) else None
 
         if self.triplet_injector_obj is not None and output.get("hs_object_last") is not None:
@@ -599,6 +610,11 @@ class IterativeRelationDETR(DETR):
             out['relation_object_logits_roi'] = output['relation_object_logits_roi']
             out['roi_subject_mask'] = output['roi_subject_mask']
             out['roi_object_mask'] = output['roi_object_mask']
+            # [REPLACE_BEFORE_MATCHER] 无条件 (train+eval) 用 roi cls 覆盖 main logits ->
+            #   matcher / 主 relation cls loss / eval 全程使用 roi 分类结果。
+            if self.roi_replace_main:
+                out['relation_subject_logits'] = out['relation_subject_logits_roi']
+                out['relation_object_logits'] = out['relation_object_logits_roi']
             # [ROI_EVAL_RAW gate] 置 ROI_EVAL_RAW=1 时跳过替换 -> eval 用原始(pre-refine) logits, 仅用于对照评测
             # [EVAL_DUAL gate] EVAL_DUAL=True 时不在此处覆盖, 由 meta_arch 单次前向同出 override/raw 两套结果
             if not self.training and not self.roi_eval_dual and os.environ.get("ROI_EVAL_RAW", "0") != "1":
@@ -750,6 +766,15 @@ class IterativeRelationDETR(DETR):
                                 "obj_score": float(obj_score[r]),
                                 "pred_score": float(pred_score[r]),
                             })
+                        if os.environ.get("TRIPLET_DEBUG") == "1" and (self.triplet_iter_counter <= 30 or self.triplet_iter_counter % 200 == 0):
+                            _qpass = int((quality[topk_idx] >= thresh).sum().item()) if topk_idx.numel() > 0 else 0
+                            print(f"[TRIPLET_DBG] upd iter={self.triplet_iter_counter} b={b} "
+                                  f"nq={int(quality.numel())} "
+                                  f"sub[max={float(sub_score.max()):.3f},mean={float(sub_score.mean()):.3f}] "
+                                  f"obj[max={float(obj_score.max()):.3f},mean={float(obj_score.mean()):.3f}] "
+                                  f"pred[max={float(pred_score.max()):.3f},mean={float(pred_score.mean()):.3f}] "
+                                  f"qual_max={float(quality.max()):.4f} thresh={thresh} "
+                                  f"npass={_qpass} ncand={len(cands)}", flush=True)
                         batch_candidates.append(cands)
 
                     self.triplet_memory_manager.update_batch(
@@ -757,6 +782,11 @@ class IterativeRelationDETR(DETR):
                         frame_idxs=frame_idxs,
                         batch_candidates=batch_candidates,
                     )
+                    if os.environ.get("TRIPLET_DEBUG") == "1" and (self.triplet_iter_counter <= 30 or self.triplet_iter_counter % 200 == 0):
+                        for _vid in dict.fromkeys(video_ids):
+                            _bk = self.triplet_memory_manager.banks.get(_vid)
+                            _occ = len(_bk.get_valid_slots()) if _bk is not None else 0
+                            print(f"[TRIPLET_DBG] bank vid={_vid} occ={_occ}", flush=True)
 
         return out
 
