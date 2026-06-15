@@ -469,17 +469,17 @@ class SameVideoBatchSampler(Sampler):
 
 class ClipSampleBatchSampler(Sampler):
     """
-    clip-as-sample 采样器（时序范式 · 折中于 clip 与 lane 之间）。
+    multi-slot stateful clip-sample 采样器。
 
-    一个 batch 由 num_slots 个 slot 拼成，每个 slot 取某视频【连续 clip_len 个关键帧】(升序)：
-      - batch_size 必须能被 clip_len 整除，num_slots = batch_size / clip_len；
-      - 每个视频【连续占据】一个 slot 直到走完，再换一个未占用视频
-        （memory 端靠 frame_idx 回退自动 reset），故其 memory 桶在权重漂移小的
-        紧凑窗口内累积——刻意贴近健康的 clip 模式、远离 lane 的逐帧时效漂移；
-      - 不 padding：每趟用随机相位选满 floor(n/clip_len) 个整块、丢弃边角 n%clip_len 帧，
-        相位逐趟随机故所有帧多趟下均被覆盖；clip 内 frame_idx 严格升序，绝不触发误 reset。
+    一个 batch 由 num_slots 个 video slot 拼成，每个 slot 在当前 step 输出某视频连续
+    clip_len 个关键帧；同一 slot 在后续 step 继续推进该视频的后续 chunk，直到该视频
+    的完整 chunks 用完才切换到新视频。因此 batch 内是 clip 形态，跨 step 是按 slot
+    持续推进的 streaming 形态；若 temporal memory 按 video_id 持久保存，memory 会跨
+    batch/step 传递，而不是限制在单个 clip_len 窗口内。
 
-    产出扁平单帧索引流，由 build_batch_data_loader 每 batch_size 个聚成一个 batch；
+    不 padding：每趟用随机相位选满 floor(n/clip_len) 个整块，丢弃边角 n%clip_len 帧；
+    随机相位只能提高多趟采样下边角帧被覆盖的概率，不保证单趟或有限 iter 严格覆盖。
+    产出扁平单帧索引流，由 build_batch_data_loader 每 batch_size 个聚成一个 batch。
     必须在模块级定义以支持 pickle / 多进程加载。per-rank 视频分片 videos[rank::world_size]。
     """
     def __init__(self, records, batch_size, base_seed, clip_len):
@@ -518,7 +518,7 @@ class ClipSampleBatchSampler(Sampler):
             )
 
     def _buildChunks(self, vid, g):
-        # 随机相位选满 floor(n/clip_len) 个整块，丢弃边角 n%clip_len 帧；块内升序、绝不复制末帧。
+        # 随机相位选满 floor(n/clip_len) 个整块；提高多趟覆盖概率，但不保证有限 iter 严格覆盖。
         frames = self.video_to_indices[vid]
         n = len(frames)
         K = self.clip_len

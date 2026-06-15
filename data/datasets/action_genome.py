@@ -351,6 +351,9 @@ class ActionGenomeTrainData:
             }
             dataset_dicts.append(record)
             image_id += 1
+        dataset_dicts.sort(key=lambda rec: (str(rec["video_id"]), int(rec["frame_idx"])))
+        for new_image_id, record in enumerate(dataset_dicts):
+            record["image_id"] = new_image_id
         if skipped_broken > 0:
             self.logger.info(
                 "[ActionGenome:%s] skipped %d frames from broken image list",
