@@ -496,17 +496,9 @@ class IterativeRelationDETR(DETR):
 
         output = self._apply_triplet_memory_to_output(output, samples, src.device)
 
-        # Score-time prior for person class on relation entity logits:
-        # logit_person <- logit_person + log(PERSON_SCORE_SCALE)
-        if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8:
-            log_scale = math.log(self.person_score_scale)
-            for key in ("relation_subject_logits", "relation_object_logits"):
-                logits = output.get(key)
-                if logits is None:
-                    continue
-                if logits.shape[-1] <= self.person_class_index:
-                    continue
-                logits[..., self.person_class_index] = logits[..., self.person_class_index] + log_scale
+        # PERSON_SCORE_SCALE no longer scales output logits here: it must not enter the
+        # criterion or eval predictions. The person prior is applied only to the triplet
+        # quality gate's subject score (see triplet update below).
 
         if self.roi_refine_enabled:
             assert self.roi_refine_head is not None, "ROI_REFINE enabled but roi_refine_head was not built."
@@ -572,12 +564,6 @@ class IterativeRelationDETR(DETR):
             }
             sub_roi_logits = self._classify_object_embeddings(sub_refined)
             obj_roi_logits = self._classify_object_embeddings(obj_refined)
-            if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8:
-                log_scale = math.log(self.person_score_scale)
-                if sub_roi_logits.shape[-1] > self.person_class_index:
-                    sub_roi_logits[..., self.person_class_index] = sub_roi_logits[..., self.person_class_index] + log_scale
-                if obj_roi_logits.shape[-1] > self.person_class_index:
-                    obj_roi_logits[..., self.person_class_index] = obj_roi_logits[..., self.person_class_index] + log_scale
             output["relation_subject_logits_roi"] = sub_roi_logits
             output["relation_object_logits_roi"] = obj_roi_logits
             output["roi_subject_mask"] = sub_mask
@@ -728,7 +714,16 @@ class IterativeRelationDETR(DETR):
 
                     batch_candidates = []
                     for b in range(bs):
-                        sub_prob = F.softmax(rel_sub_logits[b], dim=-1)
+                        sub_logits_b = rel_sub_logits[b]
+                        # person prior for the quality gate ONLY (subject is always person).
+                        # clone so out["relation_subject_logits"] (criterion path) is never mutated.
+                        if self.person_score_scale > 0 and abs(self.person_score_scale - 1.0) > 1e-8 \
+                                and sub_logits_b.shape[-1] > self.person_class_index:
+                            sub_logits_b = sub_logits_b.clone()
+                            sub_logits_b[..., self.person_class_index] = (
+                                sub_logits_b[..., self.person_class_index] + math.log(self.person_score_scale)
+                            )
+                        sub_prob = F.softmax(sub_logits_b, dim=-1)
                         obj_prob = F.softmax(rel_obj_logits[b], dim=-1)
                         rel_prob = F.softmax(rel_logits[b], dim=-1)
                         sub_score, sub_label = sub_prob[..., :-1].max(-1)

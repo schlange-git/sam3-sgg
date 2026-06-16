@@ -293,14 +293,27 @@ class Detr(nn.Module):
         state_dict = ckpt.get("model", ckpt)
         del ckpt
         model_dict = self.state_dict()
+        ckpt_patch_merge_keys = [k for k in state_dict if "_patch_merge_proj" in k]
         filtered = {}
         for k, v in state_dict.items():
             if k in model_dict and model_dict[k].shape == v.shape:
                 filtered[k] = v
         del state_dict
+        # Fix A: a pretrained patch-merge conv MUST actually be loaded. If the checkpoint
+        # carries it but it was filtered out, the lazy layer was not pre-built before load
+        # and the weights would be silently replaced by avg-pool init on first forward.
+        for k in ckpt_patch_merge_keys:
+            assert k in filtered, (
+                f"[Fix A] pretrained '{k}' is in the checkpoint but was NOT loaded "
+                f"(patch-merge conv not pre-built before weight load). It must be eagerly "
+                f"built in Sam3MaskedBackbone.__init__."
+            )
         model_dict.update(filtered)
         self.load_state_dict(model_dict, strict=False)
-        logger.info("Full DETR load: loaded %d compatible keys", len(filtered))
+        logger.info(
+            "Full DETR load: loaded %d compatible keys (patch_merge keys loaded: %d)",
+            len(filtered), len(ckpt_patch_merge_keys),
+        )
         del model_dict
         del filtered
         gc.collect()

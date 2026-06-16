@@ -222,6 +222,18 @@ class Sam3MaskedBackbone(nn.Module):
         else:
             self.feature_strides = [self.feature_stride]
 
+        # Eagerly build the patch-merge 1x1 conv at construction (instead of lazily on the
+        # first forward) so its weight key exists in state_dict when pretrained weights are
+        # loaded. Otherwise the pretrained _patch_merge_proj is filtered out as an unknown
+        # key and the layer re-inits to avg_pool on first forward, discarding pretraining.
+        if self.use_patch_merge and self.target_stride and self.target_stride > self.feature_stride:
+            factor = self.target_stride // self.feature_stride
+            assert factor > 1 and (factor & (factor - 1)) == 0, (
+                f"[SAM3 PatchMerge] USE_PATCH_MERGE requires a power-of-2 downsample factor, "
+                f"got factor={factor} (target_stride={self.target_stride}, feature_stride={self.feature_stride})."
+            )
+            self._build_patch_merge_proj(factor)
+
     def _initialize_fpn_layers(self) -> None:
         """Initialize FPN layers based on actual feature_stride"""
         if self._fpn_layers_initialized:
