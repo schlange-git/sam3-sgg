@@ -225,6 +225,7 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.TARGET_STRIDE = 32
   _C.MODEL.SAM3.USE_PATCH_MERGE = False
   _C.MODEL.SAM3.PATCH_MERGE_INIT_NOISE_STD = 0.0  # >0 perturbs avg-pool init off its stationary point
+  _C.MODEL.SAM3.PATCH_MERGE_INIT_MODE = "channel_avg"  # channel_avg | global_avg
   _C.MODEL.SAM3.USE_FPN = False  # Enable FPN-style multi-scale features
   _C.MODEL.SAM3.FPN_STRIDES = [4, 8, 16, 32]  # Feature pyramid strides
   _C.MODEL.SAM3.USE_BACKBONE_FPN = True  # Prefer native SAM3 backbone_fpn levels

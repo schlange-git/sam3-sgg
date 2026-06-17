@@ -53,6 +53,12 @@ class Sam3MaskedBackbone(nn.Module):
         self.patch_merge_init_noise_std = float(
             getattr(cfg.MODEL.SAM3, "PATCH_MERGE_INIT_NOISE_STD", 0.0)
         )
+        self.patch_merge_init_mode = str(
+            getattr(cfg.MODEL.SAM3, "PATCH_MERGE_INIT_MODE", "channel_avg")
+        ).lower()
+        assert self.patch_merge_init_mode in ("channel_avg", "global_avg"), (
+            f"Unsupported PATCH_MERGE_INIT_MODE={self.patch_merge_init_mode}"
+        )
         self._patch_merge_logged = False
         self._last_aux_features = {}  # cached intermediate features for ROI_REFINE
 
@@ -357,24 +363,28 @@ class Sam3MaskedBackbone(nn.Module):
         layer = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, bias=False)
         with torch.no_grad():
             layer.weight.zero_()
-            for c in range(self.feature_dim):
-                for dy in range(factor):
-                    for dx in range(factor):
-                        src_c = c + (dy * factor + dx) * self.feature_dim
-                        layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
+            if self.patch_merge_init_mode == "global_avg":
+                layer.weight.fill_(1.0 / float(in_channels))
+            else:
+                for c in range(self.feature_dim):
+                    for dy in range(factor):
+                        for dx in range(factor):
+                            src_c = c + (dy * factor + dx) * self.feature_dim
+                            layer.weight[c, src_c, 0, 0] = 1.0 / (factor * factor)
+            init_weight = layer.weight.detach().clone()
             if self.patch_merge_init_noise_std > 0.0:
-                avgpool_weight = layer.weight.detach().clone()
                 layer.weight.add_(
                     torch.randn_like(layer.weight) * self.patch_merge_init_noise_std
                 )
-                deviation = (layer.weight - avgpool_weight).abs().max().item()
+                deviation = (layer.weight - init_weight).abs().max().item()
                 assert deviation > 0.0, (
                     "PATCH_MERGE_INIT_NOISE_STD>0 but patch-merge init weight unchanged"
                 )
                 logging.getLogger("detectron2").info(
-                    "X-SAM patch-merge: injected init noise std=%.4g, max|delta|=%.4g vs avg-pool",
+                    "X-SAM patch-merge: injected init noise std=%.4g, max|delta|=%.4g vs %s init",
                     self.patch_merge_init_noise_std,
                     deviation,
+                    self.patch_merge_init_mode,
                 )
         self._patch_merge_factor = int(factor)
         self._patch_merge_init_weight = layer.weight.detach().clone()
