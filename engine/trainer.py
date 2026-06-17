@@ -38,6 +38,7 @@ from detectron2.evaluation import (
     SemSegEvaluator
 )
 from ..checkpoint import PeriodicCheckpointerWithEval
+from .patch_merge_heatmap_hook import PatchMergeHeatmapHook
 from ..evaluation import scenegraph_inference_on_dataset, SceneGraphEvaluator
 from detectron2.engine import hooks
 from detectron2.data.samplers import InferenceSampler, RepeatFactorTrainingSampler, TrainingSampler
@@ -831,6 +832,8 @@ class JointTransformerTrainer(DefaultTrainer):
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
         # ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+        if cfg.MODEL.SAM3.ENABLED and cfg.MODEL.SAM3.USE_PATCH_MERGE:
+            ret.append(PatchMergeHeatmapHook(cfg.TEST.EVAL_PERIOD, cfg.OUTPUT_DIR))
         ret.append(EvalFirstHook())
         ret.append(PeriodicCheckpointerWithEval(cfg.TEST.EVAL_PERIOD, test_and_save_results, test_at_end_of_training, self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_to_keep=cfg.SOLVER.MAX_TO_KEEP))
         if comm.is_main_process():
