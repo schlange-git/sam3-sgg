@@ -601,9 +601,28 @@ class IterativeRelationDETR(DETR):
             if self.roi_replace_main:
                 out['relation_subject_logits'] = out['relation_subject_logits_roi']
                 out['relation_object_logits'] = out['relation_object_logits_roi']
+            roi_eval_area_thresh = os.environ.get("ROI_EVAL_AREA_THRESH", "")
+            if not self.training and roi_eval_area_thresh:
+                assert not self.roi_eval_dual, "ROI_EVAL_AREA_THRESH requires MODEL.ROI_REFINE.EVAL_DUAL=False."
+                area_thresh = float(roi_eval_area_thresh)
+                assert 0.0 < area_thresh <= 1.0, f"bad ROI_EVAL_AREA_THRESH={area_thresh}"
+                sub_area = out['relation_subject_boxes'][..., 2].clamp_min(0.0) * out['relation_subject_boxes'][..., 3].clamp_min(0.0)
+                obj_area = out['relation_object_boxes'][..., 2].clamp_min(0.0) * out['relation_object_boxes'][..., 3].clamp_min(0.0)
+                sub_small = sub_area < area_thresh
+                obj_small = obj_area < area_thresh
+                out['relation_subject_logits'] = torch.where(
+                    sub_small.unsqueeze(-1),
+                    out['relation_subject_logits_roi'],
+                    out['relation_subject_logits'],
+                )
+                out['relation_object_logits'] = torch.where(
+                    obj_small.unsqueeze(-1),
+                    out['relation_object_logits_roi'],
+                    out['relation_object_logits'],
+                )
             # [ROI_EVAL_RAW gate] 置 ROI_EVAL_RAW=1 时跳过替换 -> eval 用原始(pre-refine) logits, 仅用于对照评测
             # [EVAL_DUAL gate] EVAL_DUAL=True 时不在此处覆盖, 由 meta_arch 单次前向同出 override/raw 两套结果
-            if not self.training and not self.roi_eval_dual and os.environ.get("ROI_EVAL_RAW", "0") != "1":
+            elif not self.training and not self.roi_eval_dual and os.environ.get("ROI_EVAL_RAW", "0") != "1":
                 out['relation_subject_logits'] = out['relation_subject_logits_roi']
                 out['relation_object_logits'] = out['relation_object_logits_roi']
         if 'obj_split_subject_head_source_idx' in output:
