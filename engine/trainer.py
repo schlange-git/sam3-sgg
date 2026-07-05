@@ -1247,6 +1247,9 @@ class JointTransformerTrainer(DefaultTrainer):
             memo.add(value)
             lr = cfg.SOLVER.BASE_LR
             weight_decay = cfg.SOLVER.WEIGHT_DECAY
+            if "triplet_" in key or "temporal_" in key:
+                lr = lr * cfg.SOLVER.TEMPORAL_LR_MULTIPLIER
+                logger.info("Setting LR for temporal {} to {}".format(key, lr))
             if "backbone" in key:
                 lr = lr * cfg.SOLVER.BACKBONE_MULTIPLIER
             if "gate" in key:

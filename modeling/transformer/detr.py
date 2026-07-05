@@ -354,6 +354,28 @@ class IterativeRelationDETR(DETR):
         assert object_embed is not None, "Transformer object_embed is missing for ROI refinement."
         return object_embed(embeddings), None, None
 
+    def _write_eval_gate_log(self, video_ids, frame_idxs, mem, gate_obj, gate_rel, applied):
+        csv_path = os.environ.get("TRIPLET_EVAL_GATE_CSV", "")
+        if not csv_path:
+            return
+        import csv
+        need_header = not os.path.exists(csv_path)
+        mem_slots = 0 if mem is None else int(mem.shape[1])
+        mem_dim = 0 if mem is None else int(mem.shape[2])
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if need_header:
+                writer.writerow([
+                    "step", "batch_index", "video_id", "frame_idx",
+                    "gate_obj", "gate_rel", "applied", "mem_slots", "mem_dim", "training"
+                ])
+            for b, (vid, fidx) in enumerate(zip(video_ids, frame_idxs)):
+                writer.writerow([
+                    int(self.triplet_iter_counter), int(b), str(vid), int(fidx),
+                    float(gate_obj), float(gate_rel), int(bool(applied)),
+                    mem_slots, mem_dim, int(bool(self.training)),
+                ])
+
     def _apply_triplet_memory_to_output(self, output, samples, device):
         if not (
             self.triplet_memory_enabled
@@ -370,17 +392,49 @@ class IterativeRelationDETR(DETR):
             video_ids=video_ids, frame_idxs=frame_idxs, device=device)
         self.triplet_iter_counter += 1
         _tdbg = os.environ.get("TRIPLET_DEBUG") == "1" and (self.triplet_iter_counter <= 30 or self.triplet_iter_counter % 200 == 0)
+        gate_obj = None
+        gate_rel = None
+        if mem is not None:
+            if self.training:
+                gate_obj = get_temporal_gate(
+                    self.triplet_iter_counter, self._triplet_max_iter,
+                    self._triplet_gate_max_obj, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
+                gate_rel = get_temporal_gate(
+                    self.triplet_iter_counter, self._triplet_max_iter,
+                    self._triplet_gate_max_rel, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
+            else:
+                gate_obj = self._triplet_gate_max_obj
+                gate_rel = self._triplet_gate_max_rel
+
+        if not self.training:
+            self._write_eval_gate_log(
+                video_ids=video_ids,
+                frame_idxs=frame_idxs,
+                mem=mem,
+                gate_obj=self._triplet_gate_max_obj if gate_obj is None else gate_obj,
+                gate_rel=self._triplet_gate_max_rel if gate_rel is None else gate_rel,
+                applied=mem is not None,
+            )
+
         if mem is None:
+            if (not self.training) and (self.triplet_iter_counter <= 10 or self.triplet_iter_counter % 500 == 0):
+                print(
+                    f"[TRIPLET_EVAL_GATE] iter={self.triplet_iter_counter} mem=None "
+                    f"gate_obj={self._triplet_gate_max_obj:.8g} gate_rel={self._triplet_gate_max_rel:.8g} "
+                    f"applied=False training={self.training}",
+                    flush=True,
+                )
             if _tdbg:
                 print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem=None -> NO injection", flush=True)
             return output
 
-        gate_obj = get_temporal_gate(
-            self.triplet_iter_counter, self._triplet_max_iter,
-            self._triplet_gate_max_obj, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
-        gate_rel = get_temporal_gate(
-            self.triplet_iter_counter, self._triplet_max_iter,
-            self._triplet_gate_max_rel, self._triplet_gate_zero_ratio, self._triplet_gate_warmup_ratio)
+        if (not self.training) and (self.triplet_iter_counter <= 10 or self.triplet_iter_counter % 500 == 0):
+            print(
+                f"[TRIPLET_EVAL_GATE] iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
+                f"gate_obj={gate_obj:.8g} gate_rel={gate_rel:.8g} applied=True "
+                f"training={self.training}",
+                flush=True,
+            )
         if _tdbg:
             print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
                   f"gate_obj={gate_obj:.4f} gate_rel={gate_rel:.4f}", flush=True)
@@ -416,6 +470,9 @@ class IterativeRelationDETR(DETR):
     def reset_temporal_memory(self):
         self._memory_states = {}
         self._relation_memory_states = {}
+        if self.triplet_memory_manager is not None:
+            self.triplet_memory_manager.banks = {}
+            self.triplet_memory_manager.last_frame_idx = {}
         if self.temporal_agg is not None:
             self.temporal_agg.reset()
 
@@ -610,6 +667,18 @@ class IterativeRelationDETR(DETR):
                 obj_area = out['relation_object_boxes'][..., 2].clamp_min(0.0) * out['relation_object_boxes'][..., 3].clamp_min(0.0)
                 sub_small = sub_area < area_thresh
                 obj_small = obj_area < area_thresh
+                if not hasattr(self, "_roi_eval_area_log_count"):
+                    self._roi_eval_area_log_count = 0
+                self._roi_eval_area_log_count += 1
+                if self._roi_eval_area_log_count <= 20 or self._roi_eval_area_log_count % 500 == 0:
+                    print(
+                        f"[ROI_EVAL_AREA_THRESH] step={self._roi_eval_area_log_count} "
+                        f"thresh={area_thresh:.6g} "
+                        f"sub_replaced={int(sub_small.sum().item())}/{sub_small.numel()} "
+                        f"obj_replaced={int(obj_small.sum().item())}/{obj_small.numel()} "
+                        f"eval_dual={self.roi_eval_dual} training={self.training}",
+                        flush=True,
+                    )
                 out['relation_subject_logits'] = torch.where(
                     sub_small.unsqueeze(-1),
                     out['relation_subject_logits_roi'],
@@ -750,7 +819,7 @@ class IterativeRelationDETR(DETR):
                         pred_score, pred_label = rel_prob[..., :-1].max(-1)
 
                         cands = []
-                        quality = sub_score * obj_score * pred_score
+                        quality = obj_score * pred_score
                         topk_upd = min(self._triplet_topk_update, len(pred_score))
                         thresh = self._triplet_update_thresh
                         _, topk_idx = quality.topk(min(topk_upd, quality.shape[0]))
@@ -787,7 +856,7 @@ class IterativeRelationDETR(DETR):
                                   f"sub[max={float(sub_score.max()):.3f},mean={float(sub_score.mean()):.3f}] "
                                   f"obj[max={float(obj_score.max()):.3f},mean={float(obj_score.mean()):.3f}] "
                                   f"pred[max={float(pred_score.max()):.3f},mean={float(pred_score.mean()):.3f}] "
-                                  f"qual_max={float(quality.max()):.4f} thresh={thresh} "
+                                  f"qual=obj*pred qual_max={float(quality.max()):.4f} thresh={thresh} "
                                   f"npass={_qpass} ncand={len(cands)}", flush=True)
                         batch_candidates.append(cands)
 

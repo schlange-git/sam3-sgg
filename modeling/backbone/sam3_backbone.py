@@ -60,6 +60,28 @@ class Sam3MaskedBackbone(nn.Module):
             f"Unsupported PATCH_MERGE_INIT_MODE={self.patch_merge_init_mode}"
         )
         self._patch_merge_logged = False
+        self._tracking_mask_enabled = bool(getattr(cfg.MODEL.SAM3, "USE_TRACKING_MASK", False))
+        self._tracking_mask_provider = None
+        self._tracking_mask_proj = None
+        self._tracking_mask_gate = None
+        self._tracking_mask_logged = False
+        if self._tracking_mask_enabled:
+            from ..temporal.sam3_tracking_mask_provider import Sam3TrackingMaskProvider
+            self._tracking_mask_provider = Sam3TrackingMaskProvider(cfg, device=str(self.device))
+            self._tracking_mask_proj = nn.Conv2d(1, self.feature_dim, kernel_size=1, bias=False)
+            torch.nn.init.zeros_(self._tracking_mask_proj.weight)
+            self._tracking_mask_gate = nn.Parameter(
+                torch.full(
+                    (self.feature_dim,),
+                    float(getattr(cfg.MODEL.SAM3, "TRACKING_MASK_GATE_INIT", 0.0)),
+                )
+            )
+            logging.getLogger("detectron2").info(
+                "[SAM3 TrackingMask] ENABLED — gate_init=%.4f topk=%s prompt=%s",
+                float(getattr(cfg.MODEL.SAM3, "TRACKING_MASK_GATE_INIT", 0.0)),
+                getattr(cfg.MODEL.SAM3, "TRACKING_MASK_TOPK", 8),
+                getattr(cfg.MODEL.SAM3, "TRACKING_MASK_TEXT_PROMPT", "object"),
+            )
         self._last_aux_features = {}  # cached intermediate features for ROI_REFINE
 
         # If using precomputed features, verify directory exists
@@ -708,6 +730,8 @@ class Sam3MaskedBackbone(nn.Module):
                 "The 1×1 conv projection is NOT reducing channels correctly."
             )
 
+        proj_feat = self._apply_tracking_mask_features(proj_feat, images)
+
         if self.use_fpn:
             # Initialize FPN layers on first forward (now we know actual feature_stride)
             if not self._fpn_layers_initialized:
@@ -730,6 +754,51 @@ class Sam3MaskedBackbone(nn.Module):
             masks = self._mask_out_padding([proj_feat.shape], images.image_sizes, proj_feat.device)
             nested = NestedTensor(proj_feat, masks[0])
             return {"sam3": nested}
+
+    def _apply_tracking_mask_features(self, proj_feat: torch.Tensor, images: ImageList) -> torch.Tensor:
+        if not self._tracking_mask_enabled:
+            return proj_feat
+        assert self._tracking_mask_provider is not None, "[SAM3 TrackingMask] provider was not built."
+        assert self._tracking_mask_proj is not None, "[SAM3 TrackingMask] projection conv was not built."
+        assert self._tracking_mask_gate is not None, "[SAM3 TrackingMask] gate parameter was not built."
+
+        video_ids = getattr(images, "video_ids", [f"__novid__{i}" for i in range(len(images))])
+        frame_idxs = getattr(images, "frame_idxs", [0] * len(images))
+        assert len(video_ids) == proj_feat.shape[0] and len(frame_idxs) == proj_feat.shape[0], (
+            f"[SAM3 TrackingMask] metadata length mismatch: B={proj_feat.shape[0]}, "
+            f"video_ids={len(video_ids)}, frame_idxs={len(frame_idxs)}"
+        )
+
+        mask_result = self._tracking_mask_provider.get_masks_for_batch(
+            images.tensor, video_ids, frame_idxs
+        )
+        masks_sum = mask_result["masks_sum"].to(proj_feat.device).float()
+        assert masks_sum.numel() > 0, "[SAM3 TrackingMask] masks_sum is empty."
+        assert torch.isfinite(masks_sum).all(), "[SAM3 TrackingMask] masks_sum has non-finite values."
+
+        if masks_sum.shape[-2:] != proj_feat.shape[-2:]:
+            masks_sum = F.interpolate(
+                masks_sum.unsqueeze(1), size=proj_feat.shape[-2:],
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
+
+        mask_input = masks_sum.unsqueeze(1).clamp(0.0, 1.0)
+        mask_feat = self._tracking_mask_proj(mask_input)
+        if self.training:
+            assert mask_feat.requires_grad, (
+                "[SAM3 TrackingMask] projected mask feature is detached; "
+                "mask projection is not part of the training graph."
+            )
+        gate = torch.sigmoid(self._tracking_mask_gate.view(1, -1, 1, 1))
+        proj_feat = proj_feat + gate * mask_feat
+
+        if not self._tracking_mask_logged:
+            logging.getLogger("detectron2").info(
+                "[SAM3 TrackingMask] consumed masks: input=%s feature=%s hit_rate=%.4f",
+                tuple(mask_input.shape), tuple(mask_feat.shape), float(mask_result.get("hit_rate", 0.0)),
+            )
+            self._tracking_mask_logged = True
+        return proj_feat
 
     def _load_precomputed(self, images: ImageList):
         image_ids = getattr(images, "image_ids", None)

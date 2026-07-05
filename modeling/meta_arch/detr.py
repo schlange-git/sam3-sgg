@@ -492,6 +492,7 @@ class Detr(nn.Module):
         images = ImageList.from_tensors(images)
         images.image_ids = [x.get("image_id") for x in batched_inputs]
         images.video_ids = [x.get("video_id", x.get("image_id")) for x in batched_inputs]
+        images.frame_idxs = [x.get("frame_idx", 0) for x in batched_inputs]
         return images
 
 @META_ARCH_REGISTRY.register()
@@ -620,7 +621,13 @@ class IterativeRelationDetr(Detr):
             logits_r = F.softmax(output['relation_logits'], -1)
 
             # For each box we assign the best class or the second best if the best on is `no_object`.
-            scores_s, labels_s = F.softmax(output[sub_key], -1)[:, :, :-1].max(-1)
+            sub_logits = output[sub_key]
+            person_scale = getattr(self.detr, 'person_score_scale', 1.0)
+            person_idx = getattr(self.detr, 'person_class_index', 0)
+            if person_scale > 0 and abs(person_scale - 1.0) > 1e-8 and sub_logits.shape[-1] > person_idx:
+                sub_logits = sub_logits.clone()
+                sub_logits[..., person_idx] = sub_logits[..., person_idx] + math.log(person_scale)
+            scores_s, labels_s = F.softmax(sub_logits, -1)[:, :, :-1].max(-1)
             scores_o, labels_o = F.softmax(output[obj_key], -1)[:, :, :-1].max(-1)
             B, _ = scores_s.size()
             
@@ -644,7 +651,13 @@ class IterativeRelationDetr(Detr):
         else:
             logits_r = F.softmax(output['aux_outputs_r'][self.test_index]['pred_logits'], -1)
              # For each box we assign the best class or the second best if the best on is `no_object`.
-            scores_s, labels_s = F.softmax(output['aux_outputs_r_sub'][self.test_index]['pred_logits'], -1)[:, :, :-1].max(-1)
+            sub_logits_aux = output['aux_outputs_r_sub'][self.test_index]['pred_logits']
+            person_scale_aux = getattr(self.detr, 'person_score_scale', 1.0)
+            person_idx_aux = getattr(self.detr, 'person_class_index', 0)
+            if person_scale_aux > 0 and abs(person_scale_aux - 1.0) > 1e-8 and sub_logits_aux.shape[-1] > person_idx_aux:
+                sub_logits_aux = sub_logits_aux.clone()
+                sub_logits_aux[..., person_idx_aux] = sub_logits_aux[..., person_idx_aux] + math.log(person_scale_aux)
+            scores_s, labels_s = F.softmax(sub_logits_aux, -1)[:, :, :-1].max(-1)
             scores_o, labels_o = F.softmax(output['aux_outputs_r_obj'][self.test_index]['pred_logits'], -1)[:, :, :-1].max(-1)
             scores_r, labels_r = logits_r[:, :, :-1].max(-1)
             src_head_s = torch.full_like(labels_s, -1)

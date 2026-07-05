@@ -202,6 +202,7 @@ def add_dataset_config(cfg):
   _C.SOLVER.RELATION_MULTIPLIER = 1.0
   _C.SOLVER.ENTITY_MULTIPLIER = 1.0
   _C.SOLVER.GATE_LR_MULTIPLIER = 5.0  # high multiplier for temporal gate to escape saddle point
+  _C.SOLVER.TEMPORAL_LR_MULTIPLIER = 1.0
   _C.SOLVER.EVAL_FIRST = True  # 训练前自动 eval 初始权重质量
   # 以 epoch 为主导的训练长度控制；若 >0，则用它和数据集长度推导 MAX_ITER
   _C.SOLVER.MAX_EPOCH = 1
@@ -226,6 +227,12 @@ def add_dataset_config(cfg):
   _C.MODEL.SAM3.USE_PATCH_MERGE = False
   _C.MODEL.SAM3.PATCH_MERGE_INIT_NOISE_STD = 0.0  # >0 perturbs avg-pool init off its stationary point
   _C.MODEL.SAM3.PATCH_MERGE_INIT_MODE = "channel_avg"  # channel_avg | global_avg
+  _C.MODEL.SAM3.USE_TRACKING_MASK = False  # consume SAM3 image-level masks as temporal features
+  _C.MODEL.SAM3.TRACKING_MASK_TEXT_PROMPT = "object"  # text prompt for SAM3 grounding
+  _C.MODEL.SAM3.TRACKING_MASK_TOPK = 8  # max masks per frame to keep
+  _C.MODEL.SAM3.TRACKING_MASK_GATE_INIT = 0.0  # init gate value (0 = pure origin features)
+  _C.MODEL.SAM3.TRACKING_MASK_SCORE_THRESH = 0.0  # filter masks below this confidence
+  _C.MODEL.SAM3.TRACKING_MASK_CACHE_MAX_FRAMES = 256  # LRU cache entries kept on CPU
   _C.MODEL.SAM3.USE_FPN = False  # Enable FPN-style multi-scale features
   _C.MODEL.SAM3.FPN_STRIDES = [4, 8, 16, 32]  # Feature pyramid strides
   _C.MODEL.SAM3.USE_BACKBONE_FPN = True  # Prefer native SAM3 backbone_fpn levels

@@ -1,0 +1,54 @@
+digraph TemporalTripletMemorySimplified {
+  graph [rankdir=TB, splines=ortho, nodesep=0.48, ranksep=0.70, pad=0.25, bgcolor="white", fontname="Helvetica"];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.12,0.08", color="#333333", penwidth=1.0];
+  edge [fontname="Helvetica", fontsize=9, color="#555555", arrowsize=0.75];
+
+  subgraph cluster_current {
+    label="Current-frame SGG pipeline";
+    color="#1d4e89"; style="rounded";
+    A0 [label="Video mini-batch\nI_t + video_id + frame_idx", fillcolor="#f7f7f7"];
+    B0 [label="SAM3 / X-SAM backbone\npatch-merge feature extraction", fillcolor="#e8f1ff"];
+    C0 [label="Iterative relation transformer\nencoder-decoder", fillcolor="#e8f1ff"];
+    C1 [label="Current-frame queries\nQ_sub, Q_obj, Q_rel", fillcolor="#e8f1ff"];
+    C2 [label="Initial subject/object/relation\nlogits and boxes", fillcolor="#e8f1ff"];
+    A0 -> B0 -> C0 -> C1 -> C2;
+  }
+
+  subgraph cluster_memory {
+    label="Temporal memory read and injection";
+    color="#2a7f3f"; style="rounded";
+    M0 [label="Select per-video triplet memory bank\nby video_id and frame_idx", fillcolor="#fff4df"];
+    M1 [label="Read valid triplet slots\nfeature, boxes, signature, score, age", fillcolor="#fff4df"];
+    M2 [label="Memory available?", shape=diamond, fillcolor="#ffffff", margin="0.06,0.04"];
+    M3 [label="Use original current-frame queries", fillcolor="#fff4df"];
+    M4 [label="Encode memory context\ndelta-time embedding + score weighting + padding", fillcolor="#fff4df"];
+    G0 [label="Gate schedule\n0 → warmup → gate_max\nobject 0.15, relation 0.30", fillcolor="#e9f8ee"];
+    I0 [label="Gated cross-attention injection\ncurrent queries attend to triplet memory", fillcolor="#e9f8ee"];
+    I1 [label="Enhanced queries\nQ_obj*, Q_rel*", fillcolor="#e9f8ee"];
+    I2 [label="Prediction features", fillcolor="#e9f8ee"];
+    M0 -> M1 -> M2;
+    M2 -> M3 [label="No"];
+    M2 -> M4 [label="Yes"];
+    M4 -> G0 -> I0 -> I1 -> I2;
+    M3 -> I2;
+  }
+
+  subgraph cluster_update {
+    label="Prediction and memory update";
+    color="#b3261e"; style="rounded";
+    P0 [label="Recompute final-layer predictions\nobject branch and relation branch", fillcolor="#f3e8ff"];
+    P1 [label="Current-frame scene graph output\nloss / evaluation", fillcolor="#f3e8ff"];
+    U0 [label="Construct triplet candidates under no_grad\nlabels, boxes, relation feature, predicate distribution", fillcolor="#fce8e6"];
+    U1 [label="Quality filtering\nscore product + top-k + threshold", fillcolor="#fce8e6"];
+    U2 [label="Encode candidate triplet feature\nrelation query + geometry + predicate distribution", fillcolor="#fce8e6"];
+    W0 [label="Update per-video memory bank\nmatch by signature + IoU", fillcolor="#fff4df"];
+    W1 [label="EMA update matched slots\nor insert / replace / expire slots", fillcolor="#fff4df"];
+    P0 -> P1;
+    P0 -> U0 -> U1 -> U2 -> W0 -> W1;
+  }
+
+  A0 -> M0;
+  C1 -> I0;
+  I2 -> P0;
+  W1 -> M0 [label="available to later frames", color="#b36b00"];
+}
