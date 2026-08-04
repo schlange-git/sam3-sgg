@@ -3,13 +3,7 @@
 基于 [SpeaQ](https://arxiv.org/abs/2403.17709)（CVPR 2024）的视频场景图生成（Video SGG）实现。  
 本仓库在 Action Genome 上接入 **SAM3 backbone**、**X-SAM patch_merge**、**ROI Refine**，并加入 **Temporal Triplet Memory (v3)**：以三元组粒度维护跨帧记忆，经门控 cross-attention 注入当前帧的 object / relation query。
 
-当前主分支：`temporal_v3`。
-
-<p align="center">
-  <img src="abschluss-paper/temporal_v3_core_idea_flowchart.png" width="900px" alt="Temporal Triplet Memory v3 overview" />
-</p>
-
-<p align="center"><em>Temporal Triplet Memory (v3)：Read → Gated-Inject → Write（per-video 跨帧闭环）</em></p>
+当前主分支：`main`。
 
 ## 核心思想
 
@@ -20,8 +14,6 @@ Action Genome 中同一 `(person, predicate, object)` 往往会在相邻帧持�
 3. **Write**（`no_grad`）：按 `quality = obj_score × pred_score` 取 top-k 三元组写入 bank（命中 EMA / 未命中插入替换 / miss 超限淘汰）
 
 约束：**读+注入可训练，写路径全程 detach**；时序新模块用更高学习率（如 `TEMPORAL_LR_MULTIPLIER=100`）。
-
-更细的实现说明见 [`abschluss-paper/temporal_v3_implementation_deep_dive.md`](abschluss-paper/temporal_v3_implementation_deep_dive.md)。
 
 ## 主要模块
 
@@ -128,9 +120,7 @@ bash tools/full_patchmerge_globalavg_overfit5999_2gpu.sh
 
 - 整模加载：`MODEL.WEIGHTS` + `MODEL.DETR.LOAD_FULL_WEIGHTS True`
 - 仅 DETR head：`MODEL.DETR.HEAD_WEIGHTS` + `LOAD_HEAD_ONLY True`
-- `USE_PATCH_MERGE=True` 时必须预建 patch_merge conv，否则预训练权重会被丢弃并回退 avg_pool（详见相关 fix commit）
-
-说明文档：[`docs/PRETRAINED_WEIGHTS_ACTIONGENOME.md`](docs/PRETRAINED_WEIGHTS_ACTIONGENOME.md)
+- `USE_PATCH_MERGE=True` 时必须预建 patch_merge conv，否则预训练权重会被丢弃并回退 avg_pool
 
 ## 评测
 
@@ -178,24 +168,8 @@ python visualize_predictions.py
 │   ├── temporal/                # triplet_memory v3
 │   └── transformer/             # DETR decoder、注入点、ROI refine
 ├── data/datasets/               # Action Genome / VG
-├── tools/                       # 训练、评测、抽帧脚本
-├── docs/                        # 设计笔记（本地，gitignore）
-└── abschluss-paper/             # 论文草稿与流程图（本地，gitignore）
+└── tools/                       # 训练、评测、抽帧脚本
 ```
-
-## 文档索引
-
-| 文档 | 内容 |
-|------|------|
-| [`abschluss-paper/temporal.md`](abschluss-paper/temporal.md) | 时序模块英文方法概述 |
-| [`abschluss-paper/temporal_v3_implementation_deep_dive.md`](abschluss-paper/temporal_v3_implementation_deep_dive.md) | v3 实现深度剖析 |
-| [`docs/SAM3_SGG_OVERALL_DESIGN.md`](docs/SAM3_SGG_OVERALL_DESIGN.md) | SAM3 + SpeaQ 整体设计 |
-| [`docs/TEMPORAL_OBJECT_QUERY_MEMORY_IMPL.md`](docs/TEMPORAL_OBJECT_QUERY_MEMORY_IMPL.md) | 早期 object-query 记忆说明 |
-| [`docs/roi_refine_flow.md`](docs/roi_refine_flow.md) | ROI refine 流程 |
-| [`docs/xsam_patch_merge.md`](docs/xsam_patch_merge.md) | patch_merge 说明 |
-| [`docs/抽帧.md`](docs/抽帧.md) | Action Genome 抽帧策略 |
-
-> `docs/` 与 `abschluss-paper/` 默认被 `.gitignore` 忽略，仅本地可见。
 
 ## 引用
 
