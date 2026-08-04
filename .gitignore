@@ -11,6 +11,8 @@ data/featuremaps
 dataset/
 dataset-full/
 docs/
+abschluss-paper/
+test_vis/
 
 # Training outputs
 output*/
@@ -66,5 +68,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 temp.*
-detectron2/
+
+# Local vendor checkout
 detectron2/
