@@ -242,6 +242,14 @@ class IterativeRelationDETR(DETR):
         self._triplet_max_iter = int(getattr(cfg.SOLVER, "MAX_ITER", 80000))
         self._triplet_gate_max_obj = float(getattr(cfg.MODEL.TEMPORAL, "GATE_MAX_OBJECT", 0.15))
         self._triplet_gate_max_rel = float(getattr(cfg.MODEL.TEMPORAL, "GATE_MAX_RELATION", 0.30))
+        self._triplet_learnable_gate = bool(getattr(cfg.MODEL.TEMPORAL, "LEARNABLE_GATE", False))
+        if self._triplet_learnable_gate:
+            init_obj = float(getattr(cfg.MODEL.TEMPORAL, "LEARNABLE_GATE_INIT_OBJECT", self._triplet_gate_max_obj))
+            init_rel = float(getattr(cfg.MODEL.TEMPORAL, "LEARNABLE_GATE_INIT_RELATION", self._triplet_gate_max_rel))
+            assert 0.0 < init_obj < 1.0, "LEARNABLE_GATE_INIT_OBJECT must be in (0, 1)."
+            assert 0.0 < init_rel < 1.0, "LEARNABLE_GATE_INIT_RELATION must be in (0, 1)."
+            self.triplet_obj_inject_logit = nn.Parameter(torch.tensor(math.log(init_obj / (1.0 - init_obj)), dtype=torch.float32))
+            self.triplet_rel_inject_logit = nn.Parameter(torch.tensor(math.log(init_rel / (1.0 - init_rel)), dtype=torch.float32))
         self._triplet_gate_zero_ratio = float(getattr(cfg.MODEL.TEMPORAL, "GATE_ZERO_END_RATIO", 0.10))
         self._triplet_gate_warmup_ratio = float(getattr(cfg.MODEL.TEMPORAL, "GATE_WARMUP_END_RATIO", 0.30))
         self._triplet_topk_update = int(getattr(cfg.MODEL.TEMPORAL, "TRIPLET_MEMORY_TOPK_UPDATE", 16))
@@ -354,6 +362,36 @@ class IterativeRelationDETR(DETR):
         assert object_embed is not None, "Transformer object_embed is missing for ROI refinement."
         return object_embed(embeddings), None, None
 
+    def _triplet_gate_to_float(self, gate):
+        if torch.is_tensor(gate):
+            return float(gate.detach().mean().item())
+        return float(gate)
+
+    def _get_triplet_learnable_gates(self):
+        assert self._triplet_learnable_gate, "Triplet learnable gate is disabled."
+        assert hasattr(self, "triplet_obj_inject_logit") and hasattr(self, "triplet_rel_inject_logit")
+        return torch.sigmoid(self.triplet_obj_inject_logit), torch.sigmoid(self.triplet_rel_inject_logit)
+
+    def _write_train_gate_csv(self, gate_obj, gate_rel, mem):
+        csv_path = os.environ.get("TRIPLET_TRAIN_GATE_CSV", "")
+        if not csv_path:
+            return
+        assert self._triplet_learnable_gate, "TRIPLET_TRAIN_GATE_CSV requires learnable triplet gate."
+        need_header = not os.path.exists(csv_path)
+        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        with open(csv_path, "a") as f:
+            if need_header:
+                f.write("iter,gate_obj,gate_rel,obj_logit,rel_logit,mem_slots,training\n")
+            f.write(
+                f"{int(self.triplet_iter_counter)},"
+                f"{self._triplet_gate_to_float(gate_obj):.10f},"
+                f"{self._triplet_gate_to_float(gate_rel):.10f},"
+                f"{float(self.triplet_obj_inject_logit.detach().item()):.10f},"
+                f"{float(self.triplet_rel_inject_logit.detach().item()):.10f},"
+                f"{int(mem.shape[1])},"
+                f"{int(bool(self.training))}\n"
+            )
+
     def _write_eval_gate_log(self, video_ids, frame_idxs, mem, gate_obj, gate_rel, applied):
         csv_path = os.environ.get("TRIPLET_EVAL_GATE_CSV", "")
         if not csv_path:
@@ -372,7 +410,7 @@ class IterativeRelationDETR(DETR):
             for b, (vid, fidx) in enumerate(zip(video_ids, frame_idxs)):
                 writer.writerow([
                     int(self.triplet_iter_counter), int(b), str(vid), int(fidx),
-                    float(gate_obj), float(gate_rel), int(bool(applied)),
+                    self._triplet_gate_to_float(gate_obj), self._triplet_gate_to_float(gate_rel), int(bool(applied)),
                     mem_slots, mem_dim, int(bool(self.training)),
                 ])
 
@@ -394,7 +432,9 @@ class IterativeRelationDETR(DETR):
         _tdbg = os.environ.get("TRIPLET_DEBUG") == "1" and (self.triplet_iter_counter <= 30 or self.triplet_iter_counter % 200 == 0)
         gate_obj = None
         gate_rel = None
-        if mem is not None:
+        if self._triplet_learnable_gate:
+            gate_obj, gate_rel = self._get_triplet_learnable_gates()
+        elif mem is not None:
             if self.training:
                 gate_obj = get_temporal_gate(
                     self.triplet_iter_counter, self._triplet_max_iter,
@@ -418,9 +458,11 @@ class IterativeRelationDETR(DETR):
 
         if mem is None:
             if (not self.training) and (self.triplet_iter_counter <= 10 or self.triplet_iter_counter % 500 == 0):
+                gate_obj_log = self._triplet_gate_to_float(self._triplet_gate_max_obj if gate_obj is None else gate_obj)
+                gate_rel_log = self._triplet_gate_to_float(self._triplet_gate_max_rel if gate_rel is None else gate_rel)
                 print(
                     f"[TRIPLET_EVAL_GATE] iter={self.triplet_iter_counter} mem=None "
-                    f"gate_obj={self._triplet_gate_max_obj:.8g} gate_rel={self._triplet_gate_max_rel:.8g} "
+                    f"gate_obj={gate_obj_log:.8g} gate_rel={gate_rel_log:.8g} "
                     f"applied=False training={self.training}",
                     flush=True,
                 )
@@ -428,16 +470,27 @@ class IterativeRelationDETR(DETR):
                 print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem=None -> NO injection", flush=True)
             return output
 
+        gate_obj_log = self._triplet_gate_to_float(gate_obj)
+        gate_rel_log = self._triplet_gate_to_float(gate_rel)
+        if self.training:
+            self._write_train_gate_csv(gate_obj, gate_rel, mem)
+        if self.training and (self.triplet_iter_counter <= 20 or self.triplet_iter_counter % 100 == 0):
+            print(
+                f"[TRIPLET_TRAIN_GATE] iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
+                f"gate_obj={gate_obj_log:.8g} gate_rel={gate_rel_log:.8g} "
+                f"learnable={self._triplet_learnable_gate}",
+                flush=True,
+            )
         if (not self.training) and (self.triplet_iter_counter <= 10 or self.triplet_iter_counter % 500 == 0):
             print(
                 f"[TRIPLET_EVAL_GATE] iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
-                f"gate_obj={gate_obj:.8g} gate_rel={gate_rel:.8g} applied=True "
+                f"gate_obj={gate_obj_log:.8g} gate_rel={gate_rel_log:.8g} applied=True "
                 f"training={self.training}",
                 flush=True,
             )
         if _tdbg:
             print(f"[TRIPLET_DBG] apply iter={self.triplet_iter_counter} mem_shape={tuple(mem.shape)} "
-                  f"gate_obj={gate_obj:.4f} gate_rel={gate_rel:.4f}", flush=True)
+                  f"gate_obj={gate_obj_log:.4f} gate_rel={gate_rel_log:.4f}", flush=True)
         mask_exp = mem_mask if (mem_mask is not None and mem_mask.dim() == 2) else None
 
         if self.triplet_injector_obj is not None and output.get("hs_object_last") is not None:

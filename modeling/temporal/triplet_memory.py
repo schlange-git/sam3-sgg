@@ -339,8 +339,14 @@ class TemporalTripletInjector(nn.Module):
         gate: scalar in [0, 1]
         Returns: [B, N, D]
         """
-        if memory is None or gate <= 0.0:
+        if memory is None:
             return queries
+        if torch.is_tensor(gate):
+            gate = gate.to(device=queries.device, dtype=queries.dtype)
+        else:
+            gate = float(gate)
+            if gate <= 0.0:
+                return queries
         B, N, D = queries.shape
         # Reshape batch*memory for MHA
         M = memory.shape[1]
