@@ -1,154 +1,218 @@
-[//]: # (# Groupwise Query Specialization and Quality-Aware Multi-Assignment for Transformer-based Visual Relationship Detection)
-# Official Implementation of SpeaQ (CVPR 2024)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/groupwise-query-specialization-and-quality/scene-graph-generation-on-visual-genome)](https://paperswithcode.com/sota/scene-graph-generation-on-visual-genome?p=groupwise-query-specialization-and-quality)
+# SAM3-SGG with Temporal Triplet Memory
 
-Official PyTorch implementation of "[Groupwise Query Specialization and Quality-Aware Multi-Assignment for Transformer-based Visual Relationship Detection](https://arxiv.org/abs/2403.17709)" (CVPR 2024).
-> Jongha Kim*, Jihwan Park*, Jinyoung Park*, Jinyoung Kim, Sehyung Kim, Hyunwoo J. Kim.
-> 
-> Department of Computer Science and Engineering, Korea University 
+基于 [SpeaQ](https://arxiv.org/abs/2403.17709)（CVPR 2024）的视频场景图生成（Video SGG）实现。  
+本仓库在 Action Genome 上接入 **SAM3 backbone**、**X-SAM patch_merge**、**ROI Refine**，并加入 **Temporal Triplet Memory (v3)**：以三元组粒度维护跨帧记忆，经门控 cross-attention 注入当前帧的 object / relation query。
 
-<div align="center">
-  <img src="assets/speaq.png" width="750px" />
-</div>
+当前主分支：`temporal_v3`。
 
-## Setup
-### Creating conda environment and installing python packages
-```
-conda create -n SpeaQ python=3.9
-conda activate SpeaQ
+<p align="center">
+  <img src="abschluss-paper/temporal_v3_core_idea_flowchart.png" width="900px" alt="Temporal Triplet Memory v3 overview" />
+</p>
 
-pip install h5py imantics easydict opencv-python scikit-learn scipy pandas setuptools==59.5.0 wandb numpy==1.21.6 pillow==9.5.0
-```
-### Installing PyTorch and Detectron2
-- This code is tested on PyTorch 1.10.0, CUDA 11.1 and Detectron2 0.5.1.
-- Note that different PyTorch, CUDA, or detectron2 versions may be required depending on your system. 
-Please refer to official installation instructions of [PyTorch](https://pytorch.org/get-started/previous-versions/) and [Detectron2](https://detectron2.readthedocs.io/en/latest/tutorials/install.html) to install different versions.
-```
-pip install torch==1.10.0+cu111 torchvision==0.11.0+cu111 torchaudio==0.10.0 -f https://download.pytorch.org/whl/torch_stable.html
+<p align="center"><em>Temporal Triplet Memory (v3)：Read → Gated-Inject → Write（per-video 跨帧闭环）</em></p>
 
+## 核心思想
+
+Action Genome 中同一 `(person, predicate, object)` 往往会在相邻帧持续出现，但单帧 SGG 无法利用这种时序先验。v3 做法：
+
+1. **Read**：从当前视频的 memory bank 取出有效 slot，加 \(\Delta t\) 编码与置信度加权  
+2. **Gated-Inject**：用 cross-attention 把记忆注入 object / relation query（蓝本固定门控 `gate_obj=0.30`，`gate_rel=0.45`），再重算最后一层 logits / boxes  
+3. **Write**（`no_grad`）：按 `quality = obj_score × pred_score` 取 top-k 三元组写入 bank（命中 EMA / 未命中插入替换 / miss 超限淘汰）
+
+约束：**读+注入可训练，写路径全程 detach**；时序新模块用更高学习率（如 `TEMPORAL_LR_MULTIPLIER=100`）。
+
+更细的实现说明见 [`abschluss-paper/temporal_v3_implementation_deep_dive.md`](abschluss-paper/temporal_v3_implementation_deep_dive.md)。
+
+## 主要模块
+
+| 模块 | 说明 | 关键配置 / 代码 |
+|------|------|----------------|
+| SAM3 Backbone | 冻结 ViT，输出统一特征图 | `MODEL.SAM3.*`，`modeling/backbone/sam3_backbone.py` |
+| X-SAM patch_merge | pixel-unshuffle + 可学习 1×1 conv 下采样（需在 `__init__` 预建以便加载预训练） | `MODEL.SAM3.USE_PATCH_MERGE` |
+| ROI Refine | stride-14 ROI 特征 refine，支持 residual 融合 | `MODEL.ROI_REFINE.*` |
+| Triplet Memory v3 | 每视频 ≤32 slot 的三元组记忆库 | `MODEL.TEMPORAL.MODE=triplet_memory_v3`，`modeling/temporal/triplet_memory.py` |
+| Clip sampler | 按视频连续帧采样，便于时序更新 | `DATASETS.ACTION_GENOME.SAMPLER_MODE=clip` |
+
+## 环境安装
+
+```bash
+conda create -n speaq python=3.9
+conda activate speaq
+
+pip install -r requirements.txt
+
+# Detectron2（按本机 CUDA / PyTorch 版本选择对应 wheel）
 python -m pip install detectron2 -f \
-  https://dl.fbaipublicfiles.com/detectron2/wheels/cu111/torch1.10/index.html
+  https://dl.fbaipublicfiles.com/detectron2/wheels/index.html
+
+# 本地 SAM3
+cd sam3 && pip install -e . && cd ..
 ```
 
+实测常用组合：PyTorch 2.x + 对应 CUDA + Detectron2。`detectron2/`、权重 `*.pth`、数据集目录等已在 `.gitignore` 中忽略。
 
-## Dataset and Pre-trained Weights Preparation
-For this section, we follow instructions from the [Iterative Scene Graph Generation](https://github.com/ubc-vision/IterativeSG).
-Please refer to the original repository for more details.
+## 数据准备（Action Genome）
 
-### Preparing Dataset
-We use the Visual Genome filtered data widely used in the Scene Graph community. 
-Please refer to [Unbiased Scene Graph Generation repository](https://github.com/KaihuaTang/Scene-Graph-Benchmark.pytorch/blob/master/DATASET.md) for instructions to download this dataset. 
-After downloading the dataset you should have the following 4 files: 
-- `VG_100K `directory containing all the images
-- `VG-SGG-with-attri.h5` 
-- `VG-SGG-dicts-with-attri.json` (Can be found in the same repository [here](https://github.com/KaihuaTang/Scene-Graph-Benchmark.pytorch/tree/master/datasets/vg))
-- `image_data.json` (Can be found in the same repository [here](https://github.com/KaihuaTang/Scene-Graph-Benchmark.pytorch/tree/master/datasets/vg))
+期望目录结构（可用软链）：
 
-### Preparing Pre-trained DETR Weights
-To enable faster model convergence, we use weights of DETR pre-trained on VG dataset.
-We replicate the DETR decoder weights three times, and initialize decoder weights of the baseline model with replicated weights. 
-For convenience, the pretrained weights (with the decoder replication) are made available [here](https://drive.google.com/drive/folders/1CdcYdcYEvkZHz-I1IFF8sBxVMWSyWIkh?usp=share_link). 
-To use these weights during training, simply use the `MODEL.WEIGHTS <Path to downloaded checkpoint>` flag in the training command.
-
-
-## Training
-We provide two training scripts: one for the baseline model and the other for the model trained with SpeaQ.
-
-The **baseline model** can be trained using the following command:
-```
-python train_iterative_model.py --resume --num-gpus <NUM_GPUS> \
---config-file configs/speaq.yaml --dist-url <PORT_NUM> OUTPUT_DIR <PATH TO CHECKPOINT DIR> \ 
-DATASETS.VISUAL_GENOME.IMAGES <PATH TO VG_100K IMAGES> \
-DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY <PATH TO VG-SGG-dicts-with-attri.json> \
-DATASETS.VISUAL_GENOME.IMAGE_DATA <PATH TO image_data.json> \
-DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 <PATH TO VG-SGG-with-attri.h5> \
-MODEL.DETR.OVERSAMPLE_PARAM 0.07 MODEL.DETR.UNDERSAMPLE_PARAM 1.5 \
-SOLVER.IMS_PER_BATCH 20 MODEL.WEIGHTS <PATH TO vg_objectdetector_pretrained.pth>
+```text
+dataset/
+├── annotations/          # AG 标注
+└── frames/               # 抽帧结果
 ```
 
-The **model with SpeaQ** can be trained using the following command:
-```
-python train_iterative_model.py --resume --num-gpus <NUM_GPUS> \
---config-file configs/speaq.yaml --dist-url <PORT_NUM> OUTPUT_DIR <PATH TO CHECKPOINT DIR> \ 
-DATASETS.VISUAL_GENOME.IMAGES <PATH TO VG_100K IMAGES> \
-DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY <PATH TO VG-SGG-dicts-with-attri.json> \
-DATASETS.VISUAL_GENOME.IMAGE_DATA <PATH TO image_data.json> \
-DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 <PATH TO VG-SGG-with-attri.h5> \
-MODEL.DETR.OVERSAMPLE_PARAM 0.07 MODEL.DETR.UNDERSAMPLE_PARAM 1.5 \
-SOLVER.IMS_PER_BATCH 20  MODEL.WEIGHTS <PATH TO vg_objectdetector_pretrained.pth> \
-MODEL.DETR.ONE2MANY_SCHEME dynamic MODEL.DETR.MULTIPLY_QUERY 2 \
-MODEL.DETR.ONLY_PREDICATE_MULTIPLY True MODEL.DETR.ONE2MANY_K 4 \
-MODEL.DETR.ONE2MANY_DYNAMIC_SCHEME max MODEL.DETR.USE_GROUP_MASK True \
-MODEL.DETR.MATCH_INDEPENDENT True \
-MODEL.DETR.NUM_GROUPS 4 MODEL.DETR.ONE2MANY_PREDICATE_SCORE True \
-MODEL.DETR.ONE2MANY_PREDICATE_WEIGHT -0.5
+抽帧（关键帧之间可均匀插帧，默认每区间额外 1 帧）：
+
+```bash
+# VIDEO_DIR / FRAME_DIR / ANNOTATION_DIR 可按需覆盖
+bash tools/prepare_actiongenome_frames.sh
 ```
 
-Note that [Iterative Scene Graph Generation](https://github.com/ubc-vision/IterativeSG) applies loss re-weighting scheme to relieve long-tail problem.
-Such option can be turned off by setting ```MODEL.DETR.OVERSAMPLE_PARAM 0.0 MODEL.DETR.UNDERSAMPLE_PARAM 0.0```.
+损坏图片列表见 `broken_images.txt`（`DATASETS.ACTION_GENOME.BROKEN_IMAGES_LIST`）。
 
+过拟合子集标注：
 
-## Evaluation
-To evaluate the model trained with SpeaQ, some modifications should be made to the training command:
-1. Change the ```--config-file``` options from ```configs/speaq.yaml``` to ```configs/speaq_test.yaml```.
-2. Set ```OUTPUT_DIR``` to the directory containing the trained model checkpoint.
-3. Add ```--eval-only``` flag to the command.
+- `dataset_overfit/`
+- `dataset_overfit_temporal/`
+- `dataset_overfit_temporal_20v/`
 
-For convenience, we provide the checkpoint of the model trained with SpeaQ [here](https://drive.google.com/file/d/1TjqkySN8K51yCjWNfCoqk5eEr5kAGDiO/view).
-After unzipping the provided file (```speaq_checkpoints.zip```), the model can be evaluated using the following command:
-```
-python train_iterative_model.py --resume --eval-only --num-gpus 4 --config-file configs/speaq_test.yaml \ 
---dist-url <PORT_NUM> OUTPUT_DIR <PATH TO speaq_checkpoints> \
-DATASETS.VISUAL_GENOME.IMAGES <PATH TO VG_100K IMAGES> \
-DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY <PATH TO VG-SGG-dicts-with-attri.json> \
-DATASETS.VISUAL_GENOME.IMAGE_DATA <PATH TO image_data.json> \
-DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 <PATH TO VG-SGG-with-attri.h5> \
-MODEL.DETR.OVERSAMPLE_PARAM 0.07 MODEL.DETR.UNDERSAMPLE_PARAM 1.5 \
-SOLVER.IMS_PER_BATCH 20  MODEL.DETR.ONE2MANY_SCHEME dynamic MODEL.DETR.MULTIPLY_QUERY 2 \
-MODEL.DETR.ONLY_PREDICATE_MULTIPLY True MODEL.DETR.ONE2MANY_K 4 \
-MODEL.DETR.ONE2MANY_DYNAMIC_SCHEME max MODEL.DETR.USE_GROUP_MASK True \
-MODEL.DETR.MATCH_INDEPENDENT True \
-MODEL.DETR.NUM_GROUPS 4 MODEL.DETR.ONE2MANY_PREDICATE_SCORE True \
-MODEL.DETR.ONE2MANY_PREDICATE_WEIGHT -0.5
+## 训练
+
+统一入口：`train_iterative_model.py`。常用脚本在 `tools/`。
+
+### 1. 全量训练（SAM3 + patch_merge + ROI + triplet_memory_v3）
+
+生产配置：`configs/fulltask_roiresid_pm_clip_v3_xsam_bs24_20w.yaml`  
+（clip 采样、patch_merge、ROI 残差、时序 v3；起始权重为 X-SAM 预训练）
+
+```bash
+# 8 卡 · bs96 · 80k iter
+bash tools/train_fulltask_v3_8gpu_bs96_80k.sh [OUTPUT_DIR] [NUM_GPUS]
+
+# 2 卡小规模
+bash tools/train_fulltask_v3_2gpu_bs24_20w.sh
 ```
 
-With the provided checkpoint, you should get results similar to the following on ```VG_test``` split if setup correctly:
-```python
-SGG eval:     R @ 20: 0.2508;     R @ 50: 0.3206;     R @ 100: 0.3554;  for mode=sgdet, type=Recall(Main).
-SGG eval:  ng-R @ 20: 0.2362;  ng-R @ 50: 0.3078;  ng-R @ 100: 0.3482;  for mode=sgdet, type=No Graph Constraint Recall(Main).
-SGG eval:    zR @ 20: 0.0123;    zR @ 50: 0.0304;    zR @ 100: 0.0463;  for mode=sgdet, type=Zero Shot Recall.
-SGG eval:    mR @ 20: 0.1011;    mR @ 50: 0.1508;    mR @ 100: 0.1760;  for mode=sgdet, type=Mean Recall.
+### 2. 时序微调（固定门控，推荐蓝本）
+
+在已收敛的全量权重（如 `model_0079999.pth`）上，固定 `gate_obj=0.30` / `gate_rel=0.45`，提高时序模块 LR：
+
+```bash
+# 8 卡 · bs16 · 20k iter
+bash tools/run_temporal_finetune_80k_fixed_gate030_045_8gpu_ml_bs16.sh
+
+# 单卡 / 2 卡变体
+bash tools/run_temporal_finetune_79999_bs8_20k_fixed_gate030_045_single.sh
+bash tools/run_temporal_finetune_79999_bs16_20k_fixed_gate030_045_2gpu.sh
 ```
 
-## SAM3 Backbone (Experimental)
-We added an experimental switch to use SAM3 as the backbone instead of ResNet. This is meant to get the pipeline running first (no explicit FPN fusion). You can enable it with the following config overrides:
-```
-MODEL.SAM3.ENABLED True
-MODEL.SAM3.CHECKPOINT_PATH <PATH_TO_SAM3_CHECKPOINT>   # optional
-MODEL.SAM3.IMAGE_SIZE 1008
-MODEL.SAM3.FEATURE_DIM 256
-MODEL.SAM3.FREEZE True
-```
-Example:
-```
-python train_iterative_model.py --num-gpus 1 --config-file configs/speaq.yaml \
-OUTPUT_DIR output_sam3_run \
-MODEL.SAM3.ENABLED True MODEL.SAM3.CHECKPOINT_PATH /path/to/sam3.pt \
-DATASETS.VISUAL_GENOME.IMAGES <PATH TO VG_100K IMAGES> \
-DATASETS.VISUAL_GENOME.MAPPING_DICTIONARY <PATH TO VG-SGG-dicts-with-attri.json> \
-DATASETS.VISUAL_GENOME.IMAGE_DATA <PATH TO image_data.json> \
-DATASETS.VISUAL_GENOME.VG_ATTRIBUTE_H5 <PATH TO VG-SGG-with-attri.h5>
+可学习门控实验：
+
+```bash
+bash tools/run_temporal_finetune_79999_bs8_20k_learnable_gate_single.sh
+bash tools/run_temporal_finetune_79999_bs8_20k_learnable_gate100x_single.sh
 ```
 
-## Citations
+### 3. Overfit / 诊断
+
+```bash
+# clip_sample 过拟合（20v）
+bash tools/overfit_clipsample_1gpu_bs16_20v_pscale300.sh
+
+# patch_merge 相关探针
+bash tools/overfit_patchmerge_globalavg_2gpu_20v.sh
+bash tools/full_patchmerge_globalavg_overfit5999_2gpu.sh
 ```
+
+### 4. 权重加载注意
+
+- 整模加载：`MODEL.WEIGHTS` + `MODEL.DETR.LOAD_FULL_WEIGHTS True`
+- 仅 DETR head：`MODEL.DETR.HEAD_WEIGHTS` + `LOAD_HEAD_ONLY True`
+- `USE_PATCH_MERGE=True` 时必须预建 patch_merge conv，否则预训练权重会被丢弃并回退 avg_pool（详见相关 fix commit）
+
+说明文档：[`docs/PRETRAINED_WEIGHTS_ACTIONGENOME.md`](docs/PRETRAINED_WEIGHTS_ACTIONGENOME.md)
+
+## 评测
+
+```bash
+python train_iterative_model.py --eval-only --num-gpus 1 \
+  --config-file <CONFIG> \
+  OUTPUT_DIR <OUTPUT_DIR> \
+  MODEL.WEIGHTS <CHECKPOINT> \
+  DATASETS.ACTION_GENOME.ANNOTATIONS dataset/annotations \
+  DATASETS.ACTION_GENOME.FRAMES dataset/frames \
+  MODEL.TEMPORAL.ENABLED True \
+  MODEL.TEMPORAL.EVAL_ENABLED True
+```
+
+有序 / 打乱帧评测脚本示例：
+
+```bash
+bash tools/run_temporal_ordered_eval_m3.sh
+bash tools/run_temporal_shuffle_eval_m3.sh
+```
+
+结果提取与对比：
+
+```bash
+python save_eval_results.py <OUTPUT_DIR> --name "exp"
+python compare_results.py <dir1> <dir2>
+```
+
+详见 [`EVAL_TOOLS_README.md`](EVAL_TOOLS_README.md)。早期 VG 全链路脚本说明见 [`PIPELINE_README.md`](PIPELINE_README.md)。
+
+## 可视化
+
+```bash
+python visualize_actiongenome_by_video.py   # 按视频可视化预测
+python visualize_predictions.py
+```
+
+## 仓库结构（简）
+
+```text
+├── train_iterative_model.py     # 训练 / 评测入口
+├── configs/                     # yaml + defaults.py
+├── modeling/
+│   ├── backbone/                # SAM3、patch_merge
+│   ├── temporal/                # triplet_memory v3
+│   └── transformer/             # DETR decoder、注入点、ROI refine
+├── data/datasets/               # Action Genome / VG
+├── tools/                       # 训练、评测、抽帧脚本
+├── docs/                        # 设计笔记（本地，gitignore）
+└── abschluss-paper/             # 论文草稿与流程图（本地，gitignore）
+```
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| [`abschluss-paper/temporal.md`](abschluss-paper/temporal.md) | 时序模块英文方法概述 |
+| [`abschluss-paper/temporal_v3_implementation_deep_dive.md`](abschluss-paper/temporal_v3_implementation_deep_dive.md) | v3 实现深度剖析 |
+| [`docs/SAM3_SGG_OVERALL_DESIGN.md`](docs/SAM3_SGG_OVERALL_DESIGN.md) | SAM3 + SpeaQ 整体设计 |
+| [`docs/TEMPORAL_OBJECT_QUERY_MEMORY_IMPL.md`](docs/TEMPORAL_OBJECT_QUERY_MEMORY_IMPL.md) | 早期 object-query 记忆说明 |
+| [`docs/roi_refine_flow.md`](docs/roi_refine_flow.md) | ROI refine 流程 |
+| [`docs/xsam_patch_merge.md`](docs/xsam_patch_merge.md) | patch_merge 说明 |
+| [`docs/抽帧.md`](docs/抽帧.md) | Action Genome 抽帧策略 |
+
+> `docs/` 与 `abschluss-paper/` 默认被 `.gitignore` 忽略，仅本地可见。
+
+## 引用
+
+若使用本仓库的 SpeaQ 基线部分，请引用：
+
+```bibtex
 @inproceedings{kim2024groupwise,
-      title={Groupwise Query Specialization and Quality-Aware Multi-Assignment for Transformer-based Visual Relationship Detection}, 
-      author={Kim, Jongha and Park, Jihwan and Park, Jinyoung and Kim, Jinyoung and Kim, Sehyung and Kim, Hyunwoo J},
-      booktitle={CVPR},
-      year={2024},
+  title={Groupwise Query Specialization and Quality-Aware Multi-Assignment for Transformer-based Visual Relationship Detection},
+  author={Kim, Jongha and Park, Jihwan and Park, Jinyoung and Kim, Jinyoung and Kim, Sehyung and Kim, Hyunwoo J},
+  booktitle={CVPR},
+  year={2024}
 }
 ```
 
 ## Acknowledgements
-This repository is built upon [Iterative Scene Graph Generation](https://github.com/ubc-vision/IterativeSG).
+
+- [SpeaQ](https://github.com/) / [Iterative Scene Graph Generation](https://github.com/ubc-vision/IterativeSG)
+- [SAM 3](https://github.com/facebookresearch/sam3)
+- [Detectron2](https://github.com/facebookresearch/detectron2)
+- Action Genome / Charades 数据集提供方
